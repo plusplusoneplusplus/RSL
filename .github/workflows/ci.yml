@@ -1,0 +1,89 @@
+name: CI
+
+# Generic CI for the repo. Jobs are language/component-scoped and self-activate:
+# add a new component (e.g. a Rust crate) and its job starts running without
+# having to rewire triggers. Each job that can be a no-op guards itself so it
+# skips cleanly when its inputs aren't present yet.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # C++ reference tools built with CMake (currently just tools/golden-gen).
+  # Discovers every tools/*/CMakeLists.txt, so new CMake tools are picked up
+  # automatically. The golden-gen tool additionally has a corpus to verify.
+  # ---------------------------------------------------------------------------
+  cmake-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+
+      - name: Build every CMake tool under tools/
+        run: |
+          shopt -s nullglob
+          found=0
+          for cml in tools/*/CMakeLists.txt; do
+            found=1
+            dir="$(dirname "$cml")"
+            echo "::group::Building $dir"
+            cmake -S "$dir" -B "$dir/build"
+            cmake --build "$dir/build" -j "$(nproc)"
+            echo "::endgroup::"
+          done
+          if [ "$found" = 0 ]; then
+            echo "No tools/*/CMakeLists.txt found; nothing to build."
+          fi
+
+      - name: Verify golden-gen corpus is reproduced byte-for-byte
+        if: hashFiles('tools/golden-gen/build/golden-gen') != ''
+        run: |
+          # Running the generator also executes its built-in round-trip
+          # self-check (non-zero exit on failure).
+          ./tools/golden-gen/build/golden-gen > /tmp/golden-ci.txt
+          if ! diff -u tools/golden-gen/corpus/phase1-golden.txt /tmp/golden-ci.txt; then
+            echo "::error::Generated golden vectors differ from the committed corpus."
+            echo "If this change intentionally alters the wire format, regenerate with:"
+            echo "  ./tools/golden-gen/build/golden-gen > tools/golden-gen/corpus/phase1-golden.txt"
+            exit 1
+          fi
+          echo "Corpus reproduced byte-for-byte."
+
+  # ---------------------------------------------------------------------------
+  # Rust — activates automatically once any Cargo.toml is added (e.g. the
+  # pure-Rust port). Skips entirely while the repo has no Rust yet.
+  # ---------------------------------------------------------------------------
+  rust:
+    runs-on: ubuntu-latest
+    if: hashFiles('**/Cargo.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-features
