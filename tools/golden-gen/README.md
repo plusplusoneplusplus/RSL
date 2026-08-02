@@ -76,6 +76,7 @@ VERSION <1..6>
 LEN <bytes>
 CHECKSUM <16 hex>       # Rabin-64 over bytes after the 8-byte checksum field
 BYTES <hex>             # the full marshaled message, checksum field patched in
+FIELDS <json>           # constructor params (see below)
 
 FPRINT                  # raw Rabin-64 vectors for the fingerprint itself
 DESC <text>
@@ -83,6 +84,20 @@ LEN <bytes>
 INPUT <hex>
 CHECKSUM <16 hex>
 ```
+
+### `FIELDS` — machine-readable constructor parameters
+
+Each `RECORD` carries a `FIELDS` line: a JSON object describing the exact
+parameters the message was built from (member id, decree, ballot, per-subtype
+payloads, nested member sets / votes, …). 64-bit integers are `"0x…"` hex
+strings, byte blobs (cookies, requests, member-set cookie) are hex strings, and
+`memberId`/`hostName` are plain strings.
+
+This exists so a re-implementation can **independently construct** each message
+from the fields and check that its marshaling reproduces `BYTES` — a stronger
+check than round-tripping `BYTES` alone, which a reader bug mirrored by a writer
+bug could pass. The Rust port's `tests/fields.rs` does exactly this. Adding
+`FIELDS` does not change `BYTES`/`CHECKSUM`; the marshaled bytes are unaffected.
 
 `FPRINT empty` is `a795d0f29b4dcdf8` — equal to the polynomial, the documented
 fingerprint of the empty string, a quick correctness check for the Rabin-64

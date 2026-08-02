@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/rsl-wire"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Azure/RSL"
+
+# Keep the wire kernel lean: deny warnings in CI, small profiles.
+[profile.release]
+lto = true
+codegen-units = 1

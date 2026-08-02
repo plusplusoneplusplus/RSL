@@ -1,0 +1,3 @@
+# Rust build output. Cargo.lock IS committed (workspace with binaries/tests) for
+# reproducible CI builds.
+/target

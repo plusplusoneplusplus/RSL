@@ -75,8 +75,14 @@ jobs:
       - name: Detect Rust sources
         id: detect
         run: |
-          if [ -n "$(git ls-files '**/Cargo.toml' Cargo.toml)" ]; then
+          # First Cargo.toml wins (root sorts before nested); its directory is
+          # where cargo runs. Handles the workspace living under rust/ without
+          # hardcoding the path.
+          manifest="$(git ls-files 'Cargo.toml' '**/Cargo.toml' | head -1)"
+          if [ -n "$manifest" ]; then
             echo "has_rust=true" >> "$GITHUB_OUTPUT"
+            echo "dir=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
+            echo "Rust workspace at: $(dirname "$manifest")"
           else
             echo "has_rust=false" >> "$GITHUB_OUTPUT"
             echo "No Cargo.toml found; skipping Rust build/test."
@@ -91,16 +97,20 @@ jobs:
 
       - name: Format check
         if: steps.detect.outputs.has_rust == 'true'
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo fmt --all --check
 
       - name: Clippy
         if: steps.detect.outputs.has_rust == 'true'
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
         if: steps.detect.outputs.has_rust == 'true'
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo build --all-targets --all-features
 
       - name: Test
         if: steps.detect.outputs.has_rust == 'true'
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo test --all-features

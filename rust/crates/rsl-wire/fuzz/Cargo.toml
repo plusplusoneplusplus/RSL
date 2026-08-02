@@ -1,0 +1,28 @@
+[package]
+name = "rsl-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Detach from the parent workspace: cargo-fuzz needs nightly + libfuzzer, so this
+# crate must not be built by a plain `cargo build` of the rsl-wire workspace.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rsl-wire]
+path = ".."
+
+[[bin]]
+name = "unmarshal"
+path = "fuzz_targets/unmarshal.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
