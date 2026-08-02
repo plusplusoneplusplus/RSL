@@ -291,3 +291,11 @@ __pycache__/
 *.btm.cs
 *.odx.cs
 *.xsd.cs
+
+# CMake (Linux port) out-of-tree build output
+/build/
+CMakeUserPresets.json
+
+# Claude Code local settings (keep the shared skills symlink)
+/.claude/*
+!/.claude/skills
