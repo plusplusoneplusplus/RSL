@@ -61,8 +61,13 @@ struct Constants
     //Bits for meta data per posting
     static const UInt8 DEFAULT_META_BITS_PER_POSTING = 2;
 
+#ifdef _WIN32
     static const UInt64 MIN_LOC = 0Ui64;
     static const UInt64 MAX_LOC = (0Ui64 - 1Ui64);
+#else
+    static const UInt64 MIN_LOC = 0ULL;
+    static const UInt64 MAX_LOC = (0ULL - 1ULL);
+#endif
 
     //Number of document records per subdoc file entry
     static const UInt8 SUBDOC_ENTRY_SPAN = 4;

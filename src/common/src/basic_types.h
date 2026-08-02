@@ -294,7 +294,11 @@ typedef union tagFAInt64
     tagFAInt64( Int64  iVal ):i64(iVal){};
     tagFAInt64( UInt32 nHigh, UInt32 nLow ): n32_low(nLow), n32_hi(nHigh){};
     tagFAInt64( Int32  iHigh, Int32  iLow ): i32_low(iLow), i32_hi(iHigh){};
+#ifdef _WIN32
+    // On LP64 gcc/clang DWORD == UInt32, so this overload collides with the
+    // (UInt32,UInt32) ctor above; it's only needed for the Windows build.
     tagFAInt64( DWORD  nHigh, DWORD  nLow ): n32_low(nLow), n32_hi(nHigh){};
+#endif
     tagFAInt64( const FILETIME&  rftSrc ): ft(rftSrc){};
 
 } FAInt64;  // flexible access 64 bit integer

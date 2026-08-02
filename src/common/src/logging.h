@@ -1,5 +1,6 @@
 #pragma once
 
+#ifdef _WIN32
 
 #define LogAssertInternal(exp, ...)  \
 do { \
@@ -11,3 +12,9 @@ RSLibImpl::Logger::FailFast(assertMessage); \
 } while (0)
 
 #include "logging_old.h"
+
+#else
+// Linux golden-gen slice: the full logging.cpp (SEH/minidump) is not ported.
+// Use a small stub that aborts on assert and prints diagnostics to stderr.
+#include <pal_logging.h>
+#endif

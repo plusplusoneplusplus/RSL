@@ -177,6 +177,11 @@ template <class C> inline void DLL<C>::insert(C *c,Link<C> &l,C *after)
 //
 template <class C>
 struct Queue : DLL<C> {
+  // Bring the dependent-base members into scope so the unqualified references
+  // below resolve under standard two-phase lookup (MSVC allows them implicitly;
+  // gcc/clang require this).
+  using DLL<C>::head;
+  using DLL<C>::link;
   C * tail;
 
   Link<C> & tail_link(C * c,Link<C> & l) {

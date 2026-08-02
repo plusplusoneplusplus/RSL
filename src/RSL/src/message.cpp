@@ -1,11 +1,22 @@
 
 #include "message.h"
+#ifdef _WIN32
 #include "hirestime.h"
 #include "rsldebug.h"
 #include "legislator.h"
 #include "utils.h"
 #include "limits.h"
 #include "FingerPrint.h"
+#else
+// Linux golden-gen slice: hirestime.h/rsldebug.h symbols are unused here, and
+// legislator.h would drag in the whole engine. msg_engine_compat.h supplies the
+// MemberSet declaration and page-rounding helpers that message.cpp actually
+// needs. FingerPrint.h differs only in case from the real fingerprint.h.
+#include "utils.h"
+#include "limits.h"
+#include "fingerprint.h"
+#include "msg_engine_compat.h"
+#endif
 #include <strsafe.h>
 
 using namespace std;
@@ -623,6 +634,7 @@ Message::GetBaseSize() const
     return size;
 }
 
+#ifdef _WIN32
 bool
 Message::ReadFromSocket(StreamSocket *socket, UInt32 maxMessageSize)
 {
@@ -675,6 +687,7 @@ Message::ReadFromSocket(StreamSocket *socket, UInt32 maxMessageSize)
 
     return true;
 }
+#endif // _WIN32
 
 bool
 Message::IsVersionValid(UInt16 version)
