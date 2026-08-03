@@ -9,7 +9,10 @@
 //! by the C++ parse here with identical accept/reject decisions — proven against
 //! the Phase-3a golden corpus (`tools/golden-gen --storage`).
 //!
-//! The log-file reader/writer (`.log`) is Phase 3c and is not in this crate yet.
+//! Phase 3c adds the rest of the data directory: the log (`<decree>.log`)
+//! writer, its decree→offset index and the startup recovery scan ([`log`]);
+//! file naming, enumeration and `defunct.txt` ([`dir`]); and the log/checkpoint
+//! retention rule ([`gc`]).
 //!
 //! ## Design
 //! * **Blocking `std::fs`**, no async: checkpoint I/O is a background activity in
@@ -41,6 +44,25 @@
 //!   reader verifies it. This port marshals it identically (a plain `u64` field
 //!   under the writer's control) so the bytes match; header integrity comes from
 //!   the embedded next-vote's own Rabin-64, which *is* verified.
+//! * **Zeroed log record pads** — the C++ log writer hands `WriteFileGather`
+//!   whatever its marshal buffer held past the message (zero for votes, heap
+//!   garbage elsewhere). [`log::LogWriter`] always zeroes the pad, because the
+//!   recovery scan reads an all-zero header page as a clean end-of-log. Readers
+//!   on both sides tolerate non-zero pads (the checksum covers only the message
+//!   body) — the Phase-3a `garbage-pad` sample pins that.
+//! * **Out-of-sequence vote in the decree index** — the C++ `LogFile::AddMessage`
+//!   `LogAssert`s (`legislator.cpp:722`);
+//!   [`log::DecreeIndex::add_message`] returns [`log::IndexError`], and
+//!   [`log::LogWriter::append_batch`] refuses the batch before writing anything.
+//! * **Out-of-range decree lookup** — `LogFile::GetOffset` `LogAssert`s
+//!   (`legislator.cpp:738`); [`log::DecreeIndex::offset`] returns `None`.
+//! * **Log GC with no checkpoint present** — `CleanupLogsAndCheckpoint` reads
+//!   `checkpoints[0]` from a possibly-empty vector (`legislator.cpp:5713`);
+//!   [`gc::plan`] deletes no logs in that case.
+//! * **Unparsable `*.log`/`*.codex` name** — both sides fail the enumeration;
+//!   [`dir::DataDir::scan`] reports [`dir::DirError::UnparsableName`] where the
+//!   C++ returns `ERROR_INVALID_PARAMETER`, and this parser takes leading ASCII
+//!   digits only where `sscanf("%I64u")` would also accept whitespace or a sign.
 //! * **Multi-buffer next-vote** — a C++ `Vote` that grew past one marshal buffer
 //!   is emitted by `CheckpointHeader::Marshal` as `sum(RoundUpToPage(buf_i))`
 //!   bytes while `GetMarshalLen` reserved only `RoundUpToPage(sum(buf_i))` — the
@@ -49,7 +71,10 @@
 //!   every parsed or single-buffer vote produces.
 
 pub mod checkpoint;
+pub mod dir;
 pub mod durability;
+pub mod gc;
+pub mod log;
 
 /// `s_PageSize` (`legislator.h:16`) — every on-disk record is padded to a
 /// multiple of this.

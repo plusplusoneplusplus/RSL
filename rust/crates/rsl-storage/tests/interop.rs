@@ -184,3 +184,188 @@ fn cpp_rejects_a_corrupted_rust_checkpoint() {
         "C++ rejected for a different reason: {line}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
+
+use rsl_storage::durability::NoSync;
+use rsl_storage::log::{self, LogWriter};
+use rsl_wire::messages::{MSG_PREPARE, MSG_RECONFIGURATION_DECISION};
+use rsl_wire::{marshal_base, PrepareMsg};
+
+fn log_header(msg_id: u16, decree: u64) -> Header {
+    Header::new(
+        ProtocolVersion::V6,
+        msg_id,
+        MemberId::from_str("101"),
+        decree,
+        7,
+        BallotNumber::new(3, MemberId::from_str("202")),
+        0,
+    )
+}
+
+fn vote_record(decree: u64, request_len: usize) -> Vec<u8> {
+    let mut vote = Vote::new(log_header(MSG_VOTE, decree));
+    if request_len > 0 {
+        vote.add_request(vec![b'r'; request_len]);
+    }
+    vote.marshal_with_checksum().unwrap()
+}
+
+/// The `--verify-storage` line for `name`, e.g.
+/// `"7.log: accept records=3 stopOffset=2048 (all records valid to EOF)"`.
+fn verdict_for<'a>(stdout: &'a str, name: &str) -> &'a str {
+    stdout
+        .lines()
+        .find(|l| l.starts_with(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("no verdict for {name} in:\n{stdout}"))
+}
+
+fn verify_storage(generator: &std::path::Path, dir: &std::path::Path) -> String {
+    let output = Command::new(generator)
+        .arg("--verify-storage")
+        .arg(dir)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", generator.display()));
+    assert!(
+        output.status.success(),
+        "golden-gen --verify-storage exited {}",
+        output.status
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The extracted C++ reader accepts logs this crate writes, and reports the
+/// same record count and stop offset the Rust scan does.
+#[test]
+fn cpp_accepts_rust_written_logs() {
+    let Some(generator) = common::golden_gen() else {
+        eprintln!("cpp_accepts_rust_written_logs: SKIPPED — golden-gen is not built.");
+        return;
+    };
+    let dir = common::TempDir::new("interop-log");
+
+    // One log per shape, each named after the first decree it holds.
+    let cases: Vec<(u64, Vec<Vec<u8>>)> = vec![
+        // Empty (a freshly opened log).
+        (10, vec![]),
+        // A single single-page vote.
+        (20, vec![vote_record(20, 0)]),
+        // Mixed record kinds, including a multi-page vote.
+        (
+            30,
+            vec![
+                PrepareMsg {
+                    header: log_header(MSG_PREPARE, 30),
+                    primary_cookie: Vec::new(),
+                }
+                .marshal_with_checksum(),
+                vote_record(30, 0),
+                vote_record(31, 600),
+                marshal_base(&log_header(MSG_RECONFIGURATION_DECISION, 31)),
+            ],
+        ),
+        // A long run, appended one record at a time.
+        (
+            40,
+            (0..32)
+                .map(|i| vote_record(40 + i, 40 * i as usize))
+                .collect(),
+        ),
+    ];
+
+    for (file_decree, records) in &cases {
+        let mut writer = LogWriter::open(dir.path(), *file_decree).expect("open");
+        for record in records {
+            writer.append(record).expect("append");
+        }
+        writer.sync().expect("sync");
+    }
+
+    let stdout = verify_storage(&generator, dir.path());
+    for (file_decree, records) in &cases {
+        let name = format!("{file_decree}.log");
+        let line = verdict_for(&stdout, &name);
+        assert!(
+            line.contains(" accept "),
+            "C++ rejected a Rust-written log: {line}"
+        );
+        assert!(
+            line.contains(&format!("records={}", records.len())),
+            "wrong recovered record count: {line}"
+        );
+
+        let scan = log::scan_file(&dir.join(&name)).expect("scan");
+        assert_eq!(scan.records.len(), records.len());
+        assert!(
+            line.contains(&format!("stopOffset={}", scan.stop_offset)),
+            "C++ and Rust disagree on the stop offset: {line}"
+        );
+        assert!(
+            line.contains(scan.detail()),
+            "C++ and Rust disagree on the detail: {line}"
+        );
+    }
+}
+
+/// Damaged logs: both readers must reach the *same* verdict, not merely refuse
+/// the file. Each case mirrors one Phase-3a corpus sample, built from the Rust
+/// side this time.
+#[test]
+fn cpp_and_rust_agree_on_damaged_rust_logs() {
+    let Some(generator) = common::golden_gen() else {
+        eprintln!("cpp_and_rust_agree_on_damaged_rust_logs: SKIPPED — golden-gen is not built.");
+        return;
+    };
+    let dir = common::TempDir::new("interop-log-bad");
+
+    // Build one good two-record log, then damage copies of it.
+    let mut writer = LogWriter::open_with(dir.path(), 1, NoSync).expect("open");
+    writer.append(&vote_record(1, 0)).expect("append");
+    writer.append(&vote_record(2, 0)).expect("append");
+    drop(writer);
+    let clean = std::fs::read(dir.join("1.log")).expect("read");
+    std::fs::remove_file(dir.join("1.log")).expect("remove");
+
+    // 2.log: a zero page after the records — the clean end of a log.
+    let mut zero_tail = clean.clone();
+    zero_tail.resize(clean.len() + rsl_storage::PAGE_SIZE as usize, 0);
+    std::fs::write(dir.join("2.log"), &zero_tail).expect("write");
+
+    // 3.log: a torn trailing record (header page plus a partial body).
+    let torn = vote_record(3, 600);
+    let mut torn_tail = clean.clone();
+    torn_tail.extend_from_slice(&torn[..rsl_storage::PAGE_SIZE as usize + 188]);
+    std::fs::write(dir.join("3.log"), &torn_tail).expect("write");
+
+    // 4.log: a corrupt first record with a valid one behind it.
+    let mut corrupt = clean.clone();
+    corrupt[40] ^= 0xff;
+    std::fs::write(dir.join("4.log"), &corrupt).expect("write");
+
+    let stdout = verify_storage(&generator, dir.path());
+    for name in ["2.log", "3.log", "4.log"] {
+        let scan = log::scan_file(&dir.join(name)).expect("scan");
+        let line = verdict_for(&stdout, name);
+        assert!(
+            line.contains(&format!(" {} ", scan.outcome())),
+            "C++ and Rust disagree on the outcome for {name}: {line} vs {}",
+            scan.outcome()
+        );
+        assert!(
+            line.contains(&format!("records={}", scan.records.len())),
+            "record count disagreement for {name}: {line}"
+        );
+        assert!(
+            line.contains(&format!("stopOffset={}", scan.stop_offset)),
+            "stop offset disagreement for {name}: {line}"
+        );
+        assert!(
+            line.contains(scan.detail()),
+            "detail disagreement for {name}: {line} vs {}",
+            scan.detail()
+        );
+    }
+}

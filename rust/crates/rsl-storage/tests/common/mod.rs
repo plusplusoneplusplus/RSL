@@ -82,8 +82,75 @@ pub fn warn_no_corpus(test: &str) {
     );
 }
 
-/// One `files[]` entry of `corpus/storage/MANIFEST.json`, restricted to the
-/// checkpoint fields (Phase 3c will want the log ones).
+/// Parse the MANIFEST once per test binary.
+fn manifest(corpus: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(corpus.join("MANIFEST.json")).expect("read MANIFEST.json");
+    serde_json::from_str(&text).expect("parse MANIFEST.json")
+}
+
+/// One `records[]` entry of a `kind: "log"` MANIFEST file.
+#[derive(Debug)]
+pub struct ManifestRecord {
+    pub offset: u64,
+    pub msg_id: u16,
+    pub decree: u64,
+    pub un_marshal_len: u32,
+    pub padded_len: u32,
+    pub checksum: u64,
+}
+
+/// One `kind: "log"` entry of `corpus/storage/MANIFEST.json`.
+#[derive(Debug)]
+pub struct LogSample {
+    pub name: String,
+    pub file: String,
+    pub size: u64,
+    pub fp64: u64,
+    pub outcome: String,
+    pub stop_offset: u64,
+    pub record_count: usize,
+    pub detail: String,
+    pub records: Vec<ManifestRecord>,
+}
+
+/// Every `kind: "log"` entry in the corpus MANIFEST.
+pub fn log_samples(corpus: &Path) -> Vec<LogSample> {
+    let manifest = manifest(corpus);
+    let files = manifest["files"].as_array().expect("files[]");
+    files
+        .iter()
+        .filter(|f| f["kind"] == "log")
+        .map(|f| LogSample {
+            name: f["name"].as_str().unwrap().to_string(),
+            file: f["file"].as_str().unwrap().to_string(),
+            size: f["size"].as_u64().unwrap(),
+            fp64: u64::from_str_radix(f["fp64"].as_str().unwrap(), 16).unwrap(),
+            outcome: f["outcome"].as_str().unwrap().to_string(),
+            stop_offset: f["stopOffset"].as_u64().unwrap(),
+            record_count: f["recordCount"].as_u64().unwrap() as usize,
+            detail: f["detail"].as_str().unwrap().to_string(),
+            records: f["records"]
+                .as_array()
+                .expect("records[]")
+                .iter()
+                .map(|r| ManifestRecord {
+                    offset: r["offset"].as_u64().unwrap(),
+                    msg_id: r["msgId"].as_u64().unwrap() as u16,
+                    decree: u64::from_str_radix(
+                        r["decree"].as_str().unwrap().trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap(),
+                    un_marshal_len: r["unMarshalLen"].as_u64().unwrap() as u32,
+                    padded_len: r["paddedLen"].as_u64().unwrap() as u32,
+                    checksum: u64::from_str_radix(r["checksum"].as_str().unwrap(), 16).unwrap(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// One `kind: "checkpoint"` entry of `corpus/storage/MANIFEST.json`.
 #[derive(Debug)]
 pub struct CheckpointSample {
     pub name: String,
@@ -103,9 +170,7 @@ pub struct CheckpointSample {
 
 /// Every `kind: "checkpoint"` entry in the corpus MANIFEST.
 pub fn checkpoint_samples(corpus: &Path) -> Vec<CheckpointSample> {
-    let text = std::fs::read_to_string(corpus.join("MANIFEST.json")).expect("read MANIFEST.json");
-    let manifest: serde_json::Value = serde_json::from_str(&text).expect("parse MANIFEST.json");
-
+    let manifest = manifest(corpus);
     let files = manifest["files"].as_array().expect("files[]");
     files
         .iter()

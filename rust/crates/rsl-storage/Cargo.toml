@@ -19,5 +19,9 @@ criterion = { version = "0.5", default-features = false }
 name = "checkpoint"
 harness = false
 
+[[bench]]
+name = "log"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
