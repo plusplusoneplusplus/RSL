@@ -32,6 +32,15 @@ pub struct Fprint {
     pub checksum: u64,
 }
 
+/// One raw `MarshalData` container vector (`StartContainer`/`CloseContainer`
+/// back-patch scenarios; no checksum — these are not messages). The Rust test
+/// rebuilds the scenario named by `desc` and must reproduce `bytes` exactly.
+pub struct Container {
+    pub desc: String,
+    pub len: usize,
+    pub bytes: Vec<u8>,
+}
+
 impl Record {
     /// Map the corpus `TYPE` to the parser that should handle it. The base
     /// class handles the twelve payload-less message ids.
@@ -58,22 +67,35 @@ pub fn corpus_path() -> PathBuf {
 
 /// Load and parse the corpus into its records and fingerprint vectors.
 pub fn load() -> (Vec<Record>, Vec<Fprint>) {
+    let (records, fprints, _) = load_all();
+    (records, fprints)
+}
+
+/// Load only the raw container vectors.
+pub fn load_containers() -> Vec<Container> {
+    load_all().2
+}
+
+/// Load and parse every block kind in the corpus.
+pub fn load_all() -> (Vec<Record>, Vec<Fprint>, Vec<Container>) {
     let path = corpus_path();
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read corpus at {}: {e}", path.display()));
 
     let mut records = Vec::new();
     let mut fprints = Vec::new();
+    let mut containers = Vec::new();
 
     // Split into blocks on blank lines; skip comment lines.
     let mut block: Vec<&str> = Vec::new();
-    let flush = |block: &mut Vec<&str>, records: &mut Vec<Record>, fprints: &mut Vec<Fprint>| {
+    let mut flush = |block: &mut Vec<&str>| {
         if block.is_empty() {
             return;
         }
         match block[0] {
             "RECORD" => records.push(parse_record(block)),
             "FPRINT" => fprints.push(parse_fprint(block)),
+            "CONTAINER" => containers.push(parse_container(block)),
             other => panic!("unexpected block header {other:?}"),
         }
         block.clear();
@@ -84,14 +106,14 @@ pub fn load() -> (Vec<Record>, Vec<Fprint>) {
             continue;
         }
         if line.trim().is_empty() {
-            flush(&mut block, &mut records, &mut fprints);
+            flush(&mut block);
         } else {
             block.push(line);
         }
     }
-    flush(&mut block, &mut records, &mut fprints);
+    flush(&mut block);
 
-    (records, fprints)
+    (records, fprints, containers)
 }
 
 /// Value after the first space of a `KEY value` line.
@@ -117,6 +139,15 @@ fn parse_record(lines: &[&str]) -> Record {
         checksum: u64::from_str_radix(require(lines, "CHECKSUM"), 16).unwrap(),
         bytes: from_hex(bytes_line),
         fields: value(lines, "FIELDS").map(str::to_string),
+    }
+}
+
+fn parse_container(lines: &[&str]) -> Container {
+    let bytes_line = value(lines, "BYTES").unwrap_or("");
+    Container {
+        desc: require(lines, "DESC").to_string(),
+        len: require(lines, "LEN").parse().unwrap(),
+        bytes: from_hex(bytes_line),
     }
 }
 

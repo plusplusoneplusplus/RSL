@@ -473,6 +473,91 @@ void GenerateBootstrap()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Raw MarshalData container vectors (Phase-2 gap closure, item 4a). The
+// StartContainer/CloseContainer back-patch rule (1-byte vs 4-byte length is
+// caller-chosen) has no message-level coverage until checkpoint headers arrive
+// in Phase 3, so emit it directly here. CONTAINER blocks carry no checksum:
+// they are raw MarshalData output, not messages. The Rust harness rebuilds each
+// scenario by DESC with its Writer and must match BYTES exactly.
+// ---------------------------------------------------------------------------
+void EmitContainer(const char* desc, MarshalData& marshal)
+{
+    printf("CONTAINER\n");
+    printf("DESC %s\n", desc);
+    printf("LEN %u\n", (unsigned)marshal.GetMarshaledLength());
+    printf("BYTES %s\n",
+           ToHex(marshal.GetMarshaled(), marshal.GetMarshaledLength()).c_str());
+    printf("\n");
+}
+
+void GenerateContainers()
+{
+    // 1-byte (short) length: empty body.
+    {
+        MarshalData m;
+        MarshalStartPlaceHolder* ph = m.StartContainer(true);
+        m.CloseContainer(ph);
+        EmitContainer("short-empty", m);
+    }
+    // 1-byte length: small body.
+    {
+        MarshalData m;
+        MarshalStartPlaceHolder* ph = m.StartContainer(true);
+        m.WriteData(5, (void*)"hello");
+        m.CloseContainer(ph);
+        EmitContainer("short-hello", m);
+    }
+    // 1-byte length at its 255-byte maximum (LogAssert(length < 256) boundary).
+    {
+        unsigned char ramp[255];
+        for (int i = 0; i < 255; ++i) { ramp[i] = (unsigned char)i; }
+        MarshalData m;
+        MarshalStartPlaceHolder* ph = m.StartContainer(true);
+        m.WriteData(sizeof(ramp), ramp);
+        m.CloseContainer(ph);
+        EmitContainer("short-max-255", m);
+    }
+    // 4-byte (long) length: empty body.
+    {
+        MarshalData m;
+        MarshalStartPlaceHolder* ph = m.StartContainer(false);
+        m.CloseContainer(ph);
+        EmitContainer("long-empty", m);
+    }
+    // 4-byte length: small body (shows the same body under the other rule).
+    {
+        MarshalData m;
+        MarshalStartPlaceHolder* ph = m.StartContainer(false);
+        m.WriteData(5, (void*)"hello");
+        m.CloseContainer(ph);
+        EmitContainer("long-hello", m);
+    }
+    // 4-byte length: body larger than a short container could hold.
+    {
+        unsigned char ramp[300];
+        for (int i = 0; i < 300; ++i) { ramp[i] = (unsigned char)(i & 0xff); }
+        MarshalData m;
+        MarshalStartPlaceHolder* ph = m.StartContainer(false);
+        m.WriteData(sizeof(ramp), ramp);
+        m.CloseContainer(ph);
+        EmitContainer("long-300", m);
+    }
+    // Nested: a long outer holding a mixed body with a short inner container;
+    // exercises inner-before-outer back-patch ordering.
+    {
+        MarshalData m;
+        MarshalStartPlaceHolder* outer = m.StartContainer(false);
+        m.WriteUInt32(0xdeadbeef);
+        MarshalStartPlaceHolder* inner = m.StartContainer(true);
+        m.WriteData(3, (void*)"abc");
+        m.CloseContainer(inner);
+        m.WriteUInt16(0xbeef);
+        m.CloseContainer(outer);
+        EmitContainer("nested-long-short", m);
+    }
+}
+
 void GenerateFingerprints()
 {
     // Empty string -> the "empty" fingerprint (== the polynomial itself).
@@ -513,6 +598,8 @@ int main()
     GeneratePrepareAccepted();
     GenerateStatusResponse();
     GenerateBootstrap();
+    // New record kinds go last so existing RECORD/FPRINT bytes never move.
+    GenerateContainers();
 
     fprintf(stderr, "self-check: %d passed, %d failed\n",
             g_selfCheckPassed, g_selfCheckFailed);

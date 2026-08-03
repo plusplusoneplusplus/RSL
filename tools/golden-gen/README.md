@@ -83,7 +83,23 @@ DESC <text>
 LEN <bytes>
 INPUT <hex>
 CHECKSUM <16 hex>
+
+CONTAINER               # raw MarshalData StartContainer/CloseContainer vectors
+DESC <scenario name>    # rebuilt by name in the Rust tests/containers.rs
+LEN <bytes>
+BYTES <hex>             # no checksum: raw MarshalData output, not a message
 ```
+
+`CONTAINER` blocks (Phase-2 gap closure) pin down the container back-patch
+rule — a caller-chosen 1-byte or 4-byte length field, zero-reserved by
+`StartContainer` and filled in by `CloseContainer` — which no message-level
+record exercises until checkpoint headers arrive in Phase 3. New block kinds
+are always appended after the existing output so RECORD/FPRINT bytes never
+move.
+
+**Bootstrap appears only at v4–v6.** That is deliberate, not a coverage hole:
+`Message_Bootstrap` was introduced with protocol version 4, so no v1–v3
+vector can exist.
 
 ### `FIELDS` — machine-readable constructor parameters
 
