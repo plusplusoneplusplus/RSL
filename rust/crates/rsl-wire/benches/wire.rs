@@ -42,7 +42,7 @@ fn bench_marshal(c: &mut Criterion) {
         b.iter(|| std::hint::black_box(&vote).marshal_with_checksum())
     });
 
-    let bytes = vote.marshal_with_checksum();
+    let bytes = vote.marshal_with_checksum().unwrap();
     c.bench_function("unmarshal_vote_v6", |b| {
         b.iter(|| Vote::unmarshal(std::hint::black_box(&bytes)))
     });

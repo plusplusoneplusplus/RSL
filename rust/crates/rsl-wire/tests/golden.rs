@@ -61,7 +61,9 @@ fn every_record_round_trips_byte_exact() {
         assert_eq!(header.checksum, rec.checksum, "{ctx}: checksum field value");
 
         // (c) re-marshal is byte-identical.
-        let remarshaled = msg.marshal_with_checksum();
+        let remarshaled = msg
+            .marshal_with_checksum()
+            .unwrap_or_else(|e| panic!("{ctx}: re-marshal failed: {e}"));
         assert_eq!(
             remarshaled, rec.bytes,
             "{ctx}: re-marshal is not byte-identical"

@@ -8,7 +8,7 @@
 //! * remaining bytes: zero or more client requests, each a `u32` length + bytes,
 //!   filling the message out to its `un_marshal_len`.
 
-use super::{Header, MSG_VOTE};
+use super::{Header, MarshalError, MSG_VOTE};
 use crate::marshal::{Reader, Writer};
 use crate::types::MemberSet;
 
@@ -56,8 +56,22 @@ impl Vote {
 
     /// Write the full message (header + body) without patching the checksum.
     /// Used both standalone and when nested inside a [`super::PrepareAccepted`].
-    pub(crate) fn write_to(&self, w: &mut Writer) {
+    ///
+    /// Errors on a reconfiguration vote that also carries requests: no C++
+    /// writer produces that shape, and the C++ *parser* aborts on it
+    /// (`LogAssert(!m_isReconfiguration)`, `message.cpp:953`), so emitting it
+    /// would be lethal to a C++ peer. Also errors if `is_reconfiguration` is
+    /// set without a member set (no wire form exists).
+    pub(crate) fn write_to(&self, w: &mut Writer) -> Result<(), MarshalError> {
         let v = self.header.version;
+        if self.is_reconfiguration && v.has_reconfiguration() {
+            if !self.requests.is_empty() {
+                return Err(MarshalError::ReconfigurationVoteWithRequests);
+            }
+            if self.members_in_new_configuration.is_none() {
+                return Err(MarshalError::ReconfigurationVoteWithoutMemberSet);
+            }
+        }
         self.header.write(w, self.marshal_len());
 
         if v.has_primary_cookie() {
@@ -68,7 +82,7 @@ impl Vote {
             if self.is_reconfiguration {
                 self.members_in_new_configuration
                     .as_ref()
-                    .expect("reconfiguration vote without a member set")
+                    .expect("checked above")
                     .marshal(w, v);
             }
         }
@@ -79,13 +93,15 @@ impl Vote {
             w.write_u32(req.len() as u32);
             w.write_data(req);
         }
+        Ok(())
     }
 
-    /// Marshal to bytes with the checksum patched in.
-    pub fn marshal_with_checksum(&self) -> Vec<u8> {
+    /// Marshal to bytes with the checksum patched in. Errors on the C++-lethal
+    /// reconfiguration shapes — see `Vote::write_to`.
+    pub fn marshal_with_checksum(&self) -> Result<Vec<u8>, MarshalError> {
         let mut w = Writer::with_capacity(self.marshal_len() as usize);
-        self.write_to(&mut w);
-        super::finalize(w.into_bytes())
+        self.write_to(&mut w)?;
+        Ok(super::finalize(w.into_bytes()))
     }
 
     /// Parse a vote from `buf` (which starts at the vote header). Requests are

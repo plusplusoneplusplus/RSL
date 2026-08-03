@@ -6,7 +6,7 @@
 //! zeroed checksum field along with everything else.
 
 use super::vote::Vote;
-use super::{Header, MSG_PREPARE_ACCEPTED};
+use super::{Header, MarshalError, MSG_PREPARE_ACCEPTED};
 use crate::marshal::{Reader, Writer};
 
 #[derive(Clone, Debug)]
@@ -21,13 +21,15 @@ impl PrepareAccepted {
         self.vote.marshal_len() + Header::base_size(self.header.version)
     }
 
-    pub fn marshal_with_checksum(&self) -> Vec<u8> {
+    /// Errors on the C++-lethal nested-vote reconfiguration shapes — see
+    /// `Vote::write_to`.
+    pub fn marshal_with_checksum(&self) -> Result<Vec<u8>, MarshalError> {
         let mut w = Writer::with_capacity(self.marshal_len() as usize);
         self.header.write(&mut w, self.marshal_len());
         // Nested vote is written in full, unchecksummed (write_to, not
         // marshal_with_checksum).
-        self.vote.write_to(&mut w);
-        super::finalize(w.into_bytes())
+        self.vote.write_to(&mut w)?;
+        Ok(super::finalize(w.into_bytes()))
     }
 
     pub fn unmarshal(buf: &[u8]) -> Option<PrepareAccepted> {

@@ -12,7 +12,7 @@
 
 mod common;
 
-use rsl_wire::{Msg, MsgKind};
+use rsl_wire::{MarshalError, Msg, MsgKind};
 
 const KINDS: [MsgKind; 7] = [
     MsgKind::Base,
@@ -27,14 +27,22 @@ const KINDS: [MsgKind; 7] = [
 /// Assert the two invariants for one (kind, buffer) pair.
 fn check(kind: MsgKind, buf: &[u8]) {
     if let Some(msg) = Msg::unmarshal(kind, buf) {
-        let b1 = msg.marshal_with_checksum();
+        let b1 = match msg.marshal_with_checksum() {
+            Ok(b) => b,
+            // The one accepted-but-unwritable shape: a reconfiguration vote
+            // with trailing bytes parses (the reader is permissive where the
+            // C++ aborts — see the whitelist in the crate docs), but the
+            // writer refuses to re-emit it.
+            Err(MarshalError::ReconfigurationVoteWithRequests) => return,
+            Err(e) => panic!("unexpected marshal error from a parsed message: {e}"),
+        };
         // Marshaling a parsed message yields a self-consistent, verifiable blob.
         assert!(
             rsl_wire::messages::verify_checksum(&b1),
             "checksum of re-marshaled message does not verify"
         );
         let msg2 = Msg::unmarshal(kind, &b1).expect("re-parse of own output failed");
-        let b2 = msg2.marshal_with_checksum();
+        let b2 = msg2.marshal_with_checksum().expect("re-marshal failed");
         assert_eq!(b1, b2, "not idempotent under marshal/parse");
     }
 }

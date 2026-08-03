@@ -89,12 +89,16 @@ impl MemberId {
         }
     }
 
-    /// `MemberId::UnMarshal`. Returns `None` on a short buffer.
+    /// `MemberId::UnMarshal`. Returns `None` on a short buffer, or on a v>=4
+    /// field with no NUL terminator (the C++ rejects via `StringCbLengthA`,
+    /// `message.cpp:174-180`; this also preserves the crate's own
+    /// [`MAX_MEMBER_ID_LEN`] invariant).
     pub fn unmarshal(r: &mut Reader, version: ProtocolVersion) -> Option<MemberId> {
         if version.member_id_is_fixed64() {
             let field = r.read_data(MEMBER_ID_SIZE as u32)?;
             // Value is everything up to the first NUL; ignore trailing padding.
-            let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+            // A field with no NUL at all is rejected, matching the C++.
+            let end = field.iter().position(|&b| b == 0)?;
             Some(MemberId {
                 value: field[..end].to_vec(),
             })
@@ -138,25 +142,80 @@ impl Ord for MemberId {
     }
 }
 
-/// Parse a member-id string as `_strtoui64(s, .., 0)` does: base auto-detected
-/// from the prefix (`0x` hex, leading `0` octal, else decimal); empty ⇒ 0.
+/// Parse a member-id string exactly as `RSLNode::ParseMemberIdAsUInt64`
+/// (`rsl.cpp:30-38`) does: empty ⇒ 0, otherwise `_strtoui64(s, &end, 0)`
+/// followed by `LogAssert(*end == 0)`.
 ///
-/// Corpus ids are plain decimals; the prefix handling keeps parity with the C++
-/// for any pre-v3 id an application might have used.
+/// `strtoull` semantics with base 0: optional leading whitespace and sign, base
+/// auto-detected from the prefix (`0x` hex, leading `0` octal, else decimal),
+/// overflow saturates to `u64::MAX`, a `-` negates by two's-complement wrap.
+/// Anything left over after the digit run (including a string with no digits at
+/// all) made the C++ `LogAssert`-abort; this port panics there instead —
+/// unreachable for legally-configured clusters, and never reachable from the
+/// reader (which only produces canonical decimal ids pre-v4).
+///
+/// Corpus ids are plain decimals; the full semantics keep writer-side value
+/// parity with the C++ for any v<=3 id an application might have used.
 fn parse_member_id_u64(value: &[u8]) -> u64 {
-    let s = match std::str::from_utf8(value) {
-        Ok(s) if !s.is_empty() => s,
-        _ => return 0,
-    };
-    let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
-    {
-        (16, rest)
-    } else if s.len() > 1 && s.starts_with('0') {
-        (8, &s[1..])
+    if value.is_empty() {
+        return 0;
+    }
+
+    let mut i = 0;
+    // Leading whitespace (C `isspace`).
+    while i < value.len() && (value[i] == b' ' || (0x09..=0x0d).contains(&value[i])) {
+        i += 1;
+    }
+    // Optional sign.
+    let mut negative = false;
+    if i < value.len() && (value[i] == b'+' || value[i] == b'-') {
+        negative = value[i] == b'-';
+        i += 1;
+    }
+    // Base detection ("0x" only counts as a hex prefix if a hex digit follows;
+    // otherwise the "0" is consumed as an octal digit and the "x" is garbage).
+    let radix: u32 = if value.get(i) == Some(&b'0') {
+        if matches!(value.get(i + 1), Some(b'x') | Some(b'X'))
+            && value.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            i += 2;
+            16
+        } else {
+            8
+        }
     } else {
-        (10, s)
+        10
     };
-    u64::from_str_radix(digits, radix).unwrap_or(0)
+
+    let digits_start = i;
+    let mut acc: u64 = 0;
+    let mut overflow = false;
+    while i < value.len() {
+        let Some(d) = (value[i] as char).to_digit(radix) else {
+            break;
+        };
+        let (v, o1) = acc.overflowing_mul(u64::from(radix));
+        let (v, o2) = v.overflowing_add(u64::from(d));
+        overflow |= o1 || o2;
+        acc = v;
+        i += 1;
+    }
+
+    // C++: LogAssert(*endPtr == NULL) — abort on trailing garbage, or when no
+    // digits were converted (endPtr then points at the first character).
+    assert!(
+        i == value.len() && i > digits_start,
+        "invalid v<=3 member id {:?}: not a full strtoull number (C++ LogAssert)",
+        String::from_utf8_lossy(value)
+    );
+
+    if overflow {
+        u64::MAX
+    } else if negative {
+        acc.wrapping_neg()
+    } else {
+        acc
+    }
 }
 
 /// A Paxos ballot number: a `u32` id paired with the member that owns it.
@@ -339,6 +398,57 @@ mod tests {
         let mut r = Reader::new(&noisy);
         let back = MemberId::unmarshal(&mut r, ProtocolVersion::V4).unwrap();
         assert_eq!(back.value(), b"202");
+    }
+
+    #[test]
+    fn member_id_v4_without_nul_is_rejected() {
+        // D1: a 64-byte field with no NUL anywhere must not parse (C++ rejects
+        // via StringCbLengthA; accepting it would break the 63-byte invariant).
+        let field = [b'A'; MEMBER_ID_SIZE];
+        let mut r = Reader::new(&field);
+        assert!(MemberId::unmarshal(&mut r, ProtocolVersion::V4).is_none());
+
+        // NUL in the last byte (a full 63-char id) is still fine.
+        let mut field = [b'A'; MEMBER_ID_SIZE];
+        field[63] = 0;
+        let mut r = Reader::new(&field);
+        let id = MemberId::unmarshal(&mut r, ProtocolVersion::V4).unwrap();
+        assert_eq!(id.value().len(), MAX_MEMBER_ID_LEN);
+    }
+
+    #[test]
+    fn member_id_u64_parse_matches_strtoull() {
+        // D4: writer-side value parity with _strtoui64(s, &end, 0).
+        let parse = |s: &str| parse_member_id_u64(s.as_bytes());
+        assert_eq!(parse(""), 0);
+        assert_eq!(parse("101"), 101);
+        assert_eq!(parse("0x1f"), 0x1f);
+        assert_eq!(parse("017"), 0o17);
+        assert_eq!(parse("0"), 0);
+        assert_eq!(parse(" \t42"), 42);
+        assert_eq!(parse("+7"), 7);
+        // '-' negates by unsigned wraparound.
+        assert_eq!(parse("-1"), u64::MAX);
+        // Overflow saturates to ULLONG_MAX (C++ wrote that value; the old Rust
+        // code silently wrote 0).
+        assert_eq!(parse("18446744073709551615"), u64::MAX);
+        assert_eq!(parse("18446744073709551616"), u64::MAX);
+        assert_eq!(parse("99999999999999999999999"), u64::MAX);
+        assert_eq!(parse("0xffffffffffffffffff"), u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid v<=3 member id")]
+    fn member_id_u64_trailing_garbage_panics() {
+        // C++ LogAssert(*endPtr == NULL) aborts on "123abc".
+        parse_member_id_u64(b"123abc");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid v<=3 member id")]
+    fn member_id_u64_no_digits_panics() {
+        // strtoull converts nothing; endPtr stays at 'a' — C++ aborts.
+        parse_member_id_u64(b"abc");
     }
 
     #[test]

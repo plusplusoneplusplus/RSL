@@ -193,7 +193,9 @@ proptest! {
 
     #[test]
     fn arbitrary_messages_reach_a_byte_fixpoint((kind, msg) in message()) {
-        let b0 = msg.marshal_with_checksum();
+        // The strategies never build the C++-lethal reconfig+requests shape,
+        // so marshaling cannot fail.
+        let b0 = msg.marshal_with_checksum().expect("valid message failed to marshal");
 
         // The writer's output must parse as the same kind.
         let parsed = Msg::unmarshal(kind, &b0)
@@ -203,7 +205,7 @@ proptest! {
         prop_assert!(rsl_wire::messages::verify_checksum(&b0));
 
         // Re-marshaling the parse is byte-identical.
-        let b1 = parsed.marshal_with_checksum();
+        let b1 = parsed.marshal_with_checksum().expect("re-marshal failed");
         prop_assert_eq!(b0, b1);
     }
 }

@@ -51,6 +51,37 @@ pub const MSG_JOIN: u16 = 12;
 pub const MSG_JOIN_REQUEST: u16 = 13;
 pub const MSG_BOOTSTRAP: u16 = 14;
 
+/// Error from marshaling a message state that no C++ writer can produce and
+/// whose *parse* would `LogAssert`-abort the C++ process. The Rust reader stays
+/// permissive for these shapes (accepting is safer than aborting — see the
+/// differential-fuzzer whitelist in the crate docs); the writer refuses to emit
+/// them so the port never puts a C++-lethal message on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarshalError {
+    /// A reconfiguration vote carrying client requests: the C++ writer cannot
+    /// produce this shape, and the C++ parser aborts on it
+    /// (`LogAssert(!m_isReconfiguration)`, `message.cpp:953`).
+    ReconfigurationVoteWithRequests,
+    /// `is_reconfiguration` set without a member set — no wire form exists
+    /// (the C++ reconfiguration `Vote` ctor always takes a `MemberSet`).
+    ReconfigurationVoteWithoutMemberSet,
+}
+
+impl std::fmt::Display for MarshalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MarshalError::ReconfigurationVoteWithRequests => {
+                write!(f, "reconfiguration vote carrying client requests")
+            }
+            MarshalError::ReconfigurationVoteWithoutMemberSet => {
+                write!(f, "reconfiguration vote without a member set")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MarshalError {}
+
 /// The fixed message header carried by every RSL message.
 ///
 /// `un_marshal_len` and `checksum` are recomputed on marshal, so setting them is
@@ -207,10 +238,20 @@ pub(crate) fn finalize(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 /// Verify a message's stored checksum against a recomputation over its bytes.
-/// (`Message::VerifyChecksum`.) `buf` must be the full message.
+/// (`Message::VerifyChecksum`.) `buf` must be *exactly* the full message: its
+/// length must equal the message's own length field, mirroring the C++
+/// `LogAssert(len == m_unMarshalLen)` (`message.cpp:559`) — except that a
+/// mismatch returns `false` here instead of aborting. Without this check a
+/// caller passing a multi-message slice would fingerprint the trailing bytes
+/// too and get a silent false negative.
 pub fn verify_checksum(buf: &[u8]) -> bool {
     let data_off = CHECKSUM_OFFSET + 8;
     if buf.len() < data_off {
+        return false;
+    }
+    // The u32 length field sits right after the u16 version.
+    let un_marshal_len = u32::from_le_bytes(buf[2..CHECKSUM_OFFSET].try_into().unwrap());
+    if un_marshal_len as usize != buf.len() {
         return false;
     }
     let stored = u64::from_le_bytes(buf[CHECKSUM_OFFSET..data_off].try_into().unwrap());
@@ -258,16 +299,20 @@ impl Msg {
     }
 
     /// Marshal to bytes with the checksum patched in.
-    pub fn marshal_with_checksum(&self) -> Vec<u8> {
-        match self {
+    ///
+    /// Only the [`Vote`]-carrying variants can fail (on the C++-lethal
+    /// reconfiguration shapes — see `Vote::write_to`); every other variant
+    /// always returns `Ok`.
+    pub fn marshal_with_checksum(&self) -> Result<Vec<u8>, MarshalError> {
+        Ok(match self {
             Msg::Base(h) => marshal_base(h),
-            Msg::Vote(m) => m.marshal_with_checksum(),
+            Msg::Vote(m) => m.marshal_with_checksum()?,
             Msg::Join(m) => m.marshal_with_checksum(),
             Msg::Prepare(m) => m.marshal_with_checksum(),
-            Msg::PrepareAccepted(m) => m.marshal_with_checksum(),
+            Msg::PrepareAccepted(m) => m.marshal_with_checksum()?,
             Msg::StatusResponse(m) => m.marshal_with_checksum(),
             Msg::Bootstrap(m) => m.marshal_with_checksum(),
-        }
+        })
     }
 
     /// The common header.
@@ -281,5 +326,81 @@ impl Msg {
             Msg::StatusResponse(m) => &m.header,
             Msg::Bootstrap(m) => &m.header,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MemberSet;
+
+    fn header(version: ProtocolVersion, msg_id: u16) -> Header {
+        Header::new(
+            version,
+            msg_id,
+            MemberId::from_str("101"),
+            7,
+            1,
+            BallotNumber::new(42, MemberId::from_str("202")),
+            0,
+        )
+    }
+
+    #[test]
+    fn reconfig_vote_with_requests_refuses_to_marshal() {
+        // D3: the C++ writer can never produce this shape, and the C++ parser
+        // LogAssert-aborts on it (message.cpp:953) — the Rust writer errors.
+        let mut vote = Vote::new(header(ProtocolVersion::V3, MSG_VOTE));
+        vote.is_reconfiguration = true;
+        vote.members_in_new_configuration = Some(MemberSet::default());
+        vote.add_request(&b"req"[..]);
+        assert_eq!(
+            vote.marshal_with_checksum(),
+            Err(MarshalError::ReconfigurationVoteWithRequests)
+        );
+
+        // The same shape nested in a PrepareAccepted is equally refused.
+        let pa = PrepareAccepted {
+            header: header(ProtocolVersion::V3, MSG_PREPARE_ACCEPTED),
+            vote: vote.clone(),
+        };
+        assert_eq!(
+            pa.marshal_with_checksum(),
+            Err(MarshalError::ReconfigurationVoteWithRequests)
+        );
+
+        // Dropping the requests makes it a legal reconfiguration vote again.
+        vote.requests.clear();
+        assert!(vote.marshal_with_checksum().is_ok());
+    }
+
+    #[test]
+    fn reconfig_vote_without_member_set_refuses_to_marshal() {
+        let mut vote = Vote::new(header(ProtocolVersion::V3, MSG_VOTE));
+        vote.is_reconfiguration = true;
+        assert_eq!(
+            vote.marshal_with_checksum(),
+            Err(MarshalError::ReconfigurationVoteWithoutMemberSet)
+        );
+    }
+
+    #[test]
+    fn verify_checksum_requires_exact_length() {
+        // The buffer must be exactly the message: C++ LogAssert(len ==
+        // m_unMarshalLen) (message.cpp:559); here a mismatch returns false.
+        let bytes = marshal_base(&header(ProtocolVersion::V4, MSG_VOTE_ACCEPTED));
+        assert!(verify_checksum(&bytes));
+
+        // A multi-message slice (trailing bytes) must not silently mis-verify.
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&bytes);
+        assert!(!verify_checksum(&longer));
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(!verify_checksum(&padded));
+
+        // Truncation fails too.
+        assert!(!verify_checksum(&bytes[..bytes.len() - 1]));
+        assert!(!verify_checksum(&[]));
     }
 }

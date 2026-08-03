@@ -183,7 +183,9 @@ fn every_record_reconstructs_from_fields() {
         let version = ProtocolVersion::from_wire(rec.version).unwrap();
 
         let msg = build(&rec.type_name, &v, version);
-        let bytes = msg.marshal_with_checksum();
+        let bytes = msg
+            .marshal_with_checksum()
+            .unwrap_or_else(|e| panic!("{ctx}: marshal failed: {e}"));
         assert_eq!(
             bytes, rec.bytes,
             "{ctx}: independently-constructed bytes differ from BYTES"
