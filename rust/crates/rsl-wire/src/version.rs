@@ -78,6 +78,21 @@ impl ProtocolVersion {
         self.0 >= 5
     }
 
+    /// A checkpoint header carries its own fields (version, length, checksum,
+    /// member id, last executed decree, max ballot, configuration) from v3
+    /// onward; before that a checkpoint file is a bare page-rounded vote.
+    /// (`CheckpointHeader::Marshal`, `legislator.cpp:893`.)
+    pub fn has_checkpoint_header(self) -> bool {
+        self.0 >= 3
+    }
+
+    /// A checkpoint header carries `stateSaved` + file size + checksum block
+    /// size — and therefore the block-checksummed user-state stream — from v4
+    /// onward. (`CheckpointHeader::Marshal`, `legislator.cpp:914`.)
+    pub fn has_checkpoint_blocks(self) -> bool {
+        self.0 >= 4
+    }
+
     /// In a `MemberSet`, node ports are marshaled as `rslLearnPort` once
     /// `version > 3`, otherwise as the deprecated `appPort`.
     /// (`MemberSet::Marshal`, note the strict `>`: v3 still uses `appPort`.)

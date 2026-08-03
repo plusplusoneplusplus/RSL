@@ -12,8 +12,11 @@ versions 1–6. It reads and writes each message identically to the original C++
 - Little-endian targets only; big-endian fails to compile (the C++ big-endian
   fingerprint path is an unported byte-swapped mirror).
 
-This is Phase 2 of the RSL Rust port. Log-file page layout, checkpoint
-containers, and NetPacket framing are explicitly out of scope here (Phase 3/4).
+This is Phase 2 of the RSL Rust port. The on-disk formats live in
+[`rsl-storage`](../rsl-storage) (Phase 3 — checkpoints today, the log file next),
+and NetPacket framing is Phase 4. The one storage-adjacent type kept here is
+`ConfigurationInfo`: only checkpoint headers marshal it, but its encoding is the
+same versioned `MemberSet` vocabulary as everything else in `types`.
 
 ## Layout
 
@@ -21,7 +24,7 @@ containers, and NetPacket framing are explicitly out of scope here (Phase 3/4).
 | --- | --- |
 | `fprint` | Rabin-64 fingerprint (`msn_fprint.cpp`) — poly `0xa795d0f29b4dcdf8` |
 | `marshal` | `MarshalData` reader/writer (`marshal.cpp`) — LE primitives, `u32`-prefixed strings, 1/4-byte back-patched containers |
-| `types` | `MemberId`, `BallotNumber`, `RslNode`, `MemberSet` |
+| `types` | `MemberId`, `BallotNumber`, `RslNode`, `MemberSet`, `ConfigurationInfo` |
 | `messages` | common `Header` + `Vote`, `JoinMessage`, `PrepareMsg`, `PrepareAccepted`, `StatusResponse`, `BootstrapMsg` |
 | `version` | `ProtocolVersion` (1–6) and the per-version field rules |
 

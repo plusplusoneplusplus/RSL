@@ -9,7 +9,8 @@
 //! ## Layout
 //! * [`fprint`] — Rabin-64 fingerprint (the message checksum).
 //! * [`marshal`] — little-endian [`marshal::Reader`] / [`marshal::Writer`].
-//! * [`types`] — [`MemberId`], [`BallotNumber`], [`RslNode`], [`MemberSet`].
+//! * [`types`] — [`MemberId`], [`BallotNumber`], [`RslNode`], [`MemberSet`],
+//!   [`ConfigurationInfo`].
 //! * [`messages`] — the [`Header`] and the six concrete message types.
 //! * [`version`] — [`ProtocolVersion`] and the per-version field rules.
 //!
@@ -58,5 +59,5 @@ pub use messages::{
     marshal_base, unmarshal_base, verify_checksum, BootstrapMsg, Header, JoinMessage, MarshalError,
     Msg, MsgKind, PrepareAccepted, PrepareMsg, StatusResponse, Vote, MAGIC,
 };
-pub use types::{BallotNumber, MemberId, MemberSet, RslNode};
+pub use types::{BallotNumber, ConfigurationInfo, MemberId, MemberSet, RslNode};
 pub use version::ProtocolVersion;

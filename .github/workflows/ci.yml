@@ -140,6 +140,30 @@ jobs:
         working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo build --all-targets --all-features
 
+      # The storage tests (Phase 3b+) read C++-generated .codex/.log samples and
+      # push Rust-written files back through the C++ reader. Neither the samples
+      # nor the binary are committed, so build the generator here and hand the
+      # tests its corpus. Without this they self-skip; with it, both interop
+      # directions are covered.
+      - name: Build golden-gen for storage interop
+        if: steps.detect.outputs.has_rust == 'true'
+        id: interop
+        run: |
+          if [ ! -f tools/golden-gen/CMakeLists.txt ]; then
+            echo "No golden-gen; storage interop tests will self-skip."
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y cmake g++
+          cmake -S tools/golden-gen -B tools/golden-gen/build
+          cmake --build tools/golden-gen/build -j "$(nproc)"
+          out=/tmp/storage-corpus-rust
+          rm -rf "$out"
+          ./tools/golden-gen/build/golden-gen --storage "$out"
+          {
+            echo "RSL_GOLDEN_GEN=$PWD/tools/golden-gen/build/golden-gen"
+            echo "RSL_STORAGE_CORPUS=$out"
+          } >> "$GITHUB_ENV"
+
       - name: Test
         if: steps.detect.outputs.has_rust == 'true'
         working-directory: ${{ steps.detect.outputs.dir }}

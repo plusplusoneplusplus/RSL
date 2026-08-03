@@ -365,9 +365,117 @@ impl MemberSet {
     }
 }
 
+/// A replica-set configuration: the configuration number, the decree it takes
+/// effect at, and the [`MemberSet`] itself. Port of `ConfigurationInfo`
+/// (`RSL/src/checkpoint.h`, methods in `legislator.cpp:784-818`).
+///
+/// Only checkpoint headers marshal this type, but its encoding is plain wire
+/// vocabulary — the same versioned `MemberSet` rules — so it lives here with the
+/// other shared types rather than in `rsl-storage`.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct ConfigurationInfo {
+    pub configuration_number: u32,
+    pub initial_decree: u64,
+    pub member_set: MemberSet,
+}
+
+impl ConfigurationInfo {
+    /// Build a configuration.
+    pub fn new(
+        configuration_number: u32,
+        initial_decree: u64,
+        member_set: MemberSet,
+    ) -> ConfigurationInfo {
+        ConfigurationInfo {
+            configuration_number,
+            initial_decree,
+            member_set,
+        }
+    }
+
+    /// `ConfigurationInfo::Marshal`.
+    pub fn marshal(&self, w: &mut Writer, version: ProtocolVersion) {
+        w.write_u32(self.configuration_number);
+        w.write_u64(self.initial_decree);
+        self.member_set.marshal(w, version);
+    }
+
+    /// `ConfigurationInfo::UnMarshal`. Returns `None` on a short buffer or an
+    /// unparsable member set.
+    pub fn unmarshal(r: &mut Reader, version: ProtocolVersion) -> Option<ConfigurationInfo> {
+        let configuration_number = r.read_u32()?;
+        let initial_decree = r.read_u64()?;
+        let member_set = MemberSet::unmarshal(r, version)?;
+        Some(ConfigurationInfo {
+            configuration_number,
+            initial_decree,
+            member_set,
+        })
+    }
+
+    /// `ConfigurationInfo::GetMarshalLen` — `4 + 8 + memberSet`.
+    pub fn marshal_len(&self, version: ProtocolVersion) -> u32 {
+        4 + 8 + self.member_set.marshal_len(version)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_info_round_trips_and_sizes_match() {
+        let member_set = MemberSet {
+            members: vec![
+                RslNode {
+                    member_id: MemberId::from_str("101"),
+                    ip: 0x0100_007f,
+                    rsl_port: 8080,
+                    rsl_learn_port: 8081,
+                    app_port: 0,
+                    host_name: b"host-a".to_vec(),
+                },
+                RslNode {
+                    member_id: MemberId::from_str("202"),
+                    ip: 0x0100_017f,
+                    rsl_port: 9090,
+                    rsl_learn_port: 9091,
+                    app_port: 0,
+                    host_name: b"host-b".to_vec(),
+                },
+            ],
+            cookie: b"cfg".to_vec(),
+        };
+        let cfg = ConfigurationInfo::new(0x0a0b_0c0d, 0x1001, member_set);
+
+        for version in [ProtocolVersion::V4, ProtocolVersion::V6] {
+            let mut w = Writer::new();
+            cfg.marshal(&mut w, version);
+            let bytes = w.into_bytes();
+            assert_eq!(bytes.len() as u32, cfg.marshal_len(version));
+            // The fixed prefix is the configuration number then the decree.
+            assert_eq!(&bytes[..4], &0x0a0b_0c0du32.to_le_bytes());
+            assert_eq!(&bytes[4..12], &0x1001u64.to_le_bytes());
+
+            let mut r = Reader::new(&bytes);
+            assert_eq!(
+                ConfigurationInfo::unmarshal(&mut r, version),
+                Some(cfg.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_info_rejects_short_buffers() {
+        let cfg = ConfigurationInfo::new(1, 2, MemberSet::default());
+        let mut w = Writer::new();
+        cfg.marshal(&mut w, ProtocolVersion::V6);
+        let bytes = w.into_bytes();
+        for cut in 0..bytes.len() {
+            let mut r = Reader::new(&bytes[..cut]);
+            assert!(ConfigurationInfo::unmarshal(&mut r, ProtocolVersion::V6).is_none());
+        }
+    }
 
     #[test]
     fn member_id_pre_v3_is_u64() {
