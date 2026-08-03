@@ -60,6 +60,36 @@ jobs:
           fi
           echo "Corpus reproduced byte-for-byte."
 
+      - name: Verify golden-gen storage corpus (Phase 3a)
+        if: hashFiles('tools/golden-gen/build/golden-gen') != ''
+        run: |
+          out=/tmp/storage-ci
+          rm -rf "$out"
+          # Regenerate the whole storage corpus (logs, checkpoints, defunct.txt
+          # + MANIFEST). The generator runs the extracted C++ readers over every
+          # file it writes to fill in the MANIFEST outcomes.
+          ./tools/golden-gen/build/golden-gen --storage "$out"
+
+          # The sample files themselves are generated test data and are not
+          # committed (see tools/golden-gen/.gitignore). MANIFEST.json IS
+          # committed and records an fp64 -- Rabin-64 of the whole file -- for
+          # every sample, alongside the executed recovery outcome. Those hashes
+          # are computed from the files just regenerated above, so diffing the
+          # MANIFEST byte-for-byte proves every regenerated file is byte-identical
+          # to what was recorded, without checking binaries into the repo.
+          if ! diff -u tools/golden-gen/corpus/storage/MANIFEST.json "$out/MANIFEST.json"; then
+            echo "::error::Storage corpus differs from the committed MANIFEST."
+            echo "If this change intentionally alters the storage format, regenerate with:"
+            echo "  ./tools/golden-gen/build/golden-gen --storage tools/golden-gen/corpus/storage"
+            exit 1
+          fi
+
+          # Reverse-interop sanity: run the extracted C++ readers over the whole
+          # directory (this is the mechanism by which C++ verifies Rust-written
+          # files in 3b/3c). Must exit 0.
+          ./tools/golden-gen/build/golden-gen --verify-storage "$out"
+          echo "Storage corpus reproduced byte-for-byte (via MANIFEST fp64)."
+
   # ---------------------------------------------------------------------------
   # Rust — activates automatically once any Cargo.toml is added (e.g. the
   # pure-Rust port). Skips entirely while the repo has no Rust yet.

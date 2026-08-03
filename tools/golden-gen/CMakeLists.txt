@@ -24,6 +24,9 @@ add_executable(golden-gen
     ${RSL_SRC}/RSL/src/message.cpp
     # Verbatim extract of MemberSet / RSLNodeCollection / RSLNode from rsl.cpp:
     ${CMAKE_CURRENT_SOURCE_DIR}/src/engine_min.cpp
+    # Verbatim extract of ConfigurationInfo / CheckpointHeader from
+    # legislator.cpp + Linux ports of the storage I/O paths (Phase 3a):
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage_min.cpp
     # The generator driver:
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
 )

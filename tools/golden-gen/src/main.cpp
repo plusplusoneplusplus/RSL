@@ -11,15 +11,23 @@
 // record per blank-line-separated block. Redirect to a file to capture the
 // corpus.
 
-#include "message.h"
-#include "msg_engine_compat.h"
-#include "utils.h"
-#include "fingerprint.h"
-
+// System headers first: the compat windows.h shim (pulled in transitively by
+// message.h) redefines identifiers that collide with <sys/stat.h>/<dirent.h> if
+// they are included afterwards, so include the POSIX headers up front.
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cerrno>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include "message.h"
+#include "msg_engine_compat.h"
+#include "utils.h"
+#include "fingerprint.h"
+#include "storage_min.h"       // Phase 3a: storage corpus + reverse verify
 
 using namespace RSLib;
 using namespace RSLibImpl;
@@ -582,10 +590,517 @@ void GenerateFingerprints()
     EmitFingerprint("ramp-256", ramp, sizeof(ramp));
 }
 
+// ===========================================================================
+// Phase 3a: storage corpus generation (--storage) and reverse verification
+// (--verify-storage). The extracted C++ readers in storage_min.cpp are the
+// ground truth: every MANIFEST outcome is produced by RUNNING them over the
+// bytes just written, never by reading the format spec (plan item 6 caution).
+// ===========================================================================
+using rsl_storage::Outcome;
+using rsl_storage::OutcomeName;
+
+std::string Hex16(UInt64 v)
+{
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)v);
+    return buf;
+}
+
+std::string Fp64Hex(const std::vector<char>& b)
+{
+    return Hex16(FingerPrint64::GetInstance()->GetFingerPrint(b.data(), b.size()));
+}
+
+bool WriteBinaryFile(const std::string& path, const std::vector<char>& bytes)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { return false; }
+    bool ok = bytes.empty() || fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    fclose(f);
+    return ok;
+}
+
+bool ReadBinaryFile(const std::string& path, std::vector<char>& out)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { return false; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    out.resize(n > 0 ? (size_t)n : 0);
+    bool ok = (n <= 0) || fread(out.data(), 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    return ok;
+}
+
+// A deterministic, compressible user-state pattern (a byte ramp). The MANIFEST
+// records "ramp" + length so the Rust port can regenerate the large checkpoint
+// samples without shipping multi-MiB binaries.
+std::vector<char> RampState(size_t n)
+{
+    std::vector<char> s(n);
+    for (size_t i = 0; i < n; ++i) { s[i] = (char)(i & 0xff); }
+    return s;
+}
+
+// Build a checkpoint header (with its nextVote + ConfigurationInfo) for a given
+// version. Objects are heap-allocated and intentionally leaked -- this is a
+// short-lived generator.
+CheckpointHeader* MakeCheckpointHeader(RSLProtocolVersion v, UInt64 cpDecree)
+{
+    PrimaryCookie cookie; // consumed during Vote::Init; safe as a local
+    Vote* vote = new Vote(v, Member("101"), cpDecree + 1, /*config*/ 7,
+                          Ballot(5, "202"), &cookie);
+    vote->CalculateChecksum(); // header.Marshal emits the vote's own buffers
+
+    CheckpointHeader* h = new CheckpointHeader();
+    h->m_version = v;
+    h->m_memberId = Member("101");
+    h->m_lastExecutedDecree = cpDecree;
+    h->m_maxBallot = Ballot(9, "202"); // must be >= nextVote's ballot
+    h->m_nextVote = vote;
+    h->m_stateSaved = true;
+    if (v >= RSLProtocolVersion_3)
+    {
+        RSLNodeCollection members;
+        members.Append(MakeNode("101", 0x0100007f, 8080, 8081, "host-a"));
+        members.Append(MakeNode("202", 0x0100017f, 9090, 9091, "host-b"));
+        const char cfgCookie[] = "cfg";
+        MemberSet* ms = new MemberSet(members, (void*)cfgCookie, (UInt32)sizeof(cfgCookie) - 1);
+        h->m_stateConfiguration = new ConfigurationInfo(0x0a0b0c0d, cpDecree + 1, ms);
+    }
+    if (v >= RSLProtocolVersion_4)
+    {
+        h->m_checksumBlockSize = s_ChecksumBlockSize;
+    }
+    return h;
+}
+
+// --- MANIFEST accumulation -------------------------------------------------
+struct Manifest
+{
+    std::string entries; // one compact JSON object per file, comma+newline joined
+    bool first = true;
+
+    void Add(const std::string& obj)
+    {
+        if (!first) { entries += ",\n"; }
+        first = false;
+        entries += "    ";
+        entries += obj;
+    }
+};
+
+std::string RecordsJson(const rsl_storage::LogScanResult& scan)
+{
+    std::string out = "[";
+    for (size_t i = 0; i < scan.records.size(); ++i)
+    {
+        const rsl_storage::ScannedRecord& r = scan.records[i];
+        if (i) { out += ","; }
+        Json j;
+        j.num("offset", (long long)r.offset);
+        j.num("msgId", r.msgId);
+        j.hex64("decree", r.decree);
+        j.num("unMarshalLen", r.unMarshalLen);
+        j.num("paddedLen", r.paddedLen);
+        j.str("checksum", Hex16(r.checksum));
+        out += j.done();
+    }
+    out += "]";
+    return out;
+}
+
+void EmitLog(Manifest& man, const std::string& outdir, const char* name,
+             const std::vector<char>& bytes)
+{
+    std::string file = std::string(name) + ".log";
+    LogAssert(WriteBinaryFile(outdir + "/" + file, bytes));
+
+    rsl_storage::LogScanResult scan = rsl_storage::ScanLog(bytes.data(), bytes.size());
+
+    Json j;
+    j.str("name", name);
+    j.str("file", file);
+    j.str("kind", "log");
+    j.num("size", (long long)bytes.size());
+    j.str("fp64", Fp64Hex(bytes));
+    j.str("outcome", OutcomeName(scan.outcome));
+    j.num("stopOffset", (long long)scan.stopOffset);
+    j.num("recordCount", (long long)scan.records.size());
+    j.str("detail", scan.detail);
+    j.rawval("records", RecordsJson(scan));
+    man.Add(j.done());
+}
+
+void EmitCheckpoint(Manifest& man, const std::string& outdir, const char* name,
+                    const std::vector<char>& bytes, const char* statePattern,
+                    size_t stateLen)
+{
+    std::string file = std::string(name) + ".codex";
+    LogAssert(WriteBinaryFile(outdir + "/" + file, bytes));
+
+    rsl_storage::CheckpointVerifyResult vr =
+        rsl_storage::VerifyCheckpointFile(bytes.data(), bytes.size());
+
+    Json j;
+    j.str("name", name);
+    j.str("file", file);
+    j.str("kind", "checkpoint");
+    j.num("size", (long long)bytes.size());
+    j.str("fp64", Fp64Hex(bytes));
+    j.str("outcome", OutcomeName(vr.outcome));
+    j.num("version", vr.version);
+    j.num("headerLen", vr.headerLen);
+    j.num("userDataSize", (long long)vr.userDataSize);
+    j.num("checksumBlockSize", vr.checksumBlockSize);
+    j.boolean("stateSaved", vr.stateSaved);
+    j.str("statePattern", statePattern);
+    j.num("stateLen", (long long)stateLen);
+    j.str("detail", vr.detail);
+    man.Add(j.done());
+}
+
+void EmitDefunct(Manifest& man, const std::string& outdir, const char* name,
+                 UInt32 value)
+{
+    std::vector<char> bytes = rsl_storage::EncodeDefunct(value);
+    std::string file = std::string(name) + ".txt";
+    LogAssert(WriteBinaryFile(outdir + "/" + file, bytes));
+
+    UInt32 decoded = 0;
+    LogAssert(rsl_storage::DecodeDefunct(bytes.data(), bytes.size(), &decoded));
+    LogAssert(decoded == value);
+
+    Json j;
+    j.str("name", name);
+    j.str("file", file);
+    j.str("kind", "defunct");
+    j.num("size", (long long)bytes.size());
+    j.str("fp64", Fp64Hex(bytes));
+    j.str("outcome", "accept");
+    j.num("value", (long long)(unsigned long long)value);
+    man.Add(j.done());
+}
+
+// Concatenate encoded log records into one log image.
+std::vector<char> CatRecords(const std::vector<std::vector<char> >& recs)
+{
+    std::vector<char> out;
+    for (const std::vector<char>& r : recs) { out.insert(out.end(), r.begin(), r.end()); }
+    return out;
+}
+
+int GenerateStorage(const char* outdir)
+{
+    if (mkdir(outdir, 0777) != 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "failed to create %s (errno=%d)\n", outdir, errno);
+        return 1;
+    }
+
+    Manifest man;
+
+    // ---- Log samples ------------------------------------------------------
+    // empty log: no records, clean accept at offset 0.
+    EmitLog(man, outdir, "empty", std::vector<char>());
+
+    // single vote (v6).
+    {
+        PrimaryCookie c;
+        Vote vote(RSLProtocolVersion_6, Member("101"), 0x00000000000abcdeULL, 7,
+                  Ballot(3, "202"), &c);
+        EmitLog(man, outdir, "single-vote", rsl_storage::EncodeLogRecord(vote));
+    }
+
+    // one vote per protocol version (v1..v6): exercises per-version layout.
+    for (RSLProtocolVersion v : kVersions)
+    {
+        PrimaryCookie c;
+        Vote vote(v, Member("101"), 0x100ULL + (UInt64)v, 7, Ballot(3, "202"), &c);
+        char name[32];
+        snprintf(name, sizeof(name), "vote-v%d", (int)v);
+        EmitLog(man, outdir, name, rsl_storage::EncodeLogRecord(vote));
+    }
+
+    // a single Prepare record (another logged message type).
+    {
+        PrimaryCookie c;
+        PrepareMsg prep(RSLProtocolVersion_6, Member("101"), 0x200ULL, 7,
+                        Ballot(4, "202"), &c);
+        EmitLog(man, outdir, "prepare", rsl_storage::EncodeLogRecord(prep));
+    }
+
+    // multi-record log spanning pad boundaries: Prepare + Vote + a Vote with a
+    // request (multi-page), + a ReconfigurationDecision base message.
+    {
+        std::vector<std::vector<char> > recs;
+        {
+            PrimaryCookie c;
+            PrepareMsg prep(RSLProtocolVersion_6, Member("101"), 0x300ULL, 7, Ballot(4, "202"), &c);
+            recs.push_back(rsl_storage::EncodeLogRecord(prep));
+        }
+        {
+            PrimaryCookie c;
+            Vote vote(RSLProtocolVersion_6, Member("101"), 0x301ULL, 7, Ballot(5, "202"), &c);
+            recs.push_back(rsl_storage::EncodeLogRecord(vote));
+        }
+        {
+            PrimaryCookie c;
+            Vote vote(RSLProtocolVersion_6, Member("101"), 0x302ULL, 7, Ballot(5, "202"), &c);
+            std::vector<char> big(600, 'x');
+            vote.AddRequest(big.data(), (UInt32)big.size(), NULL);
+            recs.push_back(rsl_storage::EncodeLogRecord(vote));
+        }
+        {
+            Message dec(RSLProtocolVersion_6, Message_ReconfigurationDecision, Member("101"),
+                        0x303ULL, 7, Ballot(6, "202"), 0);
+            recs.push_back(rsl_storage::EncodeLogRecord(dec));
+        }
+        EmitLog(man, outdir, "multi-record", CatRecords(recs));
+    }
+
+    // garbage-pad tolerance: a valid vote whose pad bytes are non-zero. The
+    // checksum only covers the message body, so the record still verifies.
+    {
+        PrimaryCookie c;
+        Vote vote(RSLProtocolVersion_6, Member("101"), 0x400ULL, 7, Ballot(3, "202"), &c);
+        std::vector<char> rec = rsl_storage::EncodeLogRecord(vote);
+        UInt32 body = vote.GetMarshalLen();
+        for (size_t i = body; i < rec.size(); ++i) { rec[i] = (char)0xAA; }
+        EmitLog(man, outdir, "garbage-pad", rec);
+    }
+
+    // clean zero tail after a valid record: recovery stops at the zero region.
+    {
+        PrimaryCookie c;
+        Vote vote(RSLProtocolVersion_6, Member("101"), 0x500ULL, 7, Ballot(3, "202"), &c);
+        std::vector<char> rec = rsl_storage::EncodeLogRecord(vote);
+        std::vector<char> img = rec;
+        img.resize(rec.size() + s_PageSize, 0); // one zero page
+        EmitLog(man, outdir, "zero-tail", img);
+    }
+
+    // torn tail: a valid vote followed by a truncated multi-page record (full
+    // header page + partial body). Recovery discards the incomplete tail.
+    {
+        PrimaryCookie c1;
+        Vote v1(RSLProtocolVersion_6, Member("101"), 0x600ULL, 7, Ballot(3, "202"), &c1);
+        std::vector<char> rec1 = rsl_storage::EncodeLogRecord(v1);
+
+        PrimaryCookie c2;
+        Vote v2(RSLProtocolVersion_6, Member("101"), 0x601ULL, 7, Ballot(3, "202"), &c2);
+        std::vector<char> big(600, 'y');
+        v2.AddRequest(big.data(), (UInt32)big.size(), NULL);
+        std::vector<char> rec2 = rsl_storage::EncodeLogRecord(v2); // >= 1024 bytes
+
+        std::vector<char> img = rec1;
+        // header page + 188 body bytes of the second record (< its padded len).
+        img.insert(img.end(), rec2.begin(), rec2.begin() + s_PageSize + 188);
+        EmitLog(man, outdir, "torn-tail", img);
+    }
+
+    // corrupt record checksum in a middle record, valid record following:
+    // non-zero data after the bad checksum means hard reject.
+    {
+        PrimaryCookie c1;
+        Vote v1(RSLProtocolVersion_6, Member("101"), 0x700ULL, 7, Ballot(3, "202"), &c1);
+        std::vector<char> rec1 = rsl_storage::EncodeLogRecord(v1);
+
+        PrimaryCookie c2;
+        Vote v2(RSLProtocolVersion_6, Member("101"), 0x701ULL, 7, Ballot(3, "202"), &c2);
+        std::vector<char> rec2 = rsl_storage::EncodeLogRecord(v2);
+        rec2[20] ^= 0xff; // flip a body byte (past the 8-byte checksum field)
+
+        PrimaryCookie c3;
+        Vote v3(RSLProtocolVersion_6, Member("101"), 0x702ULL, 7, Ballot(3, "202"), &c3);
+        std::vector<char> rec3 = rsl_storage::EncodeLogRecord(v3);
+
+        std::vector<std::vector<char> > recs = { rec1, rec2, rec3 };
+        EmitLog(man, outdir, "corrupt-checksum", CatRecords(recs));
+    }
+
+    // unknown message id: a non-logged message type in the log stream -> reject.
+    {
+        Message bad(RSLProtocolVersion_6, Message_VoteAccepted, Member("101"),
+                    0x800ULL, 7, Ballot(3, "202"), 0);
+        EmitLog(man, outdir, "unknown-msgid", rsl_storage::EncodeLogRecord(bad));
+    }
+
+    // ---- Checkpoint samples ----------------------------------------------
+    // Per-version headers (v3..v6; the checkpoint header format is a v>=3
+    // construct -- v1/v2 checkpoints are a bare page-rounded vote, out of scope,
+    // analogous to Bootstrap only existing at v4+). Minimal empty user state.
+    for (RSLProtocolVersion v = RSLProtocolVersion_3; v <= RSLProtocolVersion_6;
+         v = (RSLProtocolVersion)(v + 1))
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(v, 0x1000ULL);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, nullptr, 0);
+        char name[32];
+        snprintf(name, sizeof(name), "cp-v%d-empty", (int)v);
+        EmitCheckpoint(man, outdir, name, img, "empty", 0);
+    }
+
+    const UInt32 kBlock = s_ChecksumBlockSize;
+    const UInt32 kDataOnly = kBlock - (UInt32)rsl_storage::CHECKSUM_SIZE;
+
+    // small user state: single partial block (data + 8-byte checksum).
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(RSLProtocolVersion_6, 0x2000ULL);
+        std::vector<char> st = RampState(100);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, st.data(), st.size());
+        EmitCheckpoint(man, outdir, "cp-small", img, "ramp", st.size());
+    }
+
+    // exactly one full 4 MiB block (state == dataOnly).
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(RSLProtocolVersion_6, 0x3000ULL);
+        std::vector<char> st = RampState(kDataOnly);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, st.data(), st.size());
+        EmitCheckpoint(man, outdir, "cp-4mib", img, "ramp", st.size());
+    }
+
+    // 4 MiB + 1: one full block + a 1-byte partial block.
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(RSLProtocolVersion_6, 0x4000ULL);
+        std::vector<char> st = RampState((size_t)kDataOnly + 1);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, st.data(), st.size());
+        EmitCheckpoint(man, outdir, "cp-4mib-plus1", img, "ramp", st.size());
+    }
+
+    // multi-block: 2 full blocks + a partial (2*dataOnly + 50).
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(RSLProtocolVersion_6, 0x5000ULL);
+        std::vector<char> st = RampState((size_t)kDataOnly * 2 + 50);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, st.data(), st.size());
+        EmitCheckpoint(man, outdir, "cp-multiblock", img, "ramp", st.size());
+    }
+
+    // corrupt block checksum: flip a byte inside the block data of a small cp.
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(RSLProtocolVersion_6, 0x6000ULL);
+        std::vector<char> st = RampState(100);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, st.data(), st.size());
+        img[h->GetMarshalLen() + 10] ^= 0xff; // flip a user-data byte in the block
+        EmitCheckpoint(man, outdir, "cp-corrupt-block", img, "ramp", st.size());
+    }
+
+    // truncated file: valid small cp with its final bytes dropped -> size !=
+    // header m_size -> reject.
+    {
+        CheckpointHeader* h = MakeCheckpointHeader(RSLProtocolVersion_6, 0x7000ULL);
+        std::vector<char> st = RampState(100);
+        std::vector<char> img = rsl_storage::BuildCheckpointFile(*h, st.data(), st.size());
+        img.resize(img.size() - 8); // drop the trailing checksum + a byte's worth
+        EmitCheckpoint(man, outdir, "cp-truncated", img, "ramp", st.size());
+    }
+
+    // ---- defunct.txt samples ---------------------------------------------
+    EmitDefunct(man, outdir, "defunct-zero", 0);
+    EmitDefunct(man, outdir, "defunct-42", 42);
+    EmitDefunct(man, outdir, "defunct-large", 0xdeadbeef);
+
+    // ---- MANIFEST ---------------------------------------------------------
+    std::string manifest;
+    manifest += "{\n";
+    manifest += "  \"generator\": \"golden-gen --storage (Phase 3a)\",\n";
+    char nums[64];
+    snprintf(nums, sizeof(nums), "  \"pageSize\": %u,\n", (unsigned)s_PageSize);
+    manifest += nums;
+    snprintf(nums, sizeof(nums), "  \"checksumBlockSize\": %u,\n", (unsigned)s_ChecksumBlockSize);
+    manifest += nums;
+    snprintf(nums, sizeof(nums), "  \"checksumSize\": %d,\n", (int)rsl_storage::CHECKSUM_SIZE);
+    manifest += nums;
+    manifest += "  \"files\": [\n";
+    manifest += man.entries;
+    manifest += "\n  ]\n}\n";
+
+    std::string manifestPath = std::string(outdir) + "/MANIFEST.json";
+    FILE* mf = fopen(manifestPath.c_str(), "wb");
+    if (!mf) { fprintf(stderr, "cannot write %s\n", manifestPath.c_str()); return 1; }
+    fwrite(manifest.data(), 1, manifest.size(), mf);
+    fclose(mf);
+
+    fprintf(stderr, "storage corpus written to %s\n", outdir);
+    return 0;
+}
+
+// Reverse mode: run the extracted C++ readers over every file in a directory
+// and report per-file accept/stop/reject + recovered record counts. This is how
+// "C++ reads (Rust-written) files" works without Windows or the full engine; in
+// CI it re-reads the C++ generator's own output as a sanity check.
+int VerifyStorage(const char* dir)
+{
+    DIR* d = opendir(dir);
+    if (!d) { fprintf(stderr, "cannot open dir %s\n", dir); return 1; }
+
+    std::vector<std::string> names;
+    for (struct dirent* e = readdir(d); e; e = readdir(d))
+    {
+        std::string n = e->d_name;
+        if (n == "." || n == ".." || n == "MANIFEST.json") { continue; }
+        names.push_back(n);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+
+    auto ends_with = [](const std::string& s, const char* suf) {
+        size_t n = strlen(suf);
+        return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+    };
+
+    int rc = 0;
+    for (const std::string& n : names)
+    {
+        std::vector<char> bytes;
+        if (!ReadBinaryFile(std::string(dir) + "/" + n, bytes))
+        {
+            printf("%s: ERROR could not read\n", n.c_str());
+            rc = 1;
+            continue;
+        }
+        if (ends_with(n, ".log"))
+        {
+            rsl_storage::LogScanResult s = rsl_storage::ScanLog(bytes.data(), bytes.size());
+            printf("%s: %s records=%zu stopOffset=%llu (%s)\n", n.c_str(),
+                   OutcomeName(s.outcome), s.records.size(),
+                   (unsigned long long)s.stopOffset, s.detail.c_str());
+        }
+        else if (ends_with(n, ".codex"))
+        {
+            rsl_storage::CheckpointVerifyResult v =
+                rsl_storage::VerifyCheckpointFile(bytes.data(), bytes.size());
+            printf("%s: %s version=%u userData=%llu (%s)\n", n.c_str(),
+                   OutcomeName(v.outcome), v.version,
+                   (unsigned long long)v.userDataSize, v.detail.c_str());
+        }
+        else if (ends_with(n, ".txt"))
+        {
+            UInt32 value = 0;
+            bool ok = rsl_storage::DecodeDefunct(bytes.data(), bytes.size(), &value);
+            printf("%s: %s value=%u\n", n.c_str(), ok ? "accept" : "reject", value);
+        }
+        else
+        {
+            printf("%s: skipped (unknown extension)\n", n.c_str());
+        }
+    }
+    return rc;
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc >= 3 && strcmp(argv[1], "--storage") == 0)
+    {
+        return GenerateStorage(argv[2]);
+    }
+    if (argc >= 3 && strcmp(argv[1], "--verify-storage") == 0)
+    {
+        return VerifyStorage(argv[2]);
+    }
+
     printf("# RSL Phase-1 golden vectors (generated by tools/golden-gen)\n");
     printf("# magic=0x%08x checksumOffset=%u\n\n",
            (unsigned)s_MessageMagic, (unsigned)s_ChecksumOffset);

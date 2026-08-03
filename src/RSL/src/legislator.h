@@ -16,7 +16,8 @@ namespace RSLibImpl
     static const UInt32 s_PageSize = 512;
     static const UInt32 s_SystemPageSize = 4096;
     static const UInt32 PAGES_PER_WRITE = 512;
-    static const UInt32 s_ChecksumBlockSize = 4 * 1024 * 1024; // 4 megabytes
+    // s_ChecksumBlockSize now lives in checkpoint.h (included below,
+    // after MemberSet) alongside the checkpoint types that define its meaning.
 
 
     inline UInt32 RoundUpToPage(UInt32 x)
@@ -268,69 +269,15 @@ namespace RSLibImpl
         void FreeCookie();
     };
 
-    class ConfigurationInfo : public RefCount
-    {
-    public:
-        ConfigurationInfo() : m_configurationNumber(0), m_initialDecree(0) { }
-        ConfigurationInfo(UInt32 configurationNumber, UInt64 initialDecree, MemberSet *memberSet) :
-            m_configurationNumber(configurationNumber), m_initialDecree(initialDecree), m_memberSet(memberSet)
-        { }
-
-        void Marshal(MarshalData *marshal, RSLProtocolVersion version);
-        bool UnMarshal(MarshalData *marshal, RSLProtocolVersion version);
-        UInt32 GetMarshalLen(RSLProtocolVersion version);
-
-        UInt32 GetConfigurationNumber() const { return m_configurationNumber; }
-        UInt64 GetInitialDecree() const { return m_initialDecree; }
-        MemberSet *GetMemberSet() { return m_memberSet; }
-        size_t GetNumMembers() { return m_memberSet->GetNumMembers(); }
-        const RSLNodeCollection& GetMemberCollection() { return m_memberSet->GetMemberCollection(); }
-        const RSLNode *GetMemberInfo(UInt16 whichMember) { return m_memberSet->GetMemberInfo(whichMember); }
-        bool IncludesMember(MemberId memberId) { return m_memberSet->IncludesMember(memberId); }
-
-        void UpdateMemberSet(MemberSet *memberset)
-        {
-            m_memberSet = memberset;
-        }
-
-    private:
-        UInt32 m_configurationNumber;
-        UInt64 m_initialDecree;
-        Ptr<MemberSet> m_memberSet;
-    };
-
-    class CheckpointHeader
-    {
-    public:
-        CheckpointHeader() :
-            m_version(RSLProtocolVersion_1), m_unMarshalLen(0), m_checksum(0),
-            m_memberId(), m_lastExecutedDecree(0), m_stateSaved(true), m_size(0),
-            m_checksumBlockSize(0)
-        {}
-
-        UInt32 GetMarshalLen();
-        void Marshal(const char* file);
-        void Marshal(MarshalData *marshal);
-        bool UnMarshal(const char* file);
-        bool UnMarshal(MarshalData *marshal);
-        bool UnMarshal(StreamReader *reader);
-        void SetBytesIssued(RSLCheckpointStreamWriter * writer);
-
-        static void GetCheckpointFileName(DynString &file, UInt64 decree);
-
-        RSLProtocolVersion m_version;
-        UInt32 m_unMarshalLen;
-        UInt64 m_checksum;
-        MemberId m_memberId; // member that produced this checkpoint
-        UInt64 m_lastExecutedDecree;  // decree executed at this checkpoint
-        BallotNumber m_maxBallot;
-        Ptr<ConfigurationInfo> m_stateConfiguration;
-        Ptr<Vote> m_nextVote;
-        bool m_stateSaved;                // Indicates whether user data was saved too
-        unsigned long long m_size;        // The whole chekcpoint file size
-        unsigned int m_checksumBlockSize; // The size of each block (user data + checksum token)
-    };
-
+    // ConfigurationInfo + CheckpointHeader (and s_ChecksumBlockSize) define the
+    // .codex on-disk layout and are shared verbatim with the Linux golden-vector
+    // tool, so they live in their own header. Included HERE, not at the top of
+    // the file, because they depend on the MemberSet declaration above.
+    // See tools/golden-gen/compat/storage_compat.h for the other includer.
+}
+#include "checkpoint.h"
+namespace RSLibImpl
+{
     class Legislator;
 
     // This object keeps track of the votes that have passed and need

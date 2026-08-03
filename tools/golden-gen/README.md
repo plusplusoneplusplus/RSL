@@ -38,6 +38,7 @@ lives entirely under `compat/`. The MSBuild build never sees any of it.
 | `pal_logging.h` | logging stub — asserts `abort()`, `RSL{Error,Info,…}` print to stderr, `LogTag_*` enum. (The real `logging.cpp` — SEH/minidump — is deliberately not ported.) |
 | `netpacket_min.h` | just the `IMarshalMemoryManager` base class that `marshal.h` derives from |
 | `msg_engine_compat.h` | the `MemberSet` declaration + page-rounding helpers that `message.cpp` uses from `legislator.h`, without dragging in the engine |
+| `storage_compat.h` | Linux prerequisites for the **shared** `RSL/src/checkpoint.h` (checkpoint types) + `CHECKSUM_SIZE`; declares nothing itself |
 | `msvc_builtins.h` | `__int8..__int64` keyword spellings, force-included into every TU |
 
 ### Guarded edits to shared headers/sources
@@ -47,6 +48,8 @@ lives entirely under `compat/`. The MSBuild build never sees any of it.
 - `common/src/basic_types.h` — `FAInt64(DWORD,DWORD)` ctor Windows-only (collides with `(UInt32,UInt32)` on LP64)
 - `common/src/constants.h` — `Ui64` literal suffixes → `ULL` on Linux
 - `common/src/List.h` — `using DLL<C>::head/link;` in `Queue<C>` (standard two-phase lookup; MSVC was lax)
+- `common/src/LogAssert.h` — `<crtdbg.h>` + the `LogAssert` macro are `#ifdef _WIN32` on Linux (the macro already comes from `pal_logging.h`); lets `DynamicBuffer.h` compile in the slice (Phase 3a)
+- `RSL/src/legislator.h` — `ConfigurationInfo`/`CheckpointHeader`/`s_ChecksumBlockSize` moved verbatim into the new shared `RSL/src/checkpoint.h`, which `legislator.h` includes at the same point (after `MemberSet`, which they depend on). The symbols `legislator.h` exposes are unchanged, so every existing consumer is unaffected (Phase 3a)
 - `RSL/src/message.h` — `list.h`→`List.h`, `streamio.h`→`StreamSocket` fwd decl + `HiResTime.h` on Linux
 - `RSL/src/message.cpp` — Linux include block; `Message::ReadFromSocket` (needs a socket) is `#ifdef _WIN32`
 
@@ -119,11 +122,81 @@ bug could pass. The Rust port's `tests/fields.rs` does exactly this. Adding
 fingerprint of the empty string, a quick correctness check for the Rabin-64
 port.
 
+## Phase 3a: storage corpus (`--storage` / `--verify-storage`)
+
+Phase 3a extends the same golden-vector technique to **containers on disk** —
+`.log` records, `.codex` checkpoints, and `defunct.txt` — so the Rust storage
+port (Phase 3b/3c) has C++-generated files to parse, and C++ can verify
+Rust-written files on Linux without a Windows box or the full engine.
+
+The checkpoint **type declarations** are not copied at all — `ConfigurationInfo`
+and `CheckpointHeader` live in `RSL/src/checkpoint.h`, which both
+`legislator.h` and this tool's `compat/storage_compat.h` include, so the `.codex`
+layout has a single definition and cannot drift between the two builds. Only
+`CheckpointHeader`'s Windows-only I/O entry points (`Marshal(const char*)`,
+`UnMarshal(const char*)`, `UnMarshal(StreamReader*)`, `SetBytesIssued`,
+`GetCheckpointFileName`) are `#ifdef _WIN32` — they take engine-only types and
+carry no format information. Every data member and marshaling method is shared.
+
+The method *bodies* are extracted the same way `MemberSet` was:
+
+| Source | Extracted into |
+| --- | --- |
+| `ConfigurationInfo` + `CheckpointHeader` marshal/unmarshal (`legislator.cpp`) | `src/storage_min.cpp` (**verbatim**, line-cited) |
+| Log record padding + `Legislator::ReadNextMessage` recovery scan | `src/storage_min.cpp` (`rsl_storage::EncodeLogRecord` / `ScanLog`) |
+| `RSLCheckpointStreamWriter`/`Reader` 4 MiB block + trailing Rabin-64 (`rsl.cpp`) | `src/storage_min.cpp` (`BuildCheckpointFile` / `VerifyCheckpointFile`) |
+| `Read`/`UpdateDefunctFile` (`legislator.cpp`) | `src/storage_min.cpp` (`EncodeDefunct` / `DecodeDefunct`) |
+
+The verbatim class methods keep their `legislator.cpp` line citations; the
+`rsl_storage::` helpers are ports that replace the Windows unbuffered/overlapped
+I/O mechanism (`WriteFileGather`, `APSEQREAD`/`APSEQWRITE`) with plain in-memory
+byte buffers — the *bytes produced/consumed are unchanged*, and every deviation
+is commented (notably: the corpus **zero-fills page pads** for determinism,
+whereas the Windows engine leaves malloc/VirtualAlloc tails; readers tolerate
+non-zero pads, exercised by the `garbage-pad` sample).
+
+```sh
+./build/golden-gen --storage        corpus/storage   # generate corpus + MANIFEST
+./build/golden-gen --verify-storage  corpus/storage   # reverse: read a dir, report
+```
+
+### Corpus layout (`corpus/storage/`)
+
+`MANIFEST.json` is the FIELDS-equivalent for storage: for every sample it records
+size, an `fp64` (Rabin-64 of the whole file), and the **executed** recovery
+outcome — `accept` / `stop-at-offset` / `reject` — produced by *running* the
+extracted C++ reader over the bytes just written (never by reading the spec).
+Log entries also carry the recovered record list; checkpoint entries carry
+version / header length / recovered user-data size.
+
+Samples: empty / single / multi-record logs, one per protocol version, plus the
+recovery edge cases (`torn-tail`, `zero-tail` → stop; `corrupt-checksum`,
+`unknown-msgid` → reject; `garbage-pad` → accept); checkpoints per version and at
+the 4 MiB block boundaries (`cp-4mib`, `cp-4mib-plus1`, `cp-multiblock`) plus
+`cp-corrupt-block` / `cp-truncated` → reject; and `defunct.txt` values.
+
+### What is committed
+
+**Only `MANIFEST.json`.** The sample files are generated test data, not source —
+the same call made for the `rsl-wire` fuzz corpus — so they are gitignored and
+regenerated by `--storage`. This keeps ~17 MB of binaries (the 4 MiB checkpoints
+dominate) out of the repo.
+
+That loses nothing, because the MANIFEST records an `fp64` (Rabin-64 of the whole
+file) for every sample, computed from the files as they are written. Diffing the
+MANIFEST byte-for-byte therefore proves each regenerated file is byte-identical
+to what was recorded — the hash-compare the plan allows in place of checking the
+binaries in. Large checkpoints additionally record `statePattern:"ramp"` +
+`stateLen`, so their user state is reproducible from the manifest alone.
+
+Consumers (the Phase 3b/3c Rust tests) run `--storage` into a scratch directory
+first; CI already builds `golden-gen`, so this costs nothing there. CI diffs the
+MANIFEST and runs `--verify-storage` as a reverse-interop self-check.
+
 ## Not covered (see the plan)
 
-- **Log-file page layout** (512-byte alignment/batching) and **checkpoint
-  files** — their `LogFile`/`CheckpointHeader` containers live in
-  `legislator.cpp` and would pull in the whole engine. Their *payloads*
-  (marshaled Votes/headers) are covered here.
 - **Wire-level packet framing** (20-byte NetPacket header) — generate from the
   spec + this checksum tool, or capture from a Windows loopback run.
+- **v1/v2 checkpoints** — those predate the `CheckpointHeader` (they are a bare
+  page-rounded vote); the checkpoint corpus starts at v3 where the header format
+  exists, analogous to `Message_Bootstrap` only existing at v4+.
