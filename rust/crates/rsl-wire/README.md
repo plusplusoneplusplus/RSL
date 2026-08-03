@@ -27,11 +27,14 @@ containers, and NetPacket framing are explicitly out of scope here (Phase 3/4).
 
 ## Correctness
 
-The crate is validated by four independent harnesses, all run by `cargo test`:
+The crate is validated by five independent harnesses, all run by `cargo test`:
 
 1. **`golden`** — for every one of the 122 corpus records: unmarshal succeeds,
    the checksum verifies and equals the stated value, and re-marshal is
    **byte-identical** to the reference bytes. All 7 raw Rabin-64 vectors match.
+   **`containers`** additionally rebuilds the 7 raw `MarshalData`
+   `CONTAINER` vectors (1/4-byte back-patched lengths, incl. nesting)
+   byte-identically.
 2. **`fields`** — each message is **independently reconstructed** from the
    corpus's machine-readable `FIELDS` metadata (never from parsing the bytes)
    and must reproduce the reference bytes. This closes the round-trip loophole
@@ -41,6 +44,14 @@ The crate is validated by four independent harnesses, all run by `cargo test`:
 4. **`fuzz_smoke`** — pseudo-random and corpus-mutated bytes never panic
    `unmarshal`, and any accepted buffer is idempotent under marshal/parse. The
    coverage-guided equivalent lives in `fuzz/` (see below).
+
+Where the C++ `LogAssert`-**aborts** on hostile input, this crate accepts or
+cleanly rejects instead; the exhaustive list (needed to whitelist a future
+C++-vs-Rust differential fuzzer) is in the crate-level rustdoc
+(`src/lib.rs`). One shape is accepted by the reader but refused by the
+writer: a reconfiguration vote carrying requests — marshaling returns
+`Err(MarshalError::ReconfigurationVoteWithRequests)` because a C++ peer
+would abort parsing it.
 
 ## Fuzzing
 
@@ -55,7 +66,10 @@ cargo +nightly fuzz run unmarshal
 
 The `fuzz/` crate is detached from the workspace (it needs nightly + libfuzzer),
 so a plain stable `cargo build`/`test` skips it; `fuzz_smoke` is the always-on
-floor in CI.
+floor in CI, plus a ~60 s bounded `cargo fuzz` smoke step. The generated corpus
+under `fuzz/corpus/unmarshal/` is **not** checked in (it's marshal data, not
+source — see `fuzz/.gitignore`); it accumulates locally across runs, and CI
+starts each smoke run from an empty corpus.
 
 ## Benchmarks
 
@@ -83,8 +97,8 @@ use rsl_wire::{Msg, MsgKind, messages::verify_checksum};
 // `kind` is chosen by the receiver (a message id may be a bare header or a
 // subclass), exactly as in the C++.
 if let Some(msg) = Msg::unmarshal(MsgKind::Vote, bytes) {
-    assert!(verify_checksum(bytes));
-    let reencoded = msg.marshal_with_checksum(); // byte-identical to `bytes`
+    assert!(verify_checksum(bytes)); // `bytes` must be exactly one message
+    let reencoded = msg.marshal_with_checksum().unwrap(); // byte-identical
     assert_eq!(reencoded, bytes);
 }
 ```

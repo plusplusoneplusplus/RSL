@@ -114,3 +114,23 @@ jobs:
         if: steps.detect.outputs.has_rust == 'true'
         working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo test --all-features
+
+      # Bounded coverage-guided fuzz smoke: ~60 s of fuzzing from an empty
+      # corpus so CI stays fast (the generated corpus is not checked in; long
+      # sessions run out-of-band, and the always-on stable-toolchain floor is
+      # tests/fuzz_smoke.rs above). Runs only if a cargo-fuzz crate exists
+      # (fuzz/Cargo.toml under some crate).
+      - name: Fuzz smoke (bounded)
+        if: steps.detect.outputs.has_rust == 'true'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          fuzz_manifest="$(git ls-files '**/fuzz/Cargo.toml' | head -1)"
+          if [ -z "$fuzz_manifest" ]; then
+            echo "No fuzz crate found; skipping fuzz smoke."
+            exit 0
+          fi
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          # git ls-files ran in the workspace dir, so the path is relative to it.
+          cd "$(dirname "$fuzz_manifest")/.."
+          cargo +nightly fuzz run unmarshal -- -max_total_time=60 -print_final_stats=1
