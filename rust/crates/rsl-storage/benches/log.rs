@@ -123,7 +123,7 @@ fn group_commit(c: &mut Criterion) {
     let dir = scratch("commit");
     let mut group = c.benchmark_group("log/group-commit");
 
-    for batch_size in [1u64, 16, 128] {
+    for batch_size in [1u64, 4, 16, 64, 256] {
         let batch: Vec<Vec<u8>> = (0..batch_size).map(prepare_record).collect();
         let refs: Vec<&[u8]> = batch.iter().map(|r| r.as_slice()).collect();
         group.throughput(Throughput::Bytes(on_disk_len(&batch)));
@@ -139,6 +139,58 @@ fn group_commit(c: &mut Criterion) {
         );
         let _ = std::fs::remove_file(dir.join("1.log"));
     }
+    group.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The individual durability primitives, so the cost of each sync point in
+/// `DURABILITY.md` is a measured number rather than an assumption:
+///
+/// * `fdatasync` — what every append pays.
+/// * `fsync` — what `fdatasync` saves by not writing inode metadata.
+/// * `create+fsync-dir` — what publishing a *new* log's name costs, paid once
+///   per log file rather than once per append.
+fn sync_cost(c: &mut Criterion) {
+    let dir = scratch("sync");
+    let mut group = c.benchmark_group("log/sync");
+    let record = prepare_record(1);
+
+    let mut writer = LogWriter::open_with(&dir, 1, SyncAll).unwrap();
+    group.bench_function("fdatasync", |b| {
+        b.iter(|| {
+            writer.append(&record).unwrap();
+            writer.sync().unwrap();
+        });
+    });
+    drop(writer);
+    let _ = std::fs::remove_file(dir.join("1.log"));
+
+    // The same append, but paying for full inode metadata as well.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.join("fsync.bin"))
+        .unwrap();
+    group.bench_function("fsync", |b| {
+        b.iter(|| {
+            use std::io::Write;
+            file.write_all(&[0u8; 512]).unwrap();
+            file.sync_all().unwrap();
+        });
+    });
+    drop(file);
+
+    let mut decree = 0u64;
+    group.bench_function("create+fsync-dir", |b| {
+        b.iter(|| {
+            decree += 1;
+            let writer = LogWriter::open_with(&dir, decree, SyncAll).unwrap();
+            drop(writer);
+            std::fs::remove_file(dir.join(format!("{decree}.log"))).unwrap();
+        });
+    });
+
     group.finish();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -173,5 +225,5 @@ fn recovery_scan(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-criterion_group!(benches, append, group_commit, recovery_scan);
+criterion_group!(benches, append, group_commit, sync_cost, recovery_scan);
 criterion_main!(benches);

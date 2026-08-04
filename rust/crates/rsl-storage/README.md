@@ -23,7 +23,8 @@ log/checkpoint retention rule (`CleanupLogsAndCheckpoint`).
 | `log` | `LogFile` (`legislator.cpp:495-780`), the `ReadNextMessage` recovery loop (`legislator.cpp:3851`) and the `RestoreState` scan that drives it (`:5993`) |
 | `dir` | file naming (`legislator.cpp:516`/`:1082`), `GetFileNumbers` (`:5766`), `Read`/`UpdateDefunctFile` (`:7198`/`:7330`) |
 | `gc` | `CleanupLogsAndCheckpoint` (`legislator.cpp:5675`) |
-| `durability` | fsync/rename policy — the seam Phase 3d builds on |
+| `durability` | the open/write/sync/rename seam every write goes through — `APSEQWRITE` + `MOVEFILE_WRITE_THROUGH` spelled out for Linux |
+| `sim` | `SimCrash`: a shadow filesystem that records the write/sync/rename journal so a crash can be replayed at any prefix (test support) |
 
 `ConfigurationInfo` lives in `rsl-wire::types` alongside `MemberSet`: only
 checkpoints marshal it, but its encoding is plain versioned wire vocabulary.
@@ -76,21 +77,27 @@ Recovery ends one of three ways, matching the C++ decision for decision:
 
 ## Durability
 
-The C++ relies on Windows semantics — unbuffered writes plus
-`MoveFileEx(..., MOVEFILE_WRITE_THROUGH)`. On Linux the equivalent is explicit.
-`CheckpointWriter::finish` does it in order:
+The C++ relies on Windows semantics — unbuffered write-through handles plus
+`MoveFileEx(..., MOVEFILE_WRITE_THROUGH)`. On Linux every part of that is
+explicit, and **[`DURABILITY.md`](DURABILITY.md) states the exact guarantee at
+each API**. In short:
 
-1. seal the last block and patch the header with the final size,
-2. `fsync` the file,
-3. rename `…​.codex.tmp` → `…​.codex`,
-4. `fsync` the containing directory.
+- `LogWriter::append_durable` — the batch survives power loss when it returns.
+  This is the contract Phase 5 acknowledges decrees against.
+- `LogWriter::open` — fsyncs the *directory* when it creates the log, because
+  `fdatasync` on ext4/xfs does not publish a new file's name. Appends then need
+  only `fdatasync`.
+- `CheckpointWriter::finish` — fsync → rename → fsync-dir, so a reader sees the
+  whole old file or the whole new one. Dropped without `finish`, the `.tmp` is
+  removed and nothing is published.
+- `gc::apply` — unlinks, then fsyncs the directory; any prefix of the deletions
+  leaves a startable directory.
 
-A `CheckpointWriter` dropped without `finish` removes its `.tmp`, so a partial
-checkpoint is never published. Logs have no rename step — they are appended in
-place — so the log layer exposes both halves and lets the caller pick the commit
-points: `append` / `append_batch` write, `sync` flushes, `append_durable` does
-both. Phase 5's engine decides where the sync points go. Swap the policy (e.g.
-`NoSync` in tests) via `CheckpointWriter::create_with` / `LogWriter::open_with`.
+All of it goes through the `durability::Durability` trait, so the policy is
+swappable: `NoSync` for benchmarks, and `sim::SimCrash` — a shadow filesystem
+that journals every operation — for the crash harness. Reads and recovery stay
+on the real filesystem; the harness materializes a crashed directory to disk and
+runs the real code against it.
 
 ## Example
 
@@ -132,7 +139,7 @@ if let Some(mut records) = log.replay_from(1042)? {
 
 ## Correctness
 
-`cargo test` runs six harnesses:
+`cargo test` runs eight harnesses:
 
 1. **`corpus`** — every `.codex` sample in the Phase-3a corpus parses with the
    outcome, `detail` wording, version, header length and recovered user-data size
@@ -148,7 +155,13 @@ if let Some(mut records) = log.replay_from(1042)? {
    extracted **C++** readers accept Rust-written checkpoints (v3–v6, at and across
    the 4 MiB boundary) and Rust-written logs (empty, mixed record kinds,
    multi-page votes, 32-record runs), reporting the same sizes, record counts and
-   stop offsets — and reject damaged ones for the *same reason* we do.
+   stop offsets — and reject damaged ones for the *same reason* we do. Plus the
+   **interop matrix**: whole data directories at every protocol version, in both
+   directions — a C++-written directory that Rust recovers, appends to,
+   checkpoints and garbage-collects before handing it back, and a Rust-built
+   directory (several logs, several checkpoints, `defunct.txt`) that the C++
+   reads before and after a retention pass. This is the rolling-upgrade handoff
+   at the storage layer, two phases before the engine exists.
 4. **`log_roundtrip`** — reopen → append → rescan idempotence over zero and torn
    tails; the decree index (re-votes, non-indexed record kinds, decree lengths)
    against `LogFile`'s rules; replay-from-decree; writer strictness; and property
@@ -161,6 +174,19 @@ if let Some(mut records) = log.replay_from(1042)? {
 6. **`dir_gc`** — name parsing and enumeration order, `defunct.txt` round trips
    (against the corpus samples), and retention scenarios: which files survive a
    checkpoint at decree N, with and without a checkpoint present.
+7. **`crash`** — four scripted workloads (append votes, publish checkpoints,
+   garbage-collect, crash-and-reopen) run against the `SimCrash` shadow
+   filesystem, then replayed at **every** prefix of the recorded operation
+   sequence under six crash policies. Each materialized directory goes through
+   the real recovery code, asserting that nothing acknowledged is lost, recovery
+   always reaches a decision, survivors are a prefix and never a hole, and a
+   published checkpoint is whole. Two tests deliberately break the policy (drop
+   the directory fsync; publish without syncing the contents) to prove the
+   harness detects both, and one `SIGKILL`s a real child writer as a
+   sanity layer. See [`DURABILITY.md`](DURABILITY.md).
+8. **`sim` unit tests** — the shadow filesystem's own model: unsynced names can
+   vanish, synced bytes never can, tears land on sector boundaries, and a rename
+   is all-or-nothing.
 
 The corpus samples are generated test data and not committed. Tests locate them
 via `$RSL_STORAGE_CORPUS`, then `tools/golden-gen/corpus/storage`, and finally by
@@ -176,26 +202,52 @@ differential fuzzer) is in the crate-level rustdoc (`src/lib.rs`).
 `cargo bench -p rsl-storage`. Indicative numbers on the development machine
 (`--release`, files in `/tmp`); treat as a baseline, not absolutes:
 
+These are the **Phase-3d baseline**: Phase 5 and 6 must not regress them.
+
 | Benchmark | Time | Throughput |
 | --- | --- | --- |
-| `checkpoint_write` / 64 KiB | ~1.49 ms | ~42 MiB/s |
-| `checkpoint_write` / 4 MiB | ~3.37 ms | ~1.16 GiB/s |
-| `checkpoint_write` / 16 MiB | ~13.1 ms | ~1.19 GiB/s |
-| `checkpoint_read` / 64 KiB | ~43 µs | ~1.41 GiB/s |
-| `checkpoint_read` / 4 MiB | ~2.68 ms | ~1.46 GiB/s |
-| `checkpoint_read` / 16 MiB | ~10.9 ms | ~1.44 GiB/s |
-| `log/append` batched, 1024 × 512 B (`NoSync`) | ~217 µs | ~2.2 GiB/s |
-| `log/append` one-at-a-time, 1024 × 512 B | ~962 µs | ~520 MiB/s |
-| `log/append` batched, 1024 × 4 KiB | ~898 µs | ~4.3 GiB/s |
-| `log/group-commit` 1 record (`SyncAll`) | ~4.9 ms | — |
-| `log/group-commit` 128 records (`SyncAll`) | ~4.7 ms | ~13 MiB/s |
-| `log/recovery-scan` 4096 × 512 B | ~1.29 ms | ~1.51 GiB/s |
+| `checkpoint_write` / 64 KiB | ~1.53 ms | ~41 MiB/s |
+| `checkpoint_write` / 4 MiB | ~11 ms (noisy) | ~376 MiB/s |
+| `checkpoint_write` / 16 MiB | ~13.8 ms | ~1.13 GiB/s |
+| `checkpoint_read` / 64 KiB | ~44 µs | ~1.40 GiB/s |
+| `checkpoint_read` / 4 MiB | ~2.71 ms | ~1.36 GiB/s |
+| `checkpoint_read` / 16 MiB | ~11.0 ms | ~1.40 GiB/s |
+| `log/append` batched, 1024 × 512 B (`NoSync`) | ~216 µs | ~2.26 GiB/s |
+| `log/append` one-at-a-time, 1024 × 512 B | ~980 µs | ~510 MiB/s |
+| `log/append` batched, 1024 × 4 KiB | ~938 µs | ~4.17 GiB/s |
+| `log/group-commit` 1 record (`SyncAll`) | ~4.79 ms | ~0.1 MiB/s |
+| `log/group-commit` 16 records | ~3.86 ms | ~2.0 MiB/s |
+| `log/group-commit` 64 records | ~3.82 ms | ~8.2 MiB/s |
+| `log/group-commit` 256 records | ~3.80 ms | ~32.9 MiB/s |
+| `log/sync` `fdatasync` (one append) | ~4.90 ms | — |
+| `log/sync` `fsync` (bare 512 B write) | ~4.95 ms | — |
+| `log/sync` create + directory fsync | ~3.42 ms | — |
+| `log/recovery-scan` 4096 × 512 B | ~1.35 ms | ~1.44 GiB/s |
 | `log/recovery-scan` 4096 × 4 KiB | ~13.2 ms | ~1.18 GiB/s |
 
 Checkpoint read throughput tracks the Rabin-64 rate (~1.6 GiB/s in `rsl-wire`),
 as expected: the checksum is the only per-byte work either direction does. The
-same holds for the recovery scan. Two shapes are worth reading carefully: the
-64 KiB *checkpoint write* figure is not a throughput measurement (each iteration
-creates, closes and renames a file, and that fixed ~1.3 ms dominates), and the
-group-commit row is the disk's `fsync` latency — ~4.7 ms whether the batch holds
-1 record or 128, which is exactly why the engine batches.
+same holds for the recovery scan. Four rows want reading carefully:
+
+- The 64 KiB and 4 MiB *checkpoint write* figures are not throughput
+  measurements — each iteration creates, closes, renames and deletes a file, and
+  that fixed cost dominates. The 4 MiB point is also very noisy on this machine
+  (a ±25 % confidence interval); the 16 MiB row, which writes four 4 MiB blocks
+  for ~3.45 ms each, is the reliable steady-state number.
+- **Group commit is the whole story.** Latency is flat in batch size — one
+  device flush whether the batch holds 1 record or 256 — so batching buys ~320×
+  the throughput for no added latency. This is exactly why the engine batches,
+  and it matches what the C++ gets from `WriteFileGather` + write-through.
+- `fdatasync` and `fsync` are indistinguishable here (within the noise of a
+  single flush). The port uses `fdatasync` for appends on correctness and
+  portability grounds, not for a measured win.
+- The directory fsync a new log pays is one-off (~3.4 ms per *file*, not per
+  append), which is why it is affordable to make a log's name durable at
+  creation.
+
+**O_DIRECT / io_uring decision: not opened.** The Phase-3d gate was to open that
+work item only if group-commit latency came in materially worse than the C++
+baseline. It does not: the cost is one device flush, and `LogWriter` adds nothing
+measurable over a bare `write` + `fsync` (4.90 ms vs 4.95 ms). It is
+format-invariant, so it can be revisited from a Phase-5/6 profile without
+touching anything on disk. Reasoning in [`DURABILITY.md`](DURABILITY.md).

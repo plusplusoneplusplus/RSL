@@ -34,6 +34,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::dir::{checkpoint_file_name, log_file_name, DataDir};
+use crate::durability::{Durability, SyncAll};
 
 /// How many files of each kind to keep (`m_cfg.MaxCheckpoints()` /
 /// `MaxLogs()`). Both must be non-zero — the C++ `LogAssert`s on that
@@ -141,12 +142,42 @@ pub struct DeleteFailure {
 /// Returns the failures; an empty vector means the whole plan was applied. A
 /// file that is already gone is not a failure.
 pub fn apply(dir: &Path, plan: &CleanupPlan) -> Vec<DeleteFailure> {
+    apply_with(dir, plan, &SyncAll)
+}
+
+/// [`apply`] under an explicit durability policy.
+///
+/// Deletion order is the plan's — the checkpoints being retired first, then the
+/// logs, both oldest-first — and the *directory* is fsynced once at the end so
+/// the unlinks themselves survive a crash. That ordering is what makes every
+/// intermediate state safe: a plan never contains the newest checkpoint or a log
+/// still needed to reach it, so whichever prefix of the deletions a crash
+/// leaves behind, the surviving directory is still recoverable. Deleting a
+/// *stale* file twice is harmless; the danger would be an unlink that outlives
+/// the file it made redundant, which cannot arise because nothing is written
+/// here.
+pub fn apply_with<D: Durability>(
+    dir: &Path,
+    plan: &CleanupPlan,
+    durability: &D,
+) -> Vec<DeleteFailure> {
     let mut failures = Vec::new();
     for path in plan.paths(dir) {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(DeleteFailure { path, error }),
+        if let Err(error) = durability.remove_file(&path) {
+            failures.push(DeleteFailure { path, error });
+        }
+    }
+    if !plan.is_empty() {
+        let handle = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Err(error) = durability.sync_dir(handle) {
+            failures.push(DeleteFailure {
+                path: dir.to_path_buf(),
+                error,
+            });
         }
     }
     failures
@@ -158,8 +189,17 @@ pub fn cleanup(
     dir: &Path,
     retention: Retention,
 ) -> Result<Vec<DeleteFailure>, crate::dir::DirError> {
-    let listing = DataDir::scan(dir)?;
-    Ok(apply(dir, &plan(&listing, retention)))
+    cleanup_with(dir, retention, &SyncAll)
+}
+
+/// [`cleanup`] under an explicit durability policy.
+pub fn cleanup_with<D: Durability>(
+    dir: &Path,
+    retention: Retention,
+    durability: &D,
+) -> Result<Vec<DeleteFailure>, crate::dir::DirError> {
+    let listing = DataDir::scan_with(dir, durability)?;
+    Ok(apply_with(dir, &plan(&listing, retention), durability))
 }
 
 #[cfg(test)]

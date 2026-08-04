@@ -26,7 +26,7 @@
 //! At `v < 3` there is no header at all — the file is just the page-rounded
 //! vote — and at `v == 3` the user state follows raw, with no block checksums.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,7 @@ use rsl_wire::marshal::{Reader, Writer};
 use rsl_wire::messages::verify_checksum;
 use rsl_wire::{BallotNumber, ConfigurationInfo, MarshalError, MemberId, ProtocolVersion, Vote};
 
-use crate::durability::{Durability, SyncAll};
+use crate::durability::{Durability, OpenMode, SyncAll};
 use crate::{round_up_to_page, CHECKSUM_BLOCK_SIZE, CHECKSUM_SIZE, PAGE_SIZE};
 
 /// Why a checkpoint file was rejected.
@@ -787,7 +787,7 @@ pub struct CheckpointWriter<D: Durability = SyncAll> {
     header_len: u32,
     tmp_path: PathBuf,
     final_path: PathBuf,
-    file: Option<BufWriter<File>>,
+    file: Option<BufWriter<D::File>>,
     durability: D,
     /// `None` for the unblocked pre-v4 layout.
     block_size: Option<u32>,
@@ -842,11 +842,7 @@ impl<D: Durability> CheckpointWriter<D> {
         };
 
         let tmp_path = tmp_path_for(path);
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        let file = durability.open(&tmp_path, OpenMode::Create)?;
         let mut file = BufWriter::new(file);
         // Reserve the header region (`Init`, rsl.cpp:473 commits `GetMarshalLen`
         // bytes before any user data). It is overwritten in `finish`.
@@ -892,7 +888,7 @@ impl<D: Durability> CheckpointWriter<D> {
         }
     }
 
-    fn out(&mut self) -> &mut BufWriter<File> {
+    fn out(&mut self) -> &mut BufWriter<D::File> {
         self.file.as_mut().expect("writer used after finish")
     }
 
@@ -956,18 +952,12 @@ impl<D: Durability> CheckpointWriter<D> {
         file.flush()?;
         let file = file.into_inner().map_err(|e| e.into_error())?;
 
-        // Durability: contents first, then the rename, then the directory entry.
-        self.durability.sync_file(&file)?;
-        drop(file);
-        self.durability.rename(&self.tmp_path, &self.final_path)?;
-        if let Some(dir) = self.final_path.parent() {
-            let dir = if dir.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                dir
-            };
-            self.durability.sync_dir(dir)?;
-        }
+        // Publish: fsync the contents, rename, fsync the directory entry — the
+        // Linux spelling of the C++ `MOVEFILE_WRITE_THROUGH`. A crash anywhere
+        // in here leaves the destination name holding the whole old file or the
+        // whole new one, never a mixture.
+        self.durability
+            .rename_durable(&file, &self.tmp_path, &self.final_path)?;
 
         Ok(self.header.clone())
     }
@@ -1005,7 +995,7 @@ impl<D: Durability> Drop for CheckpointWriter<D> {
         // Dropped without `finish`: the temporary file holds a half-written
         // checkpoint under a name nothing reads, so remove it.
         if self.file.take().is_some() {
-            let _ = std::fs::remove_file(&self.tmp_path);
+            let _ = self.durability.remove_file(&self.tmp_path);
         }
     }
 }

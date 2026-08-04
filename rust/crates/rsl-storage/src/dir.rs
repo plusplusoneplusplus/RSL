@@ -26,11 +26,11 @@
 //!   than silently skipping the file, because a stray `foo.log` in a data
 //!   directory means something else is writing there.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::durability::{Durability, SyncAll};
+use crate::durability::{Durability, OpenMode, SyncAll};
 
 /// The name of the defunct-configuration file (`legislator.cpp:7202`).
 pub const DEFUNCT_FILE: &str = "defunct.txt";
@@ -135,15 +135,19 @@ pub struct DataDir {
 }
 
 impl DataDir {
-    /// Enumerate `path`.
+    /// Enumerate `path` on the real filesystem.
     pub fn scan(path: &Path) -> Result<DataDir, DirError> {
+        DataDir::scan_with(path, &SyncAll)
+    }
+
+    /// Enumerate `path` through a durability policy — the same listing, but
+    /// reading the simulator's shadow directory when one is in use.
+    pub fn scan_with<D: Durability>(path: &Path, durability: &D) -> Result<DataDir, DirError> {
         let mut logs = Vec::new();
         let mut checkpoints = Vec::new();
 
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
+        for name in durability.read_dir(path)? {
+            let name = name.as_str();
 
             for (ext, out) in [(LOG_EXT, &mut logs), (CHECKPOINT_EXT, &mut checkpoints)] {
                 match parse_numbered_name(name, ext) {
@@ -241,12 +245,14 @@ pub fn write_defunct(dir: &Path, value: u32) -> io::Result<()> {
 /// rename dance, and adds the explicit `fsync` Windows's `APSEQWRITE` implied.
 pub fn write_defunct_with<D: Durability>(dir: &Path, value: u32, durability: &D) -> io::Result<()> {
     let path = dir.join(DEFUNCT_FILE);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)?;
+    let existed = durability.exists(&path);
+    let mut file = durability.open(&path, OpenMode::Create)?;
     file.write_all(&encode_defunct(value))?;
     durability.sync_file(&file)?;
-    durability.sync_dir(dir)
+    // The name only needs publishing the first time; after that the entry does
+    // not change and `fsync` of the file is the whole story.
+    if !existed {
+        durability.sync_new_file(&path)?;
+    }
+    Ok(())
 }

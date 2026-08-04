@@ -58,7 +58,7 @@
 //!   Rabin-64 verifies. The Phase-3a extraction stops at the checksum and never
 //!   emits this `detail` string.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -67,7 +67,7 @@ use rsl_wire::messages::{
     MSG_RECONFIGURATION_DECISION, MSG_VOTE,
 };
 
-use crate::durability::{Durability, SyncAll};
+use crate::durability::{Durability, OpenMode, StorageFile, SyncAll};
 use crate::{round_up_to_page, PAGE_SIZE};
 
 /// `MAX_SINGLE_IO_SIZE` (`legislator.cpp:21`) — the largest single unbuffered
@@ -553,7 +553,8 @@ impl std::error::Error for IndexError {}
 /// decree → offset within one log file: the port of `LogFile::m_decreeOffsets`
 /// (`legislator.h:208`).
 ///
-/// Only votes are indexed. Decrees are contiguous from [`min_decree`], so the
+/// Only votes are indexed. Decrees are contiguous from
+/// [`min_decree`](DecreeIndex::min_decree), so the
 /// map is a vector: `offsets[decree - min_decree]`. A re-vote on the current
 /// maximum decree (a higher ballot for the same decree) replaces its entry, so
 /// a lookup always finds the *last* record for that decree — which is the one
@@ -817,9 +818,16 @@ impl std::error::Error for LogError {
 ///
 /// Durability is the caller's call, as in the engine: [`append`](Self::append)
 /// only writes, [`append_durable`](Self::append_durable) writes and syncs, and
-/// [`sync`](Self::sync) flushes a batch of earlier appends.
+/// [`sync`](Self::sync) flushes a batch of earlier appends. The engine's
+/// contract for Phase 5 is that a decree may only be acknowledged after an
+/// `append_durable` (or an `append` followed by a `sync`) has returned — see
+/// `DURABILITY.md`.
+///
+/// Creating the file is itself made durable: `open` fsyncs the *directory* when
+/// it had to create the log, because on ext4/xfs an `fdatasync` of the file does
+/// not publish its name. Every later append then needs only `fdatasync`.
 pub struct LogWriter<D: Durability = SyncAll> {
-    file: File,
+    file: D::File,
     path: PathBuf,
     file_decree: u64,
     index: DecreeIndex,
@@ -870,24 +878,26 @@ impl<D: Durability> LogWriter<D> {
     /// Truncating is what makes reopen → append → rescan idempotent.
     pub fn open_with(dir: &Path, decree: u64, durability: D) -> Result<LogWriter<D>, LogError> {
         let path = dir.join(crate::dir::log_file_name(decree));
-        let index = if path.exists() {
-            let scan = scan_file(&path)?;
+        let existed = durability.exists(&path);
+        let mut file = durability.open(&path, OpenMode::Append)?;
+
+        let index = if existed {
+            let scan = scan(io::BufReader::new(&mut file))?;
             if !scan.end.recoverable() {
                 return Err(LogError::Corrupt(Box::new(scan)));
             }
             scan.index()?
         } else {
+            // A brand-new log's *name* is not durable until the directory is.
+            // Without this an `fdatasync`ed vote can still be lost, because the
+            // file it landed in never existed as far as the directory is
+            // concerned (see `DURABILITY.md`).
+            durability.sync_new_file(&path)?;
             DecreeIndex::new()
         };
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        if file.metadata()?.len() > index.data_len() {
-            file.set_len(index.data_len())?;
+        if file.size()? > index.data_len() {
+            file.set_size(index.data_len())?;
         }
         file.seek(SeekFrom::Start(index.data_len()))?;
 
@@ -934,6 +944,9 @@ impl<D: Durability> LogWriter<D> {
 
     /// Append a batch of records in as few writes as possible, then make them
     /// durable. This is the group-commit shape the engine's vote path uses.
+    ///
+    /// **Contract:** once this returns `Ok`, every record in the batch survives
+    /// power loss. A decree must not be acknowledged before it does.
     pub fn append_durable(&mut self, records: &[&[u8]]) -> Result<u64, LogError> {
         let offset = self.append_batch(records)?;
         self.sync()?;
@@ -1025,13 +1038,19 @@ impl<D: Durability> LogWriter<D> {
     }
 
     /// Flush everything appended so far to stable storage.
+    ///
+    /// `fdatasync`, not `fsync`: a log is only ever extended, and `fdatasync`
+    /// already covers the one metadata field that matters for that — the file's
+    /// length. What it does *not* cover is the directory entry, which is why
+    /// [`open_with`](Self::open_with) fsyncs the directory when it creates the
+    /// file.
     pub fn sync(&self) -> io::Result<()> {
-        self.durability.sync_file(&self.file)
+        self.durability.sync_data(&self.file)
     }
 }
 
 /// Write every byte of `slices`, tolerating partial vectored writes.
-fn write_all_vectored(file: &mut File, slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+fn write_all_vectored<W: Write>(file: &mut W, slices: &mut [IoSlice<'_>]) -> io::Result<()> {
     let mut bufs = slices;
     while !bufs.is_empty() {
         match file.write_vectored(bufs) {

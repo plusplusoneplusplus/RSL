@@ -14,14 +14,25 @@
 //! file naming, enumeration and `defunct.txt` ([`dir`]); and the log/checkpoint
 //! retention rule ([`gc`]).
 //!
+//! Phase 3d makes it *provably* durable. Every write goes through the
+//! [`durability`] policy, which spells out on Linux what the C++ gets implicitly
+//! from `FILE_FLAG_WRITE_THROUGH` and `MOVEFILE_WRITE_THROUGH`: `fdatasync` per
+//! commit, an `fsync` of the *directory* when a file is created, and
+//! fsync→rename→fsync-dir to publish a checkpoint. [`sim::SimCrash`] is a
+//! shadow filesystem that journals every operation so `tests/crash.rs` can cut
+//! power at every point in a workload and run the real recovery code on the
+//! wreckage. `DURABILITY.md` states the guarantee each public API offers; that
+//! is the contract the Phase-5 engine acknowledges decrees against.
+//!
 //! ## Design
 //! * **Blocking `std::fs`**, no async: checkpoint I/O is a background activity in
 //!   the C++ engine model, so a plain blocking API is the faithful shape.
 //! * **Bounded memory**: neither direction ever buffers a whole checkpoint. The
 //!   writer streams user bytes straight through while folding them into the
 //!   running block checksum; the reader holds exactly one block.
-//! * **Durability** is behind the [`durability`] trait so a test can run without
-//!   `fsync` and so Phase 3d can swap in the engine's policy.
+//! * **Durability** is behind the [`durability`] trait — which owns opening and
+//!   writing files, not just syncing them, so [`sim::SimCrash`] can substitute a
+//!   whole filesystem and a benchmark can substitute none of it.
 //! * **Reader-permissive, writer-strict**: where the C++ `LogAssert`-aborts on a
 //!   malformed file, this crate returns an error instead; where the C++ would
 //!   emit a shape no reader accepts, the writer refuses. Every such site is
@@ -75,6 +86,7 @@ pub mod dir;
 pub mod durability;
 pub mod gc;
 pub mod log;
+pub mod sim;
 
 /// `s_PageSize` (`legislator.h:16`) — every on-disk record is padded to a
 /// multiple of this.
