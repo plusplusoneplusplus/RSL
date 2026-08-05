@@ -1,0 +1,38 @@
+[package]
+name = "rsl-net-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Detach from the parent workspace: cargo-fuzz needs nightly + libfuzzer, so this
+# crate must not be built by a plain `cargo build` of the rsl-net workspace.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rsl-net]
+path = ".."
+
+[dependencies.rsl-wire]
+path = "../../rsl-wire"
+
+[[bin]]
+name = "packet_decode"
+path = "fuzz_targets/packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "learn_decode"
+path = "fuzz_targets/learn_decode.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

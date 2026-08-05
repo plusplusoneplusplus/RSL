@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rsl-wire", "crates/rsl-storage"]
+members = ["crates/rsl-wire", "crates/rsl-storage", "crates/rsl-net"]
 
 [workspace.package]
 edition = "2021"

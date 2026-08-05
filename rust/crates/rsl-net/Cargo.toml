@@ -1,0 +1,21 @@
+[package]
+name = "rsl-net"
+version = "0.1.0"
+description = "Byte-exact Rust port of the RSL network framing (20-byte packet header + learn-port message framing)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rsl-wire = { path = "../rsl-wire" }
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "framing"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"

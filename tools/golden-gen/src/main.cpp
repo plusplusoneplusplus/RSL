@@ -28,6 +28,7 @@
 #include "utils.h"
 #include "fingerprint.h"
 #include "storage_min.h"       // Phase 3a: storage corpus + reverse verify
+#include "packet_min.h"        // Phase 4a: packet + learn-port framing
 
 using namespace RSLib;
 using namespace RSLibImpl;
@@ -201,12 +202,31 @@ void SelfCheck(const char* desc, std::vector<char>& buf)
     }
 }
 
+// Every message emitted as a RECORD is kept here so the Phase-4a packet and
+// learn-port vectors can frame real corpus messages rather than inventing new
+// payloads.
+struct CorpusMsg
+{
+    std::string type;
+    std::string desc;
+    int version;
+    std::vector<char> bytes;
+};
+std::vector<CorpusMsg> g_corpusMessages;
+
 void EmitRecord(const char* type, const char* desc, int version, Message& msg,
                 const std::string& fields)
 {
     UInt64 checksum = 0;
     std::vector<char> buf = MarshalWithChecksum(msg, &checksum);
     SelfCheck(desc, buf);
+
+    CorpusMsg keep;
+    keep.type = type;
+    keep.desc = desc;
+    keep.version = version;
+    keep.bytes = buf;
+    g_corpusMessages.push_back(keep);
 
     printf("RECORD\n");
     printf("TYPE %s\n", type);
@@ -588,6 +608,290 @@ void GenerateFingerprints()
     unsigned char ramp[256];
     for (int i = 0; i < 256; ++i) { ramp[i] = (unsigned char)i; }
     EmitFingerprint("ramp-256", ramp, sizeof(ramp));
+}
+
+// ===========================================================================
+// Phase 4a: packet framing vectors (PACKET) and learn-port framing vectors
+// (LEARN). As everywhere else in this tool, the OUTCOME lines are produced by
+// RUNNING the extracted C++ receive path over the bytes emitted -- never by
+// reading the spec.
+// ===========================================================================
+
+void EmitPacket(const char* desc, const std::vector<char>& frame,
+                UInt32 maxSize, UInt32 maxAlert)
+{
+    rsl_packet::ScanResult r =
+        rsl_packet::ScanPackets(frame.data(), frame.size(), maxSize, maxAlert);
+
+    printf("PACKET\n");
+    printf("DESC %s\n", desc);
+    printf("MAXSIZE %u\n", (unsigned)maxSize);
+    printf("MAXALERT %u\n", (unsigned)maxAlert);
+    printf("LEN %zu\n", frame.size());
+    printf("BYTES %s\n", ToHex(frame.data(), frame.size()).c_str());
+    printf("OUTCOME %s\n", rsl_packet::OutcomeName(r.outcome));
+    printf("CONSUMED %zu\n", r.consumed);
+    printf("PAYLOADS %zu\n", r.payloads.size());
+    for (size_t i = 0; i < r.payloads.size(); ++i)
+    {
+        printf("PAYLOAD %s\n", ToHex(r.payloads[i].data(), r.payloads[i].size()).c_str());
+    }
+    printf("DETAIL %s\n", r.detail.empty() ? "-" : r.detail.c_str());
+    printf("\n");
+}
+
+// Rewrite the header's size field and recompute the frame checksum, so a
+// size-range vector is rejected for its size and nothing else.
+std::vector<char> PatchSize(const std::vector<char>& frame, UInt32 size)
+{
+    std::vector<char> out = frame;
+    rsl_packet::PacketHdr hdr;
+    hdr.DeSerialize(out.data(), rsl_packet::SerialLen);
+    hdr.m_Size = size;
+    hdr.m_Checksum = 0;
+    hdr.Serialize(out.data(), rsl_packet::SerialLen);
+    UInt64 checksum = Utils::CalculateChecksum(out.data(), out.size());
+    rsl_packet::PacketHdr::SetChecksum(checksum, out.data(), rsl_packet::SerialLen);
+    return out;
+}
+
+void GeneratePackets()
+{
+    // ---- positives: real corpus messages wrapped in a packet --------------
+    // A fixed, deterministic selection: the first record of each message type
+    // at its highest emitted version, so the payloads stay small but cover
+    // every marshaling path.
+    static const char* kWanted[] = {
+        "Message", "Vote", "JoinMessage", "PrepareMsg",
+        "PrepareAccepted", "StatusResponse", "BootstrapMsg",
+    };
+    for (const char* type : kWanted)
+    {
+        const CorpusMsg* best = NULL;
+        for (const CorpusMsg& m : g_corpusMessages)
+        {
+            if (m.type == type && (!best || m.version > best->version))
+            {
+                best = &m;
+            }
+        }
+        if (!best) { continue; }
+        char desc[192];
+        snprintf(desc, sizeof(desc), "packet wrapping %s v%d (%s)",
+                 best->type.c_str(), best->version, best->desc.c_str());
+        EmitPacket(desc, rsl_packet::SerializePacket(best->bytes.data(), best->bytes.size()), 0, 0);
+    }
+
+    // Payload edge cases: the minimum legal packet is a bare 20-byte header.
+    EmitPacket("packet with empty payload (size == header)",
+               rsl_packet::SerializePacket("", 0), 0, 0);
+    {
+        char one = (char)0xff;
+        EmitPacket("packet with 1-byte payload", rsl_packet::SerializePacket(&one, 1), 0, 0);
+    }
+    {
+        std::vector<char> ramp(1024);
+        for (size_t i = 0; i < ramp.size(); ++i) { ramp[i] = (char)(i & 0xff); }
+        EmitPacket("packet with 1 KiB ramp payload",
+                   rsl_packet::SerializePacket(ramp.data(), ramp.size()), 0, 0);
+    }
+
+    // A reference frame reused by the stream and negative vectors below.
+    const CorpusMsg* ref = NULL;
+    for (const CorpusMsg& m : g_corpusMessages)
+    {
+        if (m.type == "Message") { ref = &m; break; }
+    }
+    if (!ref) { return; }
+    std::vector<char> frame = rsl_packet::SerializePacket(ref->bytes.data(), ref->bytes.size());
+
+    // ---- several packets in one read buffer -------------------------------
+    {
+        std::vector<char> three;
+        for (int i = 0; i < 3; ++i)
+        {
+            three.insert(three.end(), frame.begin(), frame.end());
+        }
+        EmitPacket("three packets back to back in one buffer", three, 0, 0);
+
+        // ... and the same buffer cut short mid-third-packet: the first two are
+        // accepted, the connection waits for the rest.
+        std::vector<char> partial(three.begin(), three.end() - 7);
+        EmitPacket("two whole packets plus a truncated third", partial, 0, 0);
+    }
+
+    // ---- incomplete input (never a rejection) -----------------------------
+    EmitPacket("empty buffer", std::vector<char>(), 0, 0);
+    EmitPacket("19 bytes -- one short of a header",
+               std::vector<char>(frame.begin(), frame.begin() + 19), 0, 0);
+    EmitPacket("header only, payload missing",
+               std::vector<char>(frame.begin(), frame.begin() + rsl_packet::SerialLen), 0, 0);
+    EmitPacket("frame missing its last byte",
+               std::vector<char>(frame.begin(), frame.end() - 1), 0, 0);
+
+    // ---- size out of range ------------------------------------------------
+    EmitPacket("size field 0", PatchSize(frame, 0), 0, 0);
+    EmitPacket("size field 19 (below the 20-byte header)", PatchSize(frame, 19), 0, 0);
+    EmitPacket("size field exactly 20 with a payload present", PatchSize(frame, 20), 0, 0);
+    EmitPacket("size field above the 100 MB default cap",
+               PatchSize(frame, rsl_packet::MaxNetPacketSize + 1), 0, 0);
+    EmitPacket("size field 0xffffffff", PatchSize(frame, 0xffffffffu), 0, 0);
+
+    // The configured cap: RSLConfig 1 MB -> 1*1024*1024 + 1024 (rslconfig.cpp:118).
+    const UInt32 oneMbCap = 1u * 1024 * 1024 + 1024;
+    EmitPacket("size just above a 1 MB configured cap", PatchSize(frame, oneMbCap + 1),
+               oneMbCap, 0);
+    EmitPacket("size exactly at a 1 MB configured cap -- accepted header, body pending",
+               PatchSize(frame, oneMbCap), oneMbCap, 0);
+    EmitPacket("in-range frame with a small configured cap", frame, oneMbCap, 0);
+
+    // The alert threshold only logs; it never rejects.
+    EmitPacket("size above the alert threshold but within the cap", frame, oneMbCap, 64);
+
+    // ---- checksum ---------------------------------------------------------
+    {
+        std::vector<char> flipped = frame;
+        flipped[rsl_packet::SerialLen] ^= 0x01; // first payload byte
+        EmitPacket("payload byte flipped (outer checksum fails)", flipped, 0, 0);
+    }
+    {
+        std::vector<char> flipped = frame;
+        flipped[rsl_packet::ChecksumOffset] ^= 0x80; // checksum field itself
+        EmitPacket("checksum field corrupted", flipped, 0, 0);
+    }
+    {
+        // The two checksum domains are different: the packet checksum covers the
+        // whole frame with a zeroed checksum field, the message checksum covers
+        // the message after its own checksum field. Flipping a byte of the
+        // header's proto-version field breaks the outer one while the inner
+        // message is untouched and still verifies.
+        std::vector<char> outerBad = frame;
+        outerBad[4] ^= 0x01; // m_ProtoVersion, which RSL always sends as zero
+        EmitPacket("outer checksum invalid, inner message checksum valid", outerBad, 0, 0);
+    }
+    {
+        // ... and the reverse: corrupt the message's own checksum field, then
+        // re-frame. The packet layer never inspects the payload, so it accepts.
+        std::vector<char> badMsg = ref->bytes;
+        badMsg[s_ChecksumOffset] ^= 0x01;
+        EmitPacket("outer checksum valid, inner message checksum invalid",
+                   rsl_packet::SerializePacket(badMsg.data(), badMsg.size()), 0, 0);
+    }
+    {
+        // A valid packet followed by a corrupt one: the first is delivered, then
+        // the connection dies. Proves that acceptance is not rolled back.
+        std::vector<char> two = frame;
+        std::vector<char> bad = frame;
+        bad[rsl_packet::SerialLen] ^= 0x01;
+        two.insert(two.end(), bad.begin(), bad.end());
+        EmitPacket("good packet followed by a corrupt one", two, 0, 0);
+    }
+}
+
+void EmitLearn(const char* desc, const std::vector<char>& stream, UInt32 maxMessageSize,
+               bool executedFaithfully)
+{
+    Message msg;
+    rsl_packet::LearnResult r =
+        rsl_packet::ReadMessage(stream.data(), stream.size(), maxMessageSize, &msg);
+
+    printf("LEARN\n");
+    printf("DESC %s\n", desc);
+    printf("MAXSIZE %u\n", (unsigned)maxMessageSize);
+    printf("LEN %zu\n", stream.size());
+    printf("BYTES %s\n", ToHex(stream.data(), stream.size()).c_str());
+    printf("EXEC %s\n", executedFaithfully ? "yes" : "no");
+    printf("OUTCOME %s\n", rsl_packet::LearnOutcomeName(r.outcome));
+    printf("VERSION %u\n", (unsigned)r.version);
+    printf("MSGLEN %u\n", (unsigned)r.length);
+    printf("DETAIL %s\n", r.detail.c_str());
+    printf("\n");
+}
+
+// Patch the u16 version / u32 length that make up the learn port's 6-byte
+// framing header (they are the message's own first two fields).
+std::vector<char> PatchLearnHeader(const std::vector<char>& msg, UInt16 version, UInt32 length)
+{
+    std::vector<char> out = msg;
+    if (out.size() < rsl_packet::LearnHeaderSize)
+    {
+        out.resize(rsl_packet::LearnHeaderSize, 0);
+    }
+    MarshalData marshal(out.data(), rsl_packet::LearnHeaderSize, false);
+    marshal.SetMarshaledLength(0);
+    marshal.WriteUInt16(version);
+    marshal.WriteUInt32(length);
+    return out;
+}
+
+void GenerateLearn()
+{
+    const CorpusMsg* base = NULL;
+    const CorpusMsg* status = NULL;
+    for (const CorpusMsg& m : g_corpusMessages)
+    {
+        if (!base && m.type == "Message") { base = &m; }
+        if (m.type == "StatusResponse" && (!status || m.version > status->version))
+        {
+            status = &m;
+        }
+    }
+    if (!base || !status) { return; }
+
+    const UInt32 kMax = rsl_packet::DefaultMaxMessageSize;
+
+    EmitLearn("learn stream: a whole base Message", base->bytes, kMax, true);
+    EmitLearn("learn stream: a whole StatusResponse", status->bytes, kMax, true);
+
+    {
+        // Trailing bytes are ignored: only `length` bytes are consumed.
+        std::vector<char> extra = base->bytes;
+        for (int i = 0; i < 8; ++i) { extra.push_back((char)0xaa); }
+        EmitLearn("message followed by trailing bytes", extra, kMax, true);
+    }
+
+    EmitLearn("empty stream", std::vector<char>(), kMax, true);
+    EmitLearn("3 bytes -- half a framing header",
+              std::vector<char>(base->bytes.begin(), base->bytes.begin() + 3), kMax, true);
+    EmitLearn("header present, body truncated",
+              std::vector<char>(base->bytes.begin(), base->bytes.end() - 1), kMax, true);
+
+    EmitLearn("version 0", PatchLearnHeader(base->bytes, 0, (UInt32)base->bytes.size()),
+              kMax, true);
+    EmitLearn("version 7 (one past the last valid version)",
+              PatchLearnHeader(base->bytes, 7, (UInt32)base->bytes.size()), kMax, true);
+    EmitLearn("version 0xffff", PatchLearnHeader(base->bytes, 0xffff,
+              (UInt32)base->bytes.size()), kMax, true);
+
+    EmitLearn("length above the configured cap",
+              PatchLearnHeader(base->bytes, 6, 0x7fffffff), kMax, true);
+    EmitLearn("length one above a 1 KB cap",
+              PatchLearnHeader(base->bytes, 6, 1025), 1024, true);
+    EmitLearn("length exactly at a small cap, body missing",
+              PatchLearnHeader(base->bytes, 6, 1024), 1024, true);
+
+    // Below the 6-byte framing header the original memcpy's 6 bytes into a
+    // `malloc(length)` buffer (message.cpp:672-674) -- a heap overflow. The
+    // port refuses the length instead, so this outcome is NOT the executed
+    // original's; EXEC says so.
+    EmitLearn("length below the 6-byte header (C++ overflows its buffer)",
+              PatchLearnHeader(base->bytes, 6, 5), kMax, false);
+
+    {
+        // Version and length are fine, the message body is not: the magic
+        // number is wrong, so UnMarshal rejects it.
+        std::vector<char> badMagic = base->bytes;
+        badMagic[14] ^= 0xff; // magic sits after version+length+checksum
+        EmitLearn("valid framing, bad magic in the message", badMagic, kMax, true);
+    }
+    {
+        // A learn message whose own checksum is wrong is still ACCEPTED:
+        // ReadFromSocket only unmarshals, it never calls VerifyChecksum.
+        std::vector<char> badChecksum = base->bytes;
+        badChecksum[s_ChecksumOffset] ^= 0x01;
+        EmitLearn("valid framing, wrong message checksum (accepted -- no verify)",
+                  badChecksum, kMax, true);
+    }
 }
 
 // ===========================================================================
@@ -1100,6 +1404,14 @@ int main(int argc, char** argv)
     {
         return VerifyStorage(argv[2]);
     }
+    // Phase 4a: live C++ TCP peer, the interop oracle for the Rust net tests.
+    // Not part of corpus regeneration; spawned on demand.
+    if (argc >= 3 && strcmp(argv[1], "--packet-peer") == 0)
+    {
+        const char* mode = "echo";
+        if (argc >= 5 && strcmp(argv[3], "--mode") == 0) { mode = argv[4]; }
+        return rsl_packet::RunPeer(atoi(argv[2]), mode);
+    }
 
     printf("# RSL Phase-1 golden vectors (generated by tools/golden-gen)\n");
     printf("# magic=0x%08x checksumOffset=%u\n\n",
@@ -1115,6 +1427,8 @@ int main(int argc, char** argv)
     GenerateBootstrap();
     // New record kinds go last so existing RECORD/FPRINT bytes never move.
     GenerateContainers();
+    GeneratePackets();
+    GenerateLearn();
 
     fprintf(stderr, "self-check: %d passed, %d failed\n",
             g_selfCheckPassed, g_selfCheckFailed);

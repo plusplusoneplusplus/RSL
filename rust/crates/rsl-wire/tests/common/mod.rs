@@ -96,6 +96,9 @@ pub fn load_all() -> (Vec<Record>, Vec<Fprint>, Vec<Container>) {
             "RECORD" => records.push(parse_record(block)),
             "FPRINT" => fprints.push(parse_fprint(block)),
             "CONTAINER" => containers.push(parse_container(block)),
+            // Phase-4a framing blocks live in the same corpus file but belong to
+            // rsl-net (see its tests/common/mod.rs); nothing here consumes them.
+            "PACKET" | "LEARN" => {}
             other => panic!("unexpected block header {other:?}"),
         }
         block.clear();

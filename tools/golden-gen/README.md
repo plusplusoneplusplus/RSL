@@ -11,7 +11,8 @@ It is the concrete implementation of
 ## What it compiles
 
 Only what the marshaling / fingerprint / message code actually needs — no
-threading, file-I/O, networking, or logging engine:
+threading, IOCP, or logging engine. Storage I/O and sockets appear only in the
+extracted Phase-3a/4a paths below, as plain blocking POSIX calls:
 
 | Source | Role |
 | --- | --- |
@@ -21,6 +22,7 @@ threading, file-I/O, networking, or logging engine:
 | `src/common/src/utils.cpp` | `Utils::CalculateChecksum` |
 | `src/RSL/src/message.cpp` | all message types × versions |
 | `tools/golden-gen/src/engine_min.cpp` | `MemberSet` / `RSLNodeCollection` / `RSLNode` — copied **verbatim** from `rsl.cpp` (message.cpp references them) |
+| `tools/golden-gen/src/packet_min.cpp` | `PacketHdr`/`Packet` + the `NetCxn` receive decision table + `Message::ReadFromSocket`, and the live TCP peer (Phase 4a) |
 | `tools/golden-gen/src/main.cpp` | the generator driver |
 
 ## How the Windows build stays untouched
@@ -91,6 +93,29 @@ CONTAINER               # raw MarshalData StartContainer/CloseContainer vectors
 DESC <scenario name>    # rebuilt by name in the Rust tests/containers.rs
 LEN <bytes>
 BYTES <hex>             # no checksum: raw MarshalData output, not a message
+
+PACKET                  # 20-byte NetPacket framing (Phase 4a)
+DESC <text>
+MAXSIZE <u32>           # PacketFactory's m_MaxPacketSize (0 = NetPacket.h default)
+MAXALERT <u32>          # m_MaxPacketAlertSize (0 = no alert)
+LEN <bytes>
+BYTES <hex>             # the byte stream fed to the C++ receive path
+OUTCOME <accept|need-more|reject-header|reject-checksum>
+CONSUMED <bytes>        # covered by the accepted packets
+PAYLOADS <count>
+PAYLOAD <hex>           # one line per accepted packet, in order
+DETAIL <text>           # the C++'s own reject wording (or an alert note)
+
+LEARN                   # learn-port framing: Message::ReadFromSocket (Phase 4a)
+DESC <text>
+MAXSIZE <u32>           # RSLConfig::MaxMessageSize()
+LEN <bytes>
+BYTES <hex>             # the byte stream fed to the reader
+EXEC <yes|no>           # no = the original is unsafe here; see below
+OUTCOME <accept|reject-short-header|reject-version|reject-too-large|reject-short-body|reject-unmarshal>
+VERSION <u16>           # as parsed from the 6-byte header (0 if not reached)
+MSGLEN <u32>            # ditto
+DETAIL <text>
 ```
 
 `CONTAINER` blocks (Phase-2 gap closure) pin down the container back-patch
@@ -117,6 +142,41 @@ from the fields and check that its marshaling reproduces `BYTES` — a stronger
 check than round-tripping `BYTES` alone, which a reader bug mirrored by a writer
 bug could pass. The Rust port's `tests/fields.rs` does exactly this. Adding
 `FIELDS` does not change `BYTES`/`CHECKSUM`; the marshaled bytes are unaffected.
+
+### Phase 4a: `PACKET` / `LEARN` and the live peer
+
+Both block kinds work the way the storage MANIFEST does: the `OUTCOME` is
+produced by **running** the extracted C++ receive code over the bytes just
+emitted, never by reading the format spec. `PACKET` payloads are real corpus
+messages (one per message type, at the highest version that emits it) plus a few
+synthetic edge cases, and the negatives cover an empty/short buffer, every
+out-of-range size, both checksum domains — including a frame whose *inner*
+message checksum is valid while the outer one is not, and the reverse — and a
+good packet followed by a corrupt one (the first is still delivered, then the
+connection dies).
+
+`EXEC no` appears on exactly one `LEARN` vector: a length below the 6-byte
+framing header. `ReadFromSocket` `malloc`s `length` bytes and then `memcpy`s 6
+into it (`message.cpp:672-674`), so the original overflows its allocation and has
+no outcome worth copying; `packet_min.cpp` refuses the length instead, and the
+Rust port pins that same behaviour.
+
+Note also that `ReadFromSocket` **never verifies the message checksum** — it only
+unmarshals. The corpus records a wrong-checksum message as `accept` for that
+reason.
+
+```sh
+# The live interop peer: single connection, blocking, Linux-only. Not part of
+# corpus regeneration; the Rust tests spawn it on demand.
+./build/golden-gen --packet-peer 0 --mode echo        # NetPacket framing, echoes
+./build/golden-gen --packet-peer 0 --mode log         # NetPacket framing, reports only
+./build/golden-gen --packet-peer 0 --mode fetch-stub  # learn port: reads one
+                                                      # Message, replies with a
+                                                      # StatusResponse
+```
+
+Port `0` picks an ephemeral port; the peer prints `PORT <n>` on stdout and
+flushes it before accepting, so a harness never has to race on a fixed port.
 
 `FPRINT empty` is `a795d0f29b4dcdf8` — equal to the polynomial, the documented
 fingerprint of the empty string, a quick correctness check for the Rabin-64
@@ -195,8 +255,6 @@ MANIFEST and runs `--verify-storage` as a reverse-interop self-check.
 
 ## Not covered (see the plan)
 
-- **Wire-level packet framing** (20-byte NetPacket header) — generate from the
-  spec + this checksum tool, or capture from a Windows loopback run.
 - **v1/v2 checkpoints** — those predate the `CheckpointHeader` (they are a bare
   page-rounded vote); the checkpoint corpus starts at v3 where the header format
   exists, analogous to `Message_Bootstrap` only existing at v4+.

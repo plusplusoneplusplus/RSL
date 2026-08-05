@@ -27,6 +27,9 @@ add_executable(golden-gen
     # Verbatim extract of ConfigurationInfo / CheckpointHeader from
     # legislator.cpp + Linux ports of the storage I/O paths (Phase 3a):
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage_min.cpp
+    # Verbatim extract of PacketHdr/Packet + the NetCxn receive decision table
+    # and Message::ReadFromSocket, plus the live TCP peer (Phase 4a):
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/packet_min.cpp
     # The generator driver:
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
 )
