@@ -739,6 +739,184 @@ impl LogReader {
 }
 
 // ---------------------------------------------------------------------------
+// The log set: every log in a data directory, as one snapshot
+// ---------------------------------------------------------------------------
+
+/// A contiguous run of bytes in one log file: what a reader must send, or read,
+/// to serve the decrees from some starting point on.
+///
+/// `len` is a **snapshot**: the number of bytes that were readable when the
+/// [`LogSet`] was opened. A concurrent appender may already have grown the file
+/// past it; a span never chases that growth (see [`LogSet`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSpan {
+    /// The log file.
+    pub path: PathBuf,
+    /// The decree in the file's name.
+    pub file_decree: u64,
+    /// First byte to read — a record boundary.
+    pub offset: u64,
+    /// Bytes from `offset` to the snapshot end of the file.
+    pub len: u64,
+}
+
+/// One log file within a [`LogSet`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogFileInfo {
+    /// The decree in the file's name (`LogFile::m_minDecree` for a log the
+    /// engine wrote).
+    pub file_decree: u64,
+    /// Path to the file.
+    pub path: PathBuf,
+    /// The rebuilt decree→offset index.
+    pub index: DecreeIndex,
+    /// How the recovery scan of this file ended.
+    pub end: ScanEnd,
+}
+
+impl LogFileInfo {
+    /// Bytes of valid records in this file, as observed at open —
+    /// `LogFile::m_dataLen`.
+    pub fn data_len(&self) -> u64 {
+        self.index.data_len()
+    }
+}
+
+/// Every `<decree>.log` in a data directory, scanned once, ordered by decree.
+///
+/// This is the read side of `Legislator::m_logFiles` (`legislator.h:262`) that
+/// `HandleFetchVotesMsg` walks: find the file holding a decree, take its offset,
+/// then send that file from the offset and every later file whole
+/// (`legislator.cpp:3633-3677`).
+///
+/// ## Snapshot-at-open
+///
+/// A `LogSet` is a point-in-time view. Every file's readable length is fixed at
+/// [`open`](LogSet::open) time to the end of the last *valid* record found
+/// there, and never re-read; a new log created afterwards is not in the set at
+/// all. So a `fetch_votes` response serves a prefix that was complete when the
+/// request arrived, even while the engine keeps appending underneath it.
+///
+/// That matches the C++ within one divergence. `SendFile` opens the file with
+/// `APSEQREAD::DoInit`, which captures `GetFileSize` once (`apdiskio.cpp:146`)
+/// and computes `length = FileSize() - offset` from that snapshot
+/// (`legislator.cpp:4515`) — so the C++ also refuses to chase a growing file.
+/// What it snapshots is the raw file *size*, where this snapshots the end of the
+/// last valid record. The two differ only when the file ends in a torn or zeroed
+/// tail, which the C++ would stream to the peer as garbage and the peer would
+/// then reject; here that tail is simply not sent, and the transfer ends cleanly
+/// on a record boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSet {
+    dir: PathBuf,
+    files: Vec<LogFileInfo>,
+}
+
+impl LogSet {
+    /// Scan every log in `dir`, in ascending decree order.
+    ///
+    /// A log whose scan rejects fails the whole open with [`LogError::Corrupt`],
+    /// exactly as it would fail the engine's `RestoreState`.
+    pub fn open(dir: &Path) -> Result<LogSet, LogError> {
+        let listing = crate::dir::DataDir::scan(dir).map_err(|e| match e {
+            crate::dir::DirError::Io(e) => LogError::Io(e),
+            crate::dir::DirError::UnparsableName(name) => {
+                LogError::Io(io::Error::new(io::ErrorKind::InvalidData, name))
+            }
+        })?;
+
+        let mut files = Vec::with_capacity(listing.logs.len());
+        for &file_decree in &listing.logs {
+            let path = listing.log_path(file_decree);
+            let scan = scan_file(&path)?;
+            if !scan.end.recoverable() {
+                return Err(LogError::Corrupt(Box::new(scan)));
+            }
+            files.push(LogFileInfo {
+                file_decree,
+                path,
+                index: scan.index()?,
+                end: scan.end,
+            });
+        }
+        Ok(LogSet {
+            dir: dir.to_path_buf(),
+            files,
+        })
+    }
+
+    /// The directory this set was opened from.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The log files, ascending by decree.
+    pub fn files(&self) -> &[LogFileInfo] {
+        &self.files
+    }
+
+    /// Is there no log at all?
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// `m_logFiles.front()->m_minDecree` — the `minDecreeInLog` a
+    /// `StatusResponse` reports (`legislator.cpp:3323`). `None` for an empty
+    /// directory, where the C++ would dereference `front()` on an empty vector.
+    pub fn min_decree_in_log(&self) -> Option<u64> {
+        self.files.first().map(|f| {
+            if f.index.is_empty() {
+                f.file_decree
+            } else {
+                f.index.min_decree()
+            }
+        })
+    }
+
+    /// The highest decree indexed anywhere in the set.
+    pub fn max_decree(&self) -> Option<u64> {
+        self.files
+            .iter()
+            .rev()
+            .find(|f| !f.index.is_empty())
+            .map(|f| f.index.max_decree())
+    }
+
+    /// The file holding `decree` (`LogFile::HasDecree`, `legislator.cpp:3646`).
+    pub fn holding(&self, decree: u64) -> Option<&LogFileInfo> {
+        self.files.iter().find(|f| f.index.has_decree(decree))
+    }
+
+    /// The byte spans a `FetchVotes(decree)` response consists of: the holding
+    /// file from `decree`'s offset, then every later file whole
+    /// (`legislator.cpp:3663-3676`).
+    ///
+    /// `None` when no log holds `decree` — the case the C++ answers by closing
+    /// the connection without a word (`legislator.cpp:3656`). Empty spans are
+    /// skipped, so an empty trailing log contributes nothing.
+    pub fn votes_from(&self, decree: u64) -> Option<Vec<FileSpan>> {
+        let start = self.files.iter().position(|f| f.index.has_decree(decree))?;
+        let mut offset = self.files[start].index.offset(decree)?;
+
+        let mut spans = Vec::with_capacity(self.files.len() - start);
+        for file in &self.files[start..] {
+            let len = file.data_len().saturating_sub(offset);
+            if len > 0 {
+                spans.push(FileSpan {
+                    path: file.path.clone(),
+                    file_decree: file.file_decree,
+                    offset,
+                    len,
+                });
+            }
+            // `offset = 0;` after the first file (legislator.cpp:3676).
+            offset = 0;
+        }
+        Some(spans)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Writing
 // ---------------------------------------------------------------------------
 

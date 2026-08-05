@@ -23,6 +23,7 @@ extracted Phase-3a/4a paths below, as plain blocking POSIX calls:
 | `src/RSL/src/message.cpp` | all message types × versions |
 | `tools/golden-gen/src/engine_min.cpp` | `MemberSet` / `RSLNodeCollection` / `RSLNode` — copied **verbatim** from `rsl.cpp` (message.cpp references them) |
 | `tools/golden-gen/src/packet_min.cpp` | `PacketHdr`/`Packet` + the `NetCxn` receive decision table + `Message::ReadFromSocket`, and the live TCP peer (Phase 4a) |
+| `tools/golden-gen/src/learn_min.cpp` | the learn port both ways: `HandleFetchRequest` + the three handlers + `SendFile`, and the `ReadNextMessage` / `CopyCheckpoint` client loops (Phase 4c) |
 | `tools/golden-gen/src/main.cpp` | the generator driver |
 
 ## How the Windows build stays untouched
@@ -177,6 +178,49 @@ reason.
 
 Port `0` picks an ephemeral port; the peer prints `PORT <n>` on stdout and
 flushes it before accepting, so a harness never has to race on a fixed port.
+
+### Phase 4c: the live learn port (`--learn-server` / `--learn-client`)
+
+`learn_min.cpp` is the state-transfer slice: `HandleFetchRequest` and its three
+handlers, `SendFile`, and — on the other side — the `ReadNextMessage` loop
+`LearnVotes` drives plus the `CopyCheckpoint` copy loop. Both ends speak the
+real protocol over a real socket, so the Rust port can be tested as a client of
+the C++ *and* as a server to it.
+
+```sh
+# C++ serves a data directory; a Rust client fetches from it.
+./build/golden-gen --learn-server 0 --dir /path/to/data --connections 3
+
+# C++ fetches from a Rust server (or from another --learn-server).
+./build/golden-gen --learn-client 127.0.0.1 <port> --mode status
+./build/golden-gen --learn-client 127.0.0.1 <port> --mode votes --decree 101
+./build/golden-gen --learn-client 127.0.0.1 <port> --mode checkpoint \
+    --decree 500 --size <bytes> --out copy.codex
+```
+
+The server prints `PORT <n>` before accepting, like `--packet-peer`. It handles
+`--connections` requests one after another and exits; each protocol is one-shot
+(one request, one stream, close), so a test needs one connection per request.
+
+The client prints machine-readable lines — `STATUS ...`, one `VOTE ...` per
+record then `VOTES <n>`, or `CHECKPOINT size=.. fp64=.. outcome=..` — and
+`ERROR <detail>` on any failure. A server that refuses a request closes without
+writing anything, which the client reports as `ERROR closed`: that is the whole
+error protocol in both implementations.
+
+Engine state the handlers would read under `m_lock` is derived from the
+directory instead: the newest `<decree>.codex` is `m_checkpointedDecree`, and
+each log's decree index is rebuilt by re-running `rsl_storage::ScanLog` (itself
+the verbatim `ReadNextMessage` recovery loop) over the file, which is what
+`LogFile::AddMessage` builds at startup anyway. `SendFile` keeps the original's
+snapshot semantics exactly: the file size is taken once, when the file is
+opened, so appends made mid-response are never sent.
+
+One deliberate deviation, commented at the site: the C++ `CopyCheckpoint`
+re-marshals the incoming header with a raised `m_maxBallot` before writing it.
+That is engine state rather than protocol, and it would make a copy differ from
+its source, so this oracle copies verbatim — as the Rust client does by default,
+with the rewrite available explicitly.
 
 `FPRINT empty` is `a795d0f29b4dcdf8` — equal to the polynomial, the documented
 fingerprint of the empty string, a quick correctness check for the Rabin-64

@@ -14,6 +14,11 @@
 //! file naming, enumeration and `defunct.txt` ([`dir`]); and the log/checkpoint
 //! retention rule ([`gc`]).
 //!
+//! Phase 4c adds the read side the learn port serves from: [`log::LogSet`], a
+//! snapshot of every log in a data directory, and the [`log::FileSpan`]s a
+//! `FetchVotes` response is made of. The snapshot semantics are the interesting
+//! part — see that type's docs.
+//!
 //! Phase 3d makes it *provably* durable. Every write goes through the
 //! [`durability`] policy, which spells out on Linux what the C++ gets implicitly
 //! from `FILE_FLAG_WRITE_THROUGH` and `MOVEFILE_WRITE_THROUGH`: `fdatasync` per

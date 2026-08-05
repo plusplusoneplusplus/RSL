@@ -488,6 +488,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "proptest",
+ "rsl-storage",
  "rsl-wire",
  "tokio",
 ]

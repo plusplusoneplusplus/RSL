@@ -30,6 +30,9 @@ add_executable(golden-gen
     # Verbatim extract of PacketHdr/Packet + the NetCxn receive decision table
     # and Message::ReadFromSocket, plus the live TCP peer (Phase 4a):
     ${CMAKE_CURRENT_SOURCE_DIR}/src/packet_min.cpp
+    # Port of the learn-port server/client paths -- SendFile, the three fetch
+    # handlers and the ReadNextMessage / CopyCheckpoint client loops (Phase 4c):
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/learn_min.cpp
     # The generator driver:
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
 )

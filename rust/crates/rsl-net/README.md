@@ -1,7 +1,8 @@
 # rsl-net
 
-The RSL network layer in pure Rust: the **framing** (Phase 4a) and the
-**transport** built on it (Phase 4b).
+The RSL network layer in pure Rust: the **framing** (Phase 4a), the **transport**
+built on it (Phase 4b), and the **learn port** a lagging replica catches up
+through (Phase 4c).
 
 - **`framing`** — a byte-exact port of the 20-byte NetPacket header that wraps
   every replica-to-replica message, and of the learn-port framing used by the
@@ -15,9 +16,16 @@ The RSL network layer in pure Rust: the **framing** (Phase 4a) and the
   suspend/resume, same connection identity — proven by a deterministic contract
   matrix and by talking to the C++ peer over real TCP.
 
+- **`learnport`** — the state-transfer protocols: `StatusQuery`, `FetchVotes`
+  and `FetchCheckpoint`, server and client. This is where the network layer
+  meets the disk, so it is the one part of the crate that depends on
+  [`rsl-storage`](../rsl-storage). Proven against the extracted C++
+  (`golden-gen --learn-server` / `--learn-client`) in **both** directions.
+
 Zero `unsafe` (`unsafe_code = "forbid"`). The framing kernel's only dependency
 is [`rsl-wire`](../rsl-wire); `default-features = false` drops tokio and leaves
-just the bytes.
+just the bytes, and `--no-default-features --features svc` keeps the transport
+without pulling in the storage crate.
 
 ## Layout
 
@@ -27,6 +35,8 @@ just the bytes.
 | `framing::learn` | `Message::ReadFromSocket` — the 6-byte version+length prefix that is the message's own header |
 | `limits` | the `maxMessageSize` cap and alert threshold (`ConfigParam::Init`, `rslconfig.cpp:118`) |
 | `svc` | `NetPacketSvc` / `NetCxn`: connection lifecycle, send queue, timeouts, statuses, callbacks |
+| `learnport::server` | `FetchServerLoop` / `HandleFetchRequest` and the three handlers, plus `SendFile` |
+| `learnport::client` | `SendStatusRequestMessage`, `LearnVotes` (+ `ReadNextMessage`), `CopyCheckpoint` |
 
 ## Framing
 
@@ -121,9 +131,109 @@ completes, so the stream stays framed.
 production, `tokio::io::duplex` in the contract tests, and rustls in Phase 4d —
 the same seam the C++ uses to swap `NetCxn` for `NetSslCxn`.
 
+## The learn port
+
+A replica that has fallen behind catches up over a second TCP port — its
+`rslLearnPort`, `rslPort + 1` by default. Three protocols share it, and all
+three are one-shot: connect, write one request, read until the peer closes.
+
+```rust
+let client = LearnClient::new();                       // 5 s timeouts, as in C++
+let who = Requester::new(ProtocolVersion::V6, my_member_id, configuration);
+
+// 1. What does that replica have?
+let status = client.query_status(peer, &who.status_query()).await?;
+
+// 2. Catch up on decrees, record by record.
+let mut votes = client.fetch_votes(peer, &who.fetch_votes(from_decree, ballot)).await?;
+while let Some(msg) = votes.next().await? { apply(msg); }
+
+// 3. Or, if we are too far behind, take its checkpoint whole.
+let fetched = client.fetch_checkpoint(
+    peer,
+    &who.fetch_checkpoint(status.checkpointed_decree),
+    status.checkpoint_size,      // learnt out of band — there is no length on the wire
+    &data_dir,
+).await?;                        // verified and durably renamed, or nothing at all
+```
+
+Serving is a `LearnServer` over a `LearnSource`; `DirSource` is the
+directory-backed one, taking engine state (the status response and
+`m_checkpointedDecree`) from a `StatusProvider` that Phase 5 will implement.
+
+### Failure is silence
+
+There is no error message on this wire, in either direction. A decree the server
+does not have, a checkpoint decree that is not *its* checkpointed decree, a
+primary that is relinquishing — every one of them closes the connection with
+nothing written, and the client is expected to try another replica. So:
+
+- The server never writes a diagnostic. `LearnSource` returning `None` **is** the
+  refusal.
+- The client turns a short or empty stream into `TransferError::Closed` /
+  `Truncated`. Nothing else can be inferred.
+
+The `FetchCheckpoint` client therefore has to be told the size in advance, from
+a prior `StatusResponse::checkpoint_size`. That is why the parameter exists.
+
+### Snapshot-at-open
+
+`FetchVotes` streams a live log directory while the engine may be appending to
+it. Both implementations serve a **snapshot**: the C++ takes the file size once,
+in `APSEQREAD::DoInit` (`apdiskio.cpp:146`), and computes `length = FileSize() -
+offset` from it (`legislator.cpp:4515`) — it never re-reads the size, so appends
+made mid-response are not sent. `rsl_storage::log::LogSet` does the same, fixing
+each file's readable length when the set is opened, and `DirSource` re-opens the
+set per request.
+
+The one difference: the C++ snapshots the raw file size, this snapshots the end
+of the last *valid* record. They differ only for a file ending in a torn or
+zeroed tail, which the C++ would stream to the peer as garbage for the peer to
+reject; here the transfer simply ends on a record boundary. (`tests/learnport.rs`
+executes the snapshot property; the C++ side is a code reading — `APSEQREAD` is
+Windows-only and cannot be executed on Linux, so the golden-gen `SendFile` port
+reproduces the same open-time `fstat` and the interop tests run against that.)
+
+### Timeouts, and the stall budget
+
+Every socket operation carries `LearnConfig::recv_timeout` / `send_timeout`
+(5 s each, from `RSLConfig`'s `m_receiveTimeoutSec`/`m_sendTimeoutSec`,
+`rsl.cpp:1365`). There is deliberately **no overall deadline** for a transfer: a
+slow but alive peer streaming a multi-gigabyte checkpoint is legal, and only
+prolonged silence is a failure.
+
+That is an inherited weakness, not a design: a peer that dribbles one byte every
+four seconds holds a transfer open forever. It is documented rather than
+silently "fixed", because changing it would make this port abandon transfers the
+original completes. A deployment that wants a hard bound should wrap the call in
+its own timeout.
+
+The practical figure is therefore a flat **5 s of silence, at any point** — not a
+size-dependent budget. The benchmarks below say what a transfer costs when bytes
+*are* moving, which is what decides whether a given size can finish on a link
+that keeps stalling.
+
+### Deliberate divergences
+
+- **A checkpoint that fails verification is an error, not a crash.** The C++
+  `LogAssert(false)`s — "terminating the process to prevent codex corruption"
+  (`legislator.cpp:5573`). Here the temp file is deleted and
+  `TransferError::Checkpoint` returned, so the caller can try another replica.
+  Nothing corrupt is published either way.
+- **The copied header is not re-marshaled by default.** The C++ always parses
+  the incoming header, raises its `m_maxBallot` and writes the re-marshaled form
+  (`legislator.cpp:5535`). `fetch_checkpoint` copies bytes verbatim, which keeps
+  a fetched file bit-identical to its source (and makes the interop assertion
+  possible); `fetch_checkpoint_with(.., Some(ballot))` is the C++ behaviour.
+- **Exactly `expected_size` bytes are read.** The C++ loop can overshoot by up
+  to one buffer if the peer sends more than it announced, and writes the excess
+  to the file. Here the extra bytes are simply not read.
+- **A task per connection** instead of a thread per request
+  (`legislator.cpp:5325`). Invisible on the wire.
+
 ## Correctness
 
-`cargo test` runs nine harnesses. Framing (Phase 4a):
+`cargo test` runs twelve harnesses. Framing (Phase 4a):
 
 1. **`packet_corpus`** — the 30 `PACKET` vectors in
    `tools/golden-gen/corpus/phase1-golden.txt`. Each is a byte stream the *real
@@ -162,6 +272,33 @@ Transport (Phase 4b):
    24-packet exchange across four sizes, the peer dying mid-packet (a
    disconnect, not a framing error, and no half packet surfaced), and a frame
    the peer will happily send but this service is configured to refuse.
+
+Learn port (Phase 4c):
+
+10. **`learnport`** — the Rust server serving real `rsl-storage` files to the
+    Rust client: every protocol, the snapshot property (records appended
+    mid-response are not sent, the next request does see them), every silent
+    refusal, and the torn-stream matrix — a response cut inside a record header
+    and inside a record body, a bad record checksum ending the stream rather
+    than resynchronizing, an all-zero page treated as corruption (`restore` is
+    false here, unlike recovery), a server killed mid-checkpoint leaving no temp
+    file, and the receive timeout firing on a silent peer.
+11. **`learnport_interop`** — both directions against executed C++.
+    `golden-gen --learn-server` serves a generated data directory and the Rust
+    client's results are compared against reading those files directly through
+    `rsl-storage`; `golden-gen --learn-client` runs the extracted
+    `ReadNextMessage` and checkpoint-copy loops against the Rust server and its
+    printed records are compared the same way. Includes the silent-close cases
+    on both sides, and a Rust server killed mid-stream where the C++ client's
+    behaviour is *recorded from the run* (it reports an incomplete checkpoint
+    and deletes its partial file).
+12. **`learnport_proptest`** — `fetch_votes` over generated multi-file log sets,
+    requesting every decree in turn and checking the response against the files;
+    the boundary set spelled out (offset in the first, middle and last file, a
+    decree exactly at a file boundary, an empty trailing log, a re-voted decree
+    where the index points at the *later* record); and `fetch_checkpoint` across
+    page and checksum-block boundaries, plus streaming chunk sizes from 512 B to
+    twice the file size.
 
 ### Deliberate divergences
 
@@ -239,6 +376,27 @@ directions:
 | `svc/round_trip` | 10 MiB | ~36.7 ms (544 MiB/s) | ~47.8 ms (419 MiB/s) |
 | `svc/throughput` | 100 KiB × 160 | ~29.9 ms (1.04 GiB/s) | ~57.6 ms (552 MiB/s) |
 | `svc/throughput` | 10 MiB × 1 | ~30.9 ms (648 MiB/s) | ~47.0 ms (425 MiB/s) |
+
+Learn port — full transfers over loopback TCP, server and client in-process.
+`fetch_checkpoint` includes verification (the whole file is re-read and
+re-checksummed) and the durable rename, because a real fetch pays for both:
+
+| Benchmark | Size | Time | Throughput |
+| --- | --- | --- | --- |
+| `fetch_votes` | 4096 votes, no requests (2 MiB) | ~12.2 ms | ~164 MiB/s |
+| `fetch_votes` | 2048 votes × 700 B (2 MiB) | ~13.5 ms | ~148 MiB/s |
+| `fetch_votes` | 256 votes × 64 KiB (16 MiB) | ~64.4 ms | ~250 MiB/s |
+| `fetch_checkpoint` | 1 MiB state | ~22.8 ms | ~44 MiB/s |
+| `fetch_checkpoint` | 8 MiB state | ~68.7 ms | ~116 MiB/s |
+| `fetch_checkpoint` | 32 MiB state | ~380 ms | ~84 MiB/s |
+
+Against the 5-second inactivity window, none of these is close: a 32 MiB
+checkpoint moves in under half a second, so the window is spent entirely on
+*silence*, never on work in progress. Small-record vote streams are the slower
+case per byte — a 512-byte page read, a header parse and a Rabin-64 per record —
+so a catch-up over many small decrees is bounded by record count, not bytes. The
+checkpoint numbers include an `fsync` and a directory `fsync` per transfer,
+which is why the 1 MiB case looks slow per byte and why the variance is wide.
 
 Round-trip latency at 1 KiB is loopback and scheduling, not framing — the frame
 itself costs well under a microsecond. The C++ peer is slower because it is a

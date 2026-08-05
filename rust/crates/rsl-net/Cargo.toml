@@ -9,12 +9,15 @@ repository.workspace = true
 [features]
 # The framing kernel is runtime-free by construction. `svc` adds the tokio
 # transport (Phase 4b) on top; turn it off with `default-features = false` to
-# depend on the bytes alone.
-default = ["svc"]
+# depend on the bytes alone. `learnport` (Phase 4c) additionally pulls in
+# `rsl-storage`, because state transfer *is* file transfer.
+default = ["svc", "learnport"]
 svc = ["dep:tokio"]
+learnport = ["svc", "dep:rsl-storage", "tokio/fs"]
 
 [dependencies]
 rsl-wire = { path = "../rsl-wire" }
+rsl-storage = { path = "../rsl-storage", optional = true }
 tokio = { version = "1", optional = true, features = [
     "rt",
     "net",
@@ -35,6 +38,10 @@ harness = false
 
 [[bench]]
 name = "transport"
+harness = false
+
+[[bench]]
+name = "learnport"
 harness = false
 
 [lints.rust]

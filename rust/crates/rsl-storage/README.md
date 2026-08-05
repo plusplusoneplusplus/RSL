@@ -20,7 +20,7 @@ log/checkpoint retention rule (`CleanupLogsAndCheckpoint`).
 | Module | Ports |
 | --- | --- |
 | `checkpoint` | `CheckpointHeader` (`legislator.cpp:820-1030`), `CheckpointWriter`/`CheckpointReader` (`rsl.cpp:161-620`), the commit sequence in `Legislator::SaveCheckpoint` |
-| `log` | `LogFile` (`legislator.cpp:495-780`), the `ReadNextMessage` recovery loop (`legislator.cpp:3851`) and the `RestoreState` scan that drives it (`:5993`) |
+| `log` | `LogFile` (`legislator.cpp:495-780`), the `ReadNextMessage` recovery loop (`legislator.cpp:3851`) and the `RestoreState` scan that drives it (`:5993`); `LogSet` is the whole-directory read side `HandleFetchVotesMsg` serves from (`:3633`) |
 | `dir` | file naming (`legislator.cpp:516`/`:1082`), `GetFileNumbers` (`:5766`), `Read`/`UpdateDefunctFile` (`:7198`/`:7330`) |
 | `gc` | `CleanupLogsAndCheckpoint` (`legislator.cpp:5675`) |
 | `durability` | the open/write/sync/rename seam every write goes through — `APSEQWRITE` + `MOVEFILE_WRITE_THROUGH` spelled out for Linux |
@@ -74,6 +74,22 @@ Recovery ends one of three ways, matching the C++ decision for decision:
 | `accept` | every record valid, consumed exactly to EOF |
 | `stop-at-offset` | valid records then a tolerated tail — a zero region, a torn last record, or a trailing checksum mismatch over zeros — which is discarded and overwritten |
 | `reject` | hard corruption; the C++ replica refuses to start |
+
+### Reading a live directory
+
+`LogSet::open` scans every `<decree>.log` at once and hands back the decree
+index for each, so a caller can ask "which spans of which files answer
+`FetchVotes(decree)`?" (`LogSet::votes_from`). This is what the learn port in
+[`rsl-net`](../rsl-net) serves from, and it is deliberately a **snapshot**: each
+file's readable length is fixed when the set is opened and never re-read, so a
+response cannot chase records appended while it is being sent.
+
+That is what the C++ does too, by accident of its I/O layer: `SendFile` opens
+the file with `APSEQREAD::DoInit`, which captures `GetFileSize` once
+(`apdiskio.cpp:146`), and computes `length = FileSize() - offset` from that one
+value (`legislator.cpp:4515`). The only difference is *what* is snapshotted —
+the raw file size there, the end of the last valid record here — which matters
+solely for a file ending in a torn or zeroed tail.
 
 ## Durability
 

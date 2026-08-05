@@ -20,6 +20,13 @@
 //! scheduler — and `default-features = false` drops tokio entirely for a
 //! consumer that wants nothing but the bytes.
 //!
+//! ## The learn port
+//!
+//! [`learnport`] (feature `learnport`, on by default) is the state-transfer
+//! side: the `StatusQuery` / `FetchVotes` / `FetchCheckpoint` server and client
+//! a lagging replica catches up with. It is the one part of this crate that
+//! touches the disk, so it pulls in `rsl-storage`.
+//!
 //! ## The transport
 //!
 //! [`svc`] (feature `svc`, on by default) is `PacketSvc`: the tokio port of
@@ -52,6 +59,8 @@
 pub mod framing;
 pub mod limits;
 
+#[cfg(feature = "learnport")]
+pub mod learnport;
 #[cfg(feature = "svc")]
 pub mod svc;
 
@@ -62,3 +71,6 @@ pub use limits::{ConfigError, Limits};
 
 #[cfg(feature = "svc")]
 pub use svc::{ConnectState, Packet, PacketHandler, PacketSvc, SvcConfig, TxRxStatus};
+
+#[cfg(feature = "learnport")]
+pub use learnport::{LearnClient, LearnConfig, LearnServer, Requester, TransferError};
