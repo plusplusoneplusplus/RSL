@@ -6,15 +6,35 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The framing kernel is runtime-free by construction. `svc` adds the tokio
+# transport (Phase 4b) on top; turn it off with `default-features = false` to
+# depend on the bytes alone.
+default = ["svc"]
+svc = ["dep:tokio"]
+
 [dependencies]
 rsl-wire = { path = "../rsl-wire" }
+tokio = { version = "1", optional = true, features = [
+    "rt",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
 
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", default-features = false }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [[bench]]
 name = "framing"
+harness = false
+
+[[bench]]
+name = "transport"
 harness = false
 
 [lints.rust]

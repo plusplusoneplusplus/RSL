@@ -148,6 +148,9 @@ LearnResult ReadMessage(const char* data, size_t len, UInt32 maxMessageSize, Mes
 //   fetch-stub -- learn-port framing: read one Message with the real
 //                 ReadFromSocket decision table and reply with a marshaled
 //                 StatusResponse echoing the request's decree/ballot.
+//   truncate   -- NetPacket framing: echo the first packet, then answer the
+//                 second with half a frame and close. A peer dying mid-packet
+//                 (Phase 4b).
 int RunPeer(int port, const char* mode);
 
 } // namespace rsl_packet

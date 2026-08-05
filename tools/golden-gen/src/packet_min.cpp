@@ -403,6 +403,43 @@ bool ServePackets(int fd, std::vector<char>* buf, bool echo, int* packetCount)
     return true;
 }
 
+// NetPacket framing: echo the first packet, then answer the second with only
+// half a frame and close. This is a peer that dies mid-packet -- the receiver
+// must treat it as a disconnect, not as a framing error, and must not surface
+// the half packet.
+void ServeTruncate(int fd)
+{
+    std::vector<char> buf;
+    int count = 0;
+    for (;;)
+    {
+        ScanResult r = ScanPackets(buf.data(), buf.size(), 0, 0);
+        for (size_t i = 0; i < r.payloads.size(); ++i)
+        {
+            std::vector<char> frame =
+                SerializePacket(r.payloads[i].data(), r.payloads[i].size());
+            if (++count == 1)
+            {
+                if (!WriteAll(fd, frame.data(), frame.size())) { return; }
+                continue;
+            }
+            size_t half = frame.size() / 2;
+            fprintf(stderr, "peer: writing %zu of %zu bytes then closing\n",
+                    half, frame.size());
+            WriteAll(fd, frame.data(), half);
+            return;
+        }
+        buf.erase(buf.begin(), buf.begin() + r.consumed);
+        if (r.outcome == RejectHeader || r.outcome == RejectChecksum)
+        {
+            fprintf(stderr, "peer: %s (%s) -- closing connection\n",
+                    OutcomeName(r.outcome), r.detail.c_str());
+            return;
+        }
+        if (!ReadSome(fd, &buf, 64 * 1024)) { return; }
+    }
+}
+
 // Learn-port framing: read one Message and answer with a StatusResponse.
 void ServeFetchStub(int fd)
 {
@@ -472,9 +509,11 @@ int RunPeer(int port, const char* mode)
     bool echo = strcmp(mode, "echo") == 0;
     bool log = strcmp(mode, "log") == 0;
     bool fetch = strcmp(mode, "fetch-stub") == 0;
-    if (!echo && !log && !fetch)
+    bool truncate = strcmp(mode, "truncate") == 0;
+    if (!echo && !log && !fetch && !truncate)
     {
-        fprintf(stderr, "unknown --packet-peer mode '%s' (echo|log|fetch-stub)\n", mode);
+        fprintf(stderr,
+                "unknown --packet-peer mode '%s' (echo|log|fetch-stub|truncate)\n", mode);
         return 2;
     }
 
@@ -522,6 +561,10 @@ int RunPeer(int port, const char* mode)
     if (fetch)
     {
         ServeFetchStub(fd);
+    }
+    else if (truncate)
+    {
+        ServeTruncate(fd);
     }
     else
     {

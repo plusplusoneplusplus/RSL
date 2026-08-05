@@ -1,5 +1,5 @@
-//! `rsl-net` — the RSL network framing layer, ported byte-exactly from the
-//! original C++ and kept free of any async runtime.
+//! `rsl-net` — the RSL network layer: the framing, ported byte-exactly from the
+//! original C++, and the packet transport built on it.
 //!
 //! Two framings exist in RSL and both live in [`framing`]:
 //!
@@ -13,11 +13,20 @@
 //! The [`Limits`] type carries the `maxMessageSize` cap (the Phase-2
 //! carry-forward) shared by both.
 //!
-//! ## No runtime, no I/O model
+//! ## The framing has no runtime
 //!
-//! Everything here works on byte slices; the only I/O adapters take a
-//! [`std::io::Read`]. Phase 4b/4c pick their own I/O model (tokio) on top, and
-//! the tests stay deterministic.
+//! Everything in [`framing`] works on byte slices; its only I/O adapters take a
+//! [`std::io::Read`]. That keeps the byte-exact kernel testable without a
+//! scheduler — and `default-features = false` drops tokio entirely for a
+//! consumer that wants nothing but the bytes.
+//!
+//! ## The transport
+//!
+//! [`svc`] (feature `svc`, on by default) is `PacketSvc`: the tokio port of
+//! `NetPacketSvc`/`NetCxn`/`NetProcessor`. Same four send statuses, same
+//! send-queue-survives-a-disconnect rule, same suspend/resume, same connection
+//! identity — see that module's docs for the contract and for the five
+//! documented divergences.
 //!
 //! ## Deliberate divergences from the C++
 //!
@@ -43,7 +52,13 @@
 pub mod framing;
 pub mod limits;
 
+#[cfg(feature = "svc")]
+pub mod svc;
+
 pub use framing::learn::{self, LearnError};
 pub use framing::packet::{self, FrameError, PacketHdr};
 pub use framing::ReadError;
 pub use limits::{ConfigError, Limits};
+
+#[cfg(feature = "svc")]
+pub use svc::{ConnectState, Packet, PacketHandler, PacketSvc, SvcConfig, TxRxStatus};
