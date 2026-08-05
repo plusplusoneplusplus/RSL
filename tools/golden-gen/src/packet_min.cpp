@@ -21,22 +21,24 @@
 #include "marshal.h"
 #include "utils.h"
 
-namespace rsl_packet
-{
-
 // ---------------------------------------------------------------------------
 // PacketHdr -- NetPacket.cpp:19-118, verbatim (LogAssert calls dropped: the
 // callers below always pass a >= SerialLen buffer, and this tool must report
 // rather than abort).
+//
+// The golden-gen binary does not link NetPacket.cpp, so we provide the
+// PacketHdr method bodies here.  The class itself now lives in PacketHdr.h
+// (RSLibImpl namespace); the `using` in packet_min.h brings it into
+// rsl_packet.
 // ---------------------------------------------------------------------------
+namespace RSLibImpl
+{
+
 PacketHdr::PacketHdr()
 {
     m_Size = 0;
     m_ProtoVersion = 0;
     m_Xid = 0;
-    // NOTE: NetPacket.cpp:19-24 leaves m_Checksum uninitialized here. Packet
-    // ::Serialize always assigns it before serializing, so the wire is
-    // unaffected; zeroing it just keeps this tool deterministic.
     m_Checksum = 0;
 }
 
@@ -60,6 +62,13 @@ bool PacketHdr::Serialize(void* buffer, UInt32 bufferLength)
     return true;
 }
 
+bool PacketHdr::Serialize(NetBuffer*)
+{
+    // Unused in the golden-gen slice; the full implementation lives in
+    // NetPacket.cpp and depends on NetBuffer.
+    return false;
+}
+
 void PacketHdr::SetChecksum(UInt64 checksum, void* hdrBuffer, UInt32 bufferLength)
 {
     UInt32 offset = sizeof(UInt32) * 3;
@@ -74,8 +83,6 @@ bool PacketHdr::DeSerialize(void* buffer, UInt32 bufferLength)
     MarshalData marshalData(buffer, bufferLength, false);
     marshalData.SetMarshaledLength(bufferLength);
 
-    // The original LogAsserts on each read failing; with bufferLength >=
-    // SerialLen (guaranteed by every caller, here and in NetCxn) none can fail.
     if (!marshalData.ReadUInt32(&m_Size) ||
         !marshalData.ReadUInt32(&m_ProtoVersion) ||
         !marshalData.ReadUInt32(&m_Xid) ||
@@ -85,6 +92,11 @@ bool PacketHdr::DeSerialize(void* buffer, UInt32 bufferLength)
     }
     return true;
 }
+
+} // namespace RSLibImpl
+
+namespace rsl_packet
+{
 
 const char* OutcomeName(Outcome o)
 {

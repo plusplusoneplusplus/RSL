@@ -18,7 +18,7 @@
 //                  to store both the header and the data
 //
 
-#include "basic_types.h"
+#include "PacketHdr.h"
 #include "logging.h"
 #include "NetBuffer.h"
 #include "PacketUtil.h"
@@ -29,47 +29,6 @@ namespace RSLibImpl
 
 class NetPacketCtx;
 class NetPacketSvc;
-
-const UInt32 MaxNetPacketSize = 100 * 1024 * 1024;       // 100MB - max packet size
-
-const UInt32 MaxNetPacketAlertSize = 0;                  // set default size to 0 means no alert                
-
-class PacketHdr
-{
-public:
-
-    // Public member variables. 
-    // IMPORTANT: Update the SerialLen and SetChecksum method below if you 
-    // add or remove fields in the header
-    UInt32  m_Size;
-    UInt32  m_ProtoVersion;
-    UInt32  m_Xid;
-    UInt64  m_Checksum;
-
-    static const UInt32 SerialLen = sizeof(UInt32) * 3 + sizeof(UInt64);
-
-    PacketHdr();
-    PacketHdr(UInt32 size, UInt32 protoVersion, UInt32 xid);
-
-    // Serialize()
-    // The following two methods dump the contents of the packet header
-    // into the given buffer. The methods return true if the packet
-    // was successfully serialized into the buffer, false otherwise.
-    bool Serialize(void *buffer, UInt32 bufferLength);
-    bool Serialize(NetBuffer *netBuf);
-
-    // SetChecksum
-    // The following method writes the given checksum values into
-    // its correct position in the serialized header
-    static void SetChecksum(UInt64 checksum, void *hdrBuffer, 
-                    UInt32 bufferLength);
-
-    // DeSerialize()
-    // The following two methods initialize the packet header from the
-    // given buffer. The methods return true if the packet
-    // was successfully de-serialized from the buffer, false otherwise.
-    bool DeSerialize(void *buffer, UInt32 bufferLength);
-};
 
 class IMarshalMemoryManager
 {

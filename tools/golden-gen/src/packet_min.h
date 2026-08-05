@@ -24,24 +24,21 @@
 #include <string>
 #include <vector>
 
-#include "basic_types.h"
+#include "PacketHdr.h"
 #include "message.h"
 
 namespace rsl_packet
 {
 
+// PacketHdr, MaxNetPacketSize, MaxNetPacketAlertSize are defined in
+// PacketHdr.h (RSLibImpl namespace) and pulled in by the using-directive below.
 using namespace RSLibImpl;
 
-// PacketHdr::SerialLen -- NetPacket.h:52. sizeof(UInt32)*3 + sizeof(UInt64).
-const UInt32 SerialLen = 20;
+const UInt32 SerialLen = PacketHdr::SerialLen;
 
 // The checksum field's offset inside the serialized header (PacketHdr::SetChecksum,
 // NetPacket.cpp:79: `UInt32 offset = sizeof(UInt32) * 3;`).
 const UInt32 ChecksumOffset = 12;
-
-// NetPacket.h:33-36.
-const UInt32 MaxNetPacketSize = 100 * 1024 * 1024;
-const UInt32 MaxNetPacketAlertSize = 0;
 
 // RSLConfig::s_MaxMessageLen (rslconfig.h:62) fed through ConfigParam::Init
 // (rslconfig.cpp:118-119): MB * 1024 * 1024 + 1024.
@@ -49,25 +46,6 @@ const UInt32 DefaultMaxMessageSize = 100u * 1024 * 1024 + 1024;
 
 // Message::ReadFromSocket's `const int HeaderSize = 6;` (message.cpp:641).
 const UInt32 LearnHeaderSize = 6;
-
-// ---------------------------------------------------------------------------
-// PacketHdr -- verbatim (NetPacket.h:38-72, NetPacket.cpp:19-118)
-// ---------------------------------------------------------------------------
-class PacketHdr
-{
-public:
-    UInt32 m_Size;
-    UInt32 m_ProtoVersion;
-    UInt32 m_Xid;
-    UInt64 m_Checksum;
-
-    PacketHdr();
-    PacketHdr(UInt32 size, UInt32 protoVersion, UInt32 xid);
-
-    bool Serialize(void* buffer, UInt32 bufferLength);
-    static void SetChecksum(UInt64 checksum, void* hdrBuffer, UInt32 bufferLength);
-    bool DeSerialize(void* buffer, UInt32 bufferLength);
-};
 
 // Packet::Serialize (NetPacket.cpp:389) over a plain payload buffer: builds the
 // full frame (header + payload) with m_Size and the Rabin-64 checksum filled in.

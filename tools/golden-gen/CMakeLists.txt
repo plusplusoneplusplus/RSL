@@ -38,6 +38,7 @@ target_include_directories(golden-gen PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/compat   # windows.h / strsafe.h / pal_logging.h / msg_engine_compat.h
     ${RSL_SRC}/inc                       # rsl.h
     ${RSL_SRC}/common/src                # basic_types.h, marshal.h, fingerprint.h, ...
+    ${RSL_SRC}/NetworkLib/inc            # PacketHdr.h (shared packet-header types)
     ${RSL_SRC}/RSL/src                   # message.h
 )
 
