@@ -45,3 +45,16 @@ native project with MSBuild:
     msbuild .\src\RSL\src\dll\RSL.vcxproj /m /p:Configuration=Debug /p:Platform=x64
 
 The native projects use the default C++ platform toolset and Windows SDK installed by Visual Studio.
+
+## Build the Rust workspace
+
+Install Rust once:
+
+    winget install Rustlang.Rustup
+
+Then run:
+
+    .\build-rust.ps1
+
+Use `.\build-rust.ps1 -Release` for an optimized build. The script builds the entire workspace with all targets and
+features.

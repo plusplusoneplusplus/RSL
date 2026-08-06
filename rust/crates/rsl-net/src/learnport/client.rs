@@ -457,7 +457,11 @@ fn publish(temp: &Path, dest: &Path) -> Result<PathBuf, TransferError> {
     }
 
     let durability = SyncAll;
-    let file = std::fs::File::open(temp)?;
+    // Windows requires write access for FlushFileBuffers, which backs sync_all.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp)?;
     durability.rename_durable(&file, temp, dest)?;
     Ok(dest.to_path_buf())
 }
