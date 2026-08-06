@@ -48,18 +48,17 @@
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"
           Condition="'$(MSBuildProjectExtension)' != '.vcxproj' and '$(MSBuildProjectExtension)' != '.nuproj'" />
 
-  <!-- Need to get all PkgXXX figured out -->
-  <Import Project="$(REPOROOT)\ossbuild\packageList.props" />
+  <Import Project="$(REPOROOT)\ossbuild\packageList.props"
+          Condition="Exists('$(REPOROOT)\ossbuild\packageList.props')" />
   <Import Project="$(CONFROOT)\build.props" />
 
   <!-- Redirect CoreXT nupkgs to standard locations -->
   <PropertyGroup>
     <PkgDotNetFxRefAssemblies_Corext>$(MSBuildProgramFiles32)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.5.2</PkgDotNetFxRefAssemblies_Corext>
     <PkgMsTest_Corext>$(DevEnvDir)\PublicAssemblies</PkgMsTest_Corext>
-    <!-- Bug in NuProj -->
-    <NuGetToolPath>$(PkgNuproj)\tools</NuGetToolPath>
+    <NuGetToolPath Condition="'$(PkgNuproj)' != ''">$(PkgNuproj)\tools</NuGetToolPath>
   </PropertyGroup>
 
-  <!-- For projects depended by nuproj. CustomAfterMicrosoftCommonTargets? -->
-  <Import Project="$(PkgNuproj)\tools\Microsoft.Common.Nuproj.targets" />
+  <Import Project="$(PkgNuproj)\tools\Microsoft.Common.Nuproj.targets"
+          Condition="'$(PkgNuproj)' != '' and Exists('$(PkgNuproj)\tools\Microsoft.Common.Nuproj.targets')" />
 </Project>

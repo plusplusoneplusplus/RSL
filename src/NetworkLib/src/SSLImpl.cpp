@@ -451,7 +451,7 @@ namespace RSLibImpl
         {
             if (debugMsg != NULL)
             {
-                debugMsg->append(" not accepted as identity as whitelist is disabled ").append(HexToString(rgbSha1Hash)).c_str();
+                debugMsg->append(" not accepted as identity as whitelist is disabled ").append(HexToString(rgbSha1Hash));
             }
 
             return E_FAIL;
@@ -465,7 +465,7 @@ namespace RSLibImpl
                 {
                     if (debugMsg != NULL)
                     {
-                        debugMsg->append(" accepted ").append(HexToString(rgbSha1Hash)).c_str();
+                        debugMsg->append(" accepted ").append(HexToString(rgbSha1Hash));
                     }
                     return S_OK;
                 }
@@ -474,7 +474,7 @@ namespace RSLibImpl
 
         if (debugMsg != NULL)
         {
-            debugMsg->append(" not accepted ").append(HexToString(rgbSha1Hash)).c_str();
+            debugMsg->append(" not accepted ").append(HexToString(rgbSha1Hash));
         }
 
         return E_FAIL;
@@ -1251,5 +1251,4 @@ namespace RSLibImpl
         return hr;
     }
 }
-
 

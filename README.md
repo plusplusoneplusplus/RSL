@@ -14,37 +14,34 @@ contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additio
 
 # How to build
 
-## Prerequisite
+## Prerequisites
 
-Install the latest version of [Git for Windows](https://git-scm.com/download/win) for working with the repo.
+Install [Git for Windows](https://git-scm.com/download/win) and Visual Studio 2022 or newer. In the Visual Studio
+Installer, select **Desktop development with C++** and a Windows 10 or Windows 11 SDK.
 
-Install [Visual Studio 2017](https://www.visualstudio.com/downloads/) with Windows desktop C# and C++ support.
-Either Professional or Enterprise edition will work, Community edition is not tested.
+## Build the native library
 
-[NuGet](https://www.nuget.org/downloads) should be already installed with Visual Studio 2017. If you choose to install
-MSBuild / .NET SDK / Windows SDK, then install the command line version. NuGet is required to restore several packages
-before the build.
+Run the build from a PowerShell prompt at the repository root:
 
-## Bootstrap the development environment
+    .\build.ps1
 
-In Start Menu (or whatever equivalent), find "Visual Studio 2017", open "visual Studio Tools" folder, click "Developer
-Command Prompt for VS 2017". A command prompt will show up, where one may run MSBuild, C# and C++ compilers.
+The script locates Visual Studio, initializes its C++ build environment, and builds the 64-bit Debug native DLL and
+static libraries. Outputs are written under `out\debug-amd64`.
 
-Change to the `ossbuild` directory in the repo, start PowerShell, and run `ossbuild.ps1`. The script will restore all
-required packages, generate a file for package definitions, and set several environment variables.
+Choose a Release build or rebuild all native outputs with:
 
-## Build the source code
+    .\build.ps1 -Configuration Release
+    .\build.ps1 -Rebuild
 
-Go to any directory at root, `src`, or under `src`, run MSBuild like what you normally do. The binaries are saved at
-`out` directory under the repo root.
+## Use MSBuild directly
 
-The projects are designed to be built in parallel. If the number of processor is 8 (check the environment variable
-`NUMBER_OF_PROCESSOR`), the recommended command to build is:
+Initialize the repository and Visual Studio environment in the current PowerShell process:
 
-    msbuild /m:8 /v:m /fl
+    . .\ossbuild\ossbuild.ps1
 
-The second argument sets the verbosity to minimal.
+The leading dot and space keep the initialized environment in the current prompt. You can then build an individual
+native project with MSBuild:
 
-### Build in Visual Studio IDE
+    msbuild .\src\RSL\src\dll\RSL.vcxproj /m /p:Configuration=Debug /p:Platform=x64
 
-Once in the bootstrapped PowerShell window, one can open any project or `src\RSL.sln` in VS IDE.
+The native projects use the default C++ platform toolset and Windows SDK installed by Visual Studio.

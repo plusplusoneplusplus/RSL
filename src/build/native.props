@@ -43,6 +43,10 @@
     </Link>
   </ItemDefinitionGroup>
 
+  <PropertyGroup Label="Configuration">
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+  </PropertyGroup>
+
   <ItemDefinitionGroup Condition="'$(Platform)'=='arm64'">
     <ClCompile>
       <PreprocessorDefinitions>_M_ARM64;_ARM64_;_WIN64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -55,10 +59,6 @@
     </ClCompile>
   </ItemDefinitionGroup>
 
-  <PropertyGroup Label="Configuration">
-    <PlatformToolset>v140</PlatformToolset>
-  </PropertyGroup>
-  
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
@@ -71,19 +71,13 @@
         $(SRCROOT)\lf;
         $(SRCROOT)\RSL\src;
         $(SRCROOT)\common\src;
-        $(SRCROOT)\NetworkLib\inc; 
-        $(PkgWindowsSdk_Corext)\Include\$(WindowsTargetPlatformVersion)\um;
-        $(PkgWindowsSdk_Corext)\Include\$(WindowsTargetPlatformVersion)\shared;
-        $(PkgWindowsSdk_Corext)\Include\$(WindowsTargetPlatformVersion)\ucrt;
+        $(SRCROOT)\NetworkLib\inc;
       </AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>
         %(AdditionalLibraryDirectories);
-        $(PkgWindowsSdk_Corext)\lib\$(WindowsTargetPlatformVersion)\um\$(Platform);
-        $(PkgWindowsSdk_Corext)\lib\$(WindowsTargetPlatformVersion)\ucrt\$(Platform);
-        $(PkgVisualCpp_Corext)\lib\$(Platform)
       </AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
