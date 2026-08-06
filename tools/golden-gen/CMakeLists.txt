@@ -55,3 +55,22 @@ target_compile_options(golden-gen PRIVATE
     # force-include the MSVC builtin keyword spellings into every TU.
     -include ${CMAKE_CURRENT_SOURCE_DIR}/compat/msvc_builtins.h
 )
+
+# ---------------------------------------------------------------------------
+# Phase 4d: the TLS interop oracle.
+#
+# Optional on purpose. OpenSSL is a *proxy* for SChannel -- it proves the Rust
+# port interoperates with a TLS stack that is not rustls, which is the strongest
+# statement that can be made from Linux -- and a build without libssl-dev should
+# still produce every other golden vector. `--tls-peer` then reports what is
+# missing instead of not existing.
+find_package(OpenSSL)
+if(OpenSSL_FOUND)
+    target_sources(golden-gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/tls_peer.cpp)
+    target_compile_definitions(golden-gen PRIVATE RSL_GOLDEN_TLS)
+    target_link_libraries(golden-gen PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    message(STATUS "golden-gen: OpenSSL ${OPENSSL_VERSION} found -- --tls-peer enabled")
+else()
+    message(STATUS "golden-gen: OpenSSL not found -- --tls-peer disabled "
+                   "(install libssl-dev for the Phase-4d interop oracle)")
+endif()

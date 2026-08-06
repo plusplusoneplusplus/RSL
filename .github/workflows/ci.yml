@@ -28,7 +28,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake g++
+        # libssl-dev is optional for golden-gen (it enables the Phase-4d
+        # `--tls-peer` interop oracle) but the build should exercise it.
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev
 
       - name: Build every CMake tool under tools/
         run: |
@@ -155,7 +157,9 @@ jobs:
             echo "No golden-gen; storage interop tests will self-skip."
             exit 0
           fi
-          sudo apt-get update && sudo apt-get install -y cmake g++
+          # libssl-dev enables `--tls-peer`; without it the TLS interop tests
+          # skip themselves rather than fail.
+          sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev
           cmake -S tools/golden-gen -B tools/golden-gen/build
           cmake --build tools/golden-gen/build -j "$(nproc)"
           out=/tmp/storage-corpus-rust

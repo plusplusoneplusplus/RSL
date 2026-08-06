@@ -11,9 +11,21 @@ repository.workspace = true
 # transport (Phase 4b) on top; turn it off with `default-features = false` to
 # depend on the bytes alone. `learnport` (Phase 4c) additionally pulls in
 # `rsl-storage`, because state transfer *is* file transfer.
-default = ["svc", "learnport"]
+default = ["svc", "learnport", "tls"]
 svc = ["dep:tokio"]
 learnport = ["svc", "dep:rsl-storage", "tokio/fs"]
+# Phase 4d: mutual TLS on both ports, with the RSL trust model. Wraps the
+# streams `svc` and `learnport` are built on and touches neither.
+tls = [
+    "svc",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki",
+    "dep:rustls-pemfile",
+    "dep:rustls-pki-types",
+    "dep:sha1",
+    "dep:x509-parser",
+]
 
 [dependencies]
 rsl-wire = { path = "../rsl-wire" }
@@ -27,10 +39,49 @@ tokio = { version = "1", optional = true, features = [
     "macros",
 ] }
 
+# --- tls -------------------------------------------------------------------
+# `ring` rather than the default aws-lc-rs: it needs no cmake/nasm in the build
+# environment, and the suite list we pin (see `tls::suites`) is identical.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+# Used directly, not through rustls' own verifiers: we need chain building with
+# an explicit EKU and revocation policy but *without* server-name checking,
+# which is exactly `verify_for_usage` and nothing rustls exposes above it.
+webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false, features = [
+    "alloc",
+    "ring",
+] }
+rustls-pemfile = { version = "2", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+sha1 = { version = "0.10", optional = true }
+x509-parser = { version = "0.17", optional = true }
+
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", default-features = false }
 tokio = { version = "1", features = ["full", "test-util"] }
+# Test certificates are generated, never checked in: the fixture is the code in
+# `tests/certs/mod.rs`, so an expiry or a key size can be changed in one place.
+time = "0.3"
+# The rule-matrix tests drive one case (a client that presents no certificate)
+# that the crate's own API cannot express, so they reach for rustls directly.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = [
+    "crypto",
+    "ring",
+    "pem",
+    "x509-parser",
+] }
 
 [[bench]]
 name = "framing"
@@ -42,6 +93,10 @@ harness = false
 
 [[bench]]
 name = "learnport"
+harness = false
+
+[[bench]]
+name = "tls"
 harness = false
 
 [lints.rust]

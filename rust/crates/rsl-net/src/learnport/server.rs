@@ -19,12 +19,12 @@ use rsl_storage::log::{FileSpan, LogSet};
 use rsl_wire::messages::{
     Header, Msg, MsgKind, StatusResponse, MSG_FETCH_CHECKPOINT, MSG_FETCH_VOTES, MSG_STATUS_QUERY,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::{write_all, LearnConfig, TransferError, LISTEN_BACKLOG};
+use super::{write_all, Acceptor, LearnConfig, PlainAcceptor, TransferError, LISTEN_BACKLOG};
 
 // ---------------------------------------------------------------------------
 // What the server needs from the engine
@@ -150,6 +150,21 @@ impl LearnServer {
         source: Arc<dyn LearnSource>,
         config: LearnConfig,
     ) -> io::Result<LearnServer> {
+        LearnServer::bind_with(addr, Arc::new(PlainAcceptor), source, config).await
+    }
+
+    /// [`bind`](LearnServer::bind) with every accepted socket going through
+    /// `acceptor` first — `tls.connector()` for a TLS deployment.
+    ///
+    /// The handshake runs inside the per-connection task, so a peer that
+    /// connects and stalls costs a task and nothing else; the accept loop is
+    /// never blocked on it.
+    pub async fn bind_with(
+        addr: SocketAddr,
+        acceptor: Arc<dyn Acceptor>,
+        source: Arc<dyn LearnSource>,
+        config: LearnConfig,
+    ) -> io::Result<LearnServer> {
         let socket = match addr {
             SocketAddr::V4(_) => TcpSocket::new_v4()?,
             SocketAddr::V6(_) => TcpSocket::new_v6()?,
@@ -157,12 +172,24 @@ impl LearnServer {
         socket.set_reuseaddr(true)?;
         socket.bind(addr)?;
         let listener = socket.listen(LISTEN_BACKLOG)?;
-        Ok(LearnServer::from_listener(listener, source, config))
+        Ok(LearnServer::from_listener_with(
+            listener, acceptor, source, config,
+        ))
     }
 
     /// Serve on an already-bound listener.
     pub fn from_listener(
         listener: TcpListener,
+        source: Arc<dyn LearnSource>,
+        config: LearnConfig,
+    ) -> LearnServer {
+        LearnServer::from_listener_with(listener, Arc::new(PlainAcceptor), source, config)
+    }
+
+    /// [`from_listener`](LearnServer::from_listener) with an explicit acceptor.
+    pub fn from_listener_with(
+        listener: TcpListener,
+        stream_acceptor: Arc<dyn Acceptor>,
         source: Arc<dyn LearnSource>,
         config: LearnConfig,
     ) -> LearnServer {
@@ -172,6 +199,7 @@ impl LearnServer {
         let (shutdown, _) = watch::channel(false);
         let acceptor = tokio::spawn(accept_loop(
             listener,
+            stream_acceptor,
             source,
             config,
             shutdown.subscribe(),
@@ -210,6 +238,7 @@ impl Drop for LearnServer {
 
 async fn accept_loop(
     listener: TcpListener,
+    stream_acceptor: Arc<dyn Acceptor>,
     source: Arc<dyn LearnSource>,
     config: LearnConfig,
     mut stop: watch::Receiver<bool>,
@@ -230,8 +259,15 @@ async fn accept_loop(
         let source = source.clone();
         let config = config.clone();
         let stop = shutdown.subscribe();
+        let handshake = stream_acceptor.accept(stream);
         // A thread per request in the C++ (legislator.cpp:5325); a task here.
         tokio::spawn(async move {
+            // A failed handshake is a connection that closes without a byte of
+            // response — indistinguishable, to the peer, from every other
+            // refusal this port expresses (see the module docs).
+            let Ok(stream) = handshake.await else {
+                return;
+            };
             let _ = serve(stream, source, config, stop).await;
         });
     }
@@ -239,8 +275,8 @@ async fn accept_loop(
 
 /// `Legislator::HandleFetchRequest` (`legislator.cpp:5330`): read exactly one
 /// message, dispatch on its id, close.
-async fn serve(
-    mut stream: TcpStream,
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     source: Arc<dyn LearnSource>,
     config: LearnConfig,
     mut stop: watch::Receiver<bool>,
@@ -273,8 +309,8 @@ async fn serve(
     }
 }
 
-async fn serve_status(
-    stream: &mut TcpStream,
+async fn serve_status<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     source: &Arc<dyn LearnSource>,
     request: &Header,
     config: &LearnConfig,
@@ -288,8 +324,8 @@ async fn serve_status(
     write_all(stream, &bytes, config.send_timeout).await
 }
 
-async fn serve_votes(
-    stream: &mut TcpStream,
+async fn serve_votes<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     source: &Arc<dyn LearnSource>,
     request: &Header,
     config: &LearnConfig,
@@ -321,8 +357,8 @@ async fn serve_votes(
     Ok(())
 }
 
-async fn serve_checkpoint(
-    stream: &mut TcpStream,
+async fn serve_checkpoint<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     source: &Arc<dyn LearnSource>,
     request: &Header,
     config: &LearnConfig,
@@ -349,8 +385,8 @@ async fn serve_checkpoint(
 ///
 /// Bytes go out in [`LearnConfig::stream_chunk`] pieces and are never all
 /// resident: a 40 GB checkpoint costs one chunk of memory.
-async fn send_file(
-    stream: &mut TcpStream,
+async fn send_file<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     path: &Path,
     offset: u64,
     length: Option<u64>,

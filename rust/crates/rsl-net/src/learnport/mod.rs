@@ -61,16 +61,66 @@
 pub mod client;
 pub mod server;
 
+use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::time::Duration;
 
 use rsl_wire::{BallotNumber, Header, MemberId, MsgKind, ProtocolVersion};
+use tokio::net::TcpStream;
 
 use crate::framing::learn::{self, LearnError, HDR_LEN};
 use crate::limits::Limits;
+use crate::svc::Stream;
 
 pub use client::{FetchedCheckpoint, LearnClient, TransferError, VoteStream};
 pub use server::{DirSource, LearnServer, LearnSource, StatusProvider};
+
+// ---------------------------------------------------------------------------
+// The stream seam
+// ---------------------------------------------------------------------------
+
+/// What a [`Connector`] or [`Acceptor`] produces: a byte stream, once whatever
+/// it takes to get one — a connect, a handshake, or nothing at all — is done.
+pub type StreamFuture = Pin<Box<dyn Future<Output = io::Result<Box<dyn Stream>>> + Send + 'static>>;
+
+/// How the learn client opens a connection to a peer's learn port.
+///
+/// Plaintext is [`PlainConnector`]; [`crate::tls::TlsConnector`] adds the
+/// handshake. This is the *only* thing TLS changes about this module — the
+/// C++'s equivalent seam is `StreamSocket::CreateStreamSocket` returning either
+/// a `StreamSocket` or an `SslSocket` (`StreamIO.cpp:37`).
+pub trait Connector: Send + Sync + 'static {
+    fn connect(&self, addr: SocketAddr) -> StreamFuture;
+}
+
+/// How the learn server turns an accepted socket into a stream.
+pub trait Acceptor: Send + Sync + 'static {
+    fn accept(&self, stream: TcpStream) -> StreamFuture;
+}
+
+/// A plain TCP connect, with `TCP_NODELAY` set.
+pub struct PlainConnector;
+
+impl Connector for PlainConnector {
+    fn connect(&self, addr: SocketAddr) -> StreamFuture {
+        Box::pin(async move {
+            let stream = TcpStream::connect(addr).await?;
+            let _ = stream.set_nodelay(true);
+            Ok(Box::new(stream) as Box<dyn Stream>)
+        })
+    }
+}
+
+/// The accepted socket, as it is.
+pub struct PlainAcceptor;
+
+impl Acceptor for PlainAcceptor {
+    fn accept(&self, stream: TcpStream) -> StreamFuture {
+        Box::pin(async move { Ok(Box::new(stream) as Box<dyn Stream>) })
+    }
+}
 
 /// The learn port a replica listens on when its config leaves it unset:
 /// `m_node.m_rslLearnPort = m_node.m_rslPort + 1` (`message.cpp:36-41`).

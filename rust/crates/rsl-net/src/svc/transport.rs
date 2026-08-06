@@ -62,6 +62,35 @@ pub trait Dialer: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = io::Result<Link>> + Send + 'static>>;
 }
 
+/// How a server service turns an accepted socket into a [`Link`].
+///
+/// The plaintext implementation ([`PlainAcceptor`]) just wraps the socket; the
+/// TLS one ([`crate::tls::TlsAcceptor`]) runs a handshake first and only
+/// produces a `Link` if it succeeds. This is the mirror of [`Dialer`], and the
+/// only place a server service learns that TLS exists.
+pub trait Acceptor: Send + Sync + 'static {
+    fn accept(
+        &self,
+        stream: TcpStream,
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Link>> + Send + 'static>>;
+}
+
+/// The accepted socket, as it is.
+pub struct PlainAcceptor;
+
+impl Acceptor for PlainAcceptor {
+    fn accept(
+        &self,
+        stream: TcpStream,
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Link>> + Send + 'static>> {
+        Box::pin(async move { Ok(Link::new(stream, local, remote)) })
+    }
+}
+
 /// The real thing: a TCP connect from `bind_ip`, with `TCP_NODELAY` set.
 ///
 /// `bind_ip` is `NetPacketSvc::m_BindIp` — the engine passes the replica's own

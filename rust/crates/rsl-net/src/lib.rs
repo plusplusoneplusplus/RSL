@@ -63,6 +63,8 @@ pub mod limits;
 pub mod learnport;
 #[cfg(feature = "svc")]
 pub mod svc;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use framing::learn::{self, LearnError};
 pub use framing::packet::{self, FrameError, PacketHdr};
@@ -74,3 +76,6 @@ pub use svc::{ConnectState, Packet, PacketHandler, PacketSvc, SvcConfig, TxRxSta
 
 #[cfg(feature = "learnport")]
 pub use learnport::{LearnClient, LearnConfig, LearnServer, Requester, TransferError};
+
+#[cfg(feature = "tls")]
+pub use tls::{ChainValidation, Identity, Revocation, SubjectRule, Thumbprint, Tls, TlsConfig};

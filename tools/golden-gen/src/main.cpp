@@ -30,6 +30,9 @@
 #include "storage_min.h"       // Phase 3a: storage corpus + reverse verify
 #include "packet_min.h"        // Phase 4a: packet + learn-port framing
 #include "learn_min.h"         // Phase 4c: the live learn port, both directions
+#ifdef RSL_GOLDEN_TLS
+#include "tls_peer.h"          // Phase 4d: the TLS 1.2 interop oracle (OpenSSL)
+#endif
 
 using namespace RSLib;
 using namespace RSLibImpl;
@@ -1412,6 +1415,52 @@ int main(int argc, char** argv)
         const char* mode = "echo";
         if (argc >= 5 && strcmp(argv[3], "--mode") == 0) { mode = argv[4]; }
         return rsl_packet::RunPeer(atoi(argv[2]), mode);
+    }
+    // Phase 4d: the same peer over TLS 1.2, via OpenSSL. A *proxy* oracle --
+    // the real C++ uses SChannel, which does not run here. See tls_peer.cpp.
+    //
+    //   --tls-peer   <port> --cert <pem> --key <pem> --ca <pem> [--mode echo|log]
+    //   --tls-client <host> <port> --cert <pem> --key <pem> --ca <pem>
+    //                [--payload <str>] [--count <n>]
+    if (argc >= 3 &&
+        (strcmp(argv[1], "--tls-peer") == 0 || strcmp(argv[1], "--tls-client") == 0))
+    {
+#ifndef RSL_GOLDEN_TLS
+        fprintf(stderr,
+                "%s needs OpenSSL: install libssl-dev and re-run cmake\n", argv[1]);
+        return 3;
+#else
+        const char* cert = NULL;
+        const char* key = NULL;
+        const char* ca = NULL;
+        const char* mode = "echo";
+        const char* payload = "tls interop";
+        int count = 1;
+        for (int i = 2; i + 1 < argc; ++i)
+        {
+            if (strcmp(argv[i], "--cert") == 0) { cert = argv[i + 1]; }
+            else if (strcmp(argv[i], "--key") == 0) { key = argv[i + 1]; }
+            else if (strcmp(argv[i], "--ca") == 0) { ca = argv[i + 1]; }
+            else if (strcmp(argv[i], "--mode") == 0) { mode = argv[i + 1]; }
+            else if (strcmp(argv[i], "--payload") == 0) { payload = argv[i + 1]; }
+            else if (strcmp(argv[i], "--count") == 0) { count = atoi(argv[i + 1]); }
+        }
+        if (cert == NULL || key == NULL || ca == NULL)
+        {
+            fprintf(stderr, "%s needs --cert <pem> --key <pem> --ca <pem>\n", argv[1]);
+            return 2;
+        }
+        if (strcmp(argv[1], "--tls-peer") == 0)
+        {
+            return rsl_tls::RunServer(atoi(argv[2]), cert, key, ca, mode);
+        }
+        if (argc < 4)
+        {
+            fprintf(stderr, "--tls-client needs <host> <port>\n");
+            return 2;
+        }
+        return rsl_tls::RunClient(argv[2], atoi(argv[3]), cert, key, ca, payload, count);
+#endif
     }
     // Phase 4c: the live C++ learn port, both directions. Also spawned on
     // demand by the Rust tests, not part of corpus regeneration.

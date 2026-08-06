@@ -1,8 +1,8 @@
 # rsl-net
 
 The RSL network layer in pure Rust: the **framing** (Phase 4a), the **transport**
-built on it (Phase 4b), and the **learn port** a lagging replica catches up
-through (Phase 4c).
+built on it (Phase 4b), the **learn port** a lagging replica catches up through
+(Phase 4c), and **TLS** over both ports (Phase 4d).
 
 - **`framing`** — a byte-exact port of the 20-byte NetPacket header that wraps
   every replica-to-replica message, and of the learn-port framing used by the
@@ -22,10 +22,17 @@ through (Phase 4c).
   [`rsl-storage`](../rsl-storage). Proven against the extracted C++
   (`golden-gen --learn-server` / `--learn-client`) in **both** directions.
 
+- **`tls`** — mutual TLS on both ports, with the C++'s operator-facing trust
+  model (SHA-1 thumbprint pins, subject + issuer-pin rules, an A/B pair for
+  rotation) over rustls instead of SChannel. One config object gates the packet
+  port and the learn port, in both directions. See [TLS.md](TLS.md) for the
+  model, the eight deliberate divergences, the operational migration from the
+  Windows certificate store, and the SChannel residual-risk note.
+
 Zero `unsafe` (`unsafe_code = "forbid"`). The framing kernel's only dependency
 is [`rsl-wire`](../rsl-wire); `default-features = false` drops tokio and leaves
-just the bytes, and `--no-default-features --features svc` keeps the transport
-without pulling in the storage crate.
+just the bytes, `--no-default-features --features svc` keeps the transport
+without pulling in the storage crate, and dropping `tls` drops rustls.
 
 ## Layout
 
@@ -37,6 +44,7 @@ without pulling in the storage crate.
 | `svc` | `NetPacketSvc` / `NetCxn`: connection lifecycle, send queue, timeouts, statuses, callbacks |
 | `learnport::server` | `FetchServerLoop` / `HandleFetchRequest` and the three handlers, plus `SendFile` |
 | `learnport::client` | `SendStatusRequestMessage`, `LearnVotes` (+ `ReadNextMessage`), `CopyCheckpoint` |
+| `tls` | `SSLImpl.cpp`'s trust model + `NetSslCxn`'s "connected means authenticated", over rustls |
 
 ## Framing
 
@@ -233,7 +241,7 @@ that keeps stalling.
 
 ## Correctness
 
-`cargo test` runs twelve harnesses. Framing (Phase 4a):
+`cargo test` runs sixteen harnesses. Framing (Phase 4a):
 
 1. **`packet_corpus`** — the 30 `PACKET` vectors in
    `tools/golden-gen/corpus/phase1-golden.txt`. Each is a byte stream the *real
@@ -300,6 +308,34 @@ Learn port (Phase 4c):
     page and checksum-block boundaries, plus streaming chunk sizes from 512 B to
     twice the file size.
 
+TLS (Phase 4d):
+
+13. **`tls_rules`** — the acceptance-rule matrix, every case a real mutual
+    handshake over loopback rather than a direct call into the verifier:
+    thumbprint hit in slot A and in slot B, a certificate from the right CA with
+    no matching pin, subject+parent hit in each slot, each partial miss (right
+    subject wrong parent, right parent wrong subject, wrong case), a bare leaf
+    with no issuer presented, expired × each chain toggle, an untrusted CA, a
+    revoked certificate and one no CRL covers, wrong EKU in each direction, no
+    EKU extension at all, mutual-auth enforcement in *both* directions, and a
+    client that presents no certificate.
+14. **`tls_ports`** — the wiring: a packet moving over TLS, a status query over
+    the same config, a plaintext client refused by each port, four packets
+    queued before the handshake and all four delivered afterwards in order,
+    `Connected` never firing for a peer we refuse, and a full A/B rotation
+    performed on a live fleet (old connections undisturbed, new ones on the new
+    config, and the mixed window in the middle).
+15. **`tls_names`** — vectors for the subject display name: CN wins, OU then O
+    as fallbacks, no name at all, the 255-character truncation, "this is not a
+    DN" stated as an assertion, both EKU roles, the two Server Gated Crypto
+    OIDs, and a repeated CN taking the most specific.
+16. **`tls_interop`** — `golden-gen --tls-peer` / `--tls-client`: the real C++
+    packet framing over **OpenSSL**, mutual auth, TLS 1.2, in both directions.
+    A proxy oracle for SChannel, which cannot run here — and it has already
+    caught a real bug (a malformed `certificate_authorities` hint that two
+    rustls peers ignore and OpenSSL rejects). See [TLS.md](TLS.md) for what it
+    does *not* prove and the Windows checklist that closes it.
+
 ### Deliberate divergences
 
 Two in the framing, all of them places where the original is unsafe:
@@ -330,6 +366,11 @@ And five in the transport, none of them observable on the wire:
 - **`send_on_existing` is strict** — "existing" means connected, where the C++
   also accepts a connection that is about to reconnect. The engine never uses
   the flag.
+
+TLS has eight of its own, including two that are security-relevant (the learn
+port is encrypted under the same switch as the packet port; the EKU roles are
+the right way round). They are listed with their `SSLImpl.cpp` line numbers in
+[TLS.md](TLS.md).
 
 ## Fuzzing
 
@@ -398,11 +439,57 @@ so a catch-up over many small decrees is bounded by record count, not bytes. The
 checkpoint numbers include an `fsync` and a directory `fsync` per transfer,
 which is why the 1 MiB case looks slow per byte and why the variance is wide.
 
+TLS — the same round trip with and without the record layer, plus a full mutual
+handshake:
+
+| Benchmark | Payload | Plaintext | TLS |
+| --- | --- | --- | --- |
+| `tls/round_trip` | 1 KiB | ~87.9 µs | ~100 µs (+14 %) |
+| `tls/round_trip` | 100 KiB | ~426 µs (458 MiB/s) | ~582 µs (336 MiB/s) |
+| `tls/round_trip` | 10 MiB | ~36.5 ms (549 MiB/s) | ~39.8 ms (503 MiB/s) |
+| `tls/handshake` | — | — | ~1.80 ms |
+
+The handshake is two chain verifications and an ECDHE exchange, paid once per
+connection — which means once per *reconnect*, so Phase 4b's backoff is what
+bounds it. The record layer costs most in relative terms at 100 KiB, where a
+payload is several TLS records but per-record overhead has not amortized, and
+least at checkpoint sizes, which is the case worth worrying about.
+
 Round-trip latency at 1 KiB is loopback and scheduling, not framing — the frame
 itself costs well under a microsecond. The C++ peer is slower because it is a
 single-threaded blocking loop that copies each payload into a fresh frame; it is
 here as a correctness oracle that also happens to bound the port's cost, not as
 a tuned implementation.
+
+## TLS
+
+`TLS.md` has the whole story. The short version:
+
+```rust
+let tls = Tls::new(TlsConfig {
+    identity: Identity::from_pem_files("replica.pem", "replica.key")?,
+    thumbprint_a: Some("1b32891adb56d3f7115e7e031cc41e1793252015".parse()?),
+    roots: vec![root_ca_der],
+    ..TlsConfig::default()
+})?;
+
+let client = PacketSvc::start_as_client_with(tls.dialer(bind_ip), handler, cfg);
+let server = PacketSvc::start_as_server_with(port, tls.acceptor(), handler, cfg)?;
+let learn  = LearnServer::bind_with(addr, tls.connector(), source, cfg).await?;
+```
+
+`Connected` fires only after the handshake and the certificate check, as it does
+in the C++; packets sent before then wait in the send queue and go out
+afterwards. `Tls::swap` rotates the configuration without disturbing live
+connections.
+
+TLS never appears inside `framing` or `svc` — an encrypted connection reaches
+the transport as a `Link` like any other, which is the same seam the C++ uses
+when it swaps `NetCxn` for `NetSslCxn`.
+
+Costs, loopback: ~1.8 ms for a full mutual handshake; +14 % round-trip time at
+1 KiB, +27 % at 100 KiB, +9 % at 10 MiB. Checkpoint-sized transfers — the thing
+worth worrying about — are the case that costs least.
 
 ## Example
 

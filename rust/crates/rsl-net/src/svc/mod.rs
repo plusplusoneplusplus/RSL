@@ -78,7 +78,7 @@ pub use dispatch::CallbackMode;
 pub use handler::{
     ConnectState, Packet, PacketHandler, TxRxStatus, MAX_CALLBACK_DELAY, UNSPECIFIED,
 };
-pub use transport::{BackoffConfig, Dialer, Link, Stream, TcpDialer};
+pub use transport::{Acceptor, BackoffConfig, Dialer, Link, PlainAcceptor, Stream, TcpDialer};
 
 use std::collections::HashMap;
 use std::io;
@@ -228,6 +228,29 @@ impl PacketSvc {
         handler: Arc<dyn PacketHandler>,
         config: SvcConfig,
     ) -> io::Result<PacketSvc> {
+        PacketSvc::start_as_server_with(port, Arc::new(PlainAcceptor), handler, config)
+    }
+
+    /// Server mode where every accepted socket goes through `acceptor` before
+    /// it becomes a connection — [`crate::tls::TlsAcceptor`] in a TLS
+    /// deployment.
+    ///
+    /// Handshakes run concurrently with the accept loop, one task each, so a
+    /// peer that opens a socket and then says nothing cannot stall the listener.
+    ///
+    /// **Divergence, unavoidable:** the duplicate-connection check happens
+    /// after the handshake rather than at accept time, because until the
+    /// handshake finishes there is no connection to be a duplicate of. A second
+    /// socket from an address that already has a connection therefore costs a
+    /// handshake before it is dropped. The C++ has the same shape for its SSL
+    /// path — `NetServerAcceptor::HandleEvent` builds the `NetSslCxn` and the
+    /// SSPI loop runs afterwards.
+    pub fn start_as_server_with(
+        port: u16,
+        acceptor: Arc<dyn Acceptor>,
+        handler: Arc<dyn PacketHandler>,
+        config: SvcConfig,
+    ) -> io::Result<PacketSvc> {
         let listener = std::net::TcpListener::bind(SocketAddrV4::new(config.bind_ip, port))?;
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -235,7 +258,9 @@ impl PacketSvc {
 
         let svc = PacketSvc::start_as_server_detached(local, handler, config);
         let inner = svc.inner.clone();
-        let task = inner.runtime.spawn(accept_loop(inner.clone(), listener));
+        let task = inner
+            .runtime
+            .spawn(accept_loop(inner.clone(), listener, acceptor));
         *svc.inner.acceptor.lock().expect("acceptor poisoned") = Some(task);
         Ok(svc)
     }
@@ -509,7 +534,11 @@ impl Svc {
     }
 }
 
-async fn accept_loop(svc: Arc<Svc>, listener: tokio::net::TcpListener) {
+async fn accept_loop(
+    svc: Arc<Svc>,
+    listener: tokio::net::TcpListener,
+    acceptor: Arc<dyn Acceptor>,
+) {
     loop {
         let (stream, remote) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -533,8 +562,19 @@ async fn accept_loop(svc: Arc<Svc>, listener: tokio::net::TcpListener) {
             Err(_) => continue,
         };
         let remote = transport::v4(remote);
-        if !svc.attach(Link::new(stream, local, remote)) {
-            eprintln!("rsl-net: duplicate connection from {remote} -- dropped");
-        }
+        let handshake = acceptor.accept(stream, local, remote);
+        let svc = svc.clone();
+        // Own task: a handshake takes a round trip, and the listener must stay
+        // responsive while it runs.
+        tokio::spawn(async move {
+            match handshake.await {
+                Ok(link) => {
+                    if !svc.attach(link) {
+                        eprintln!("rsl-net: duplicate connection from {remote} -- dropped");
+                    }
+                }
+                Err(e) => eprintln!("rsl-net: handshake with {remote} failed ({e})"),
+            }
+        });
     }
 }

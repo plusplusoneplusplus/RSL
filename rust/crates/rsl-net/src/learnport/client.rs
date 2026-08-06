@@ -11,6 +11,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rsl_storage::checkpoint::{self, CheckpointHeader};
@@ -21,11 +22,11 @@ use rsl_wire::messages::{
     MSG_RECONFIGURATION_DECISION, MSG_VOTE,
 };
 use rsl_wire::BallotNumber;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use super::{read_exact_or_eof, write_all, LearnConfig};
+use super::{read_exact_or_eof, write_all, Connector, LearnConfig, PlainConnector};
 use crate::framing::learn::{self, LearnError};
+use crate::svc::Stream;
 
 /// Why a learn-port transfer failed.
 ///
@@ -149,11 +150,26 @@ impl From<io::Error> for TransferError {
 // The client
 // ---------------------------------------------------------------------------
 
-/// A learn-port client. Stateless apart from its [`LearnConfig`]; one instance
-/// can drive any number of concurrent transfers.
-#[derive(Clone, Debug, Default)]
+/// A learn-port client. Stateless apart from its [`LearnConfig`] and its
+/// [`Connector`]; one instance can drive any number of concurrent transfers.
+#[derive(Clone)]
 pub struct LearnClient {
     config: LearnConfig,
+    connector: Arc<dyn Connector>,
+}
+
+impl Default for LearnClient {
+    fn default() -> LearnClient {
+        LearnClient::with_config(LearnConfig::default())
+    }
+}
+
+impl std::fmt::Debug for LearnClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LearnClient")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LearnClient {
@@ -164,7 +180,16 @@ impl LearnClient {
 
     /// A client with explicit configuration.
     pub fn with_config(config: LearnConfig) -> LearnClient {
-        LearnClient { config }
+        LearnClient {
+            config,
+            connector: Arc::new(PlainConnector),
+        }
+    }
+
+    /// The same client, connecting through `connector` —
+    /// `tls.connector()` for a TLS deployment.
+    pub fn over(self, connector: Arc<dyn Connector>) -> LearnClient {
+        LearnClient { connector, ..self }
     }
 
     /// The configuration in force.
@@ -295,14 +320,18 @@ impl LearnClient {
         &self,
         addr: SocketAddr,
         request: &Header,
-    ) -> Result<TcpStream, TransferError> {
+    ) -> Result<Box<dyn Stream>, TransferError> {
         let bytes = learn::encode_message(&Msg::Base(request.clone()))
             .expect("a base-class message always marshals");
 
-        let mut stream = super::with_timeout(self.config.send_timeout, TcpStream::connect(addr))
-            .await?
-            .map_err(TransferError::Io)?;
-        let _ = stream.set_nodelay(true);
+        // The connect *and*, for TLS, the handshake are under the send timeout:
+        // the C++ sets `SO_SNDTIMEO`/`SO_RCVTIMEO` on the socket before
+        // `SslSocket::Connect` runs its SSPI loop, so the handshake inherits the
+        // same budget (`StreamIO.cpp:82-95`).
+        let mut stream =
+            super::with_timeout(self.config.send_timeout, self.connector.connect(addr))
+                .await?
+                .map_err(TransferError::Io)?;
         write_all(&mut stream, &bytes, self.config.send_timeout).await?;
         stream.flush().await?;
         Ok(stream)
@@ -312,9 +341,9 @@ impl LearnClient {
     /// bytes until `expected_size` have been read *in total*
     /// (`legislator.cpp:5551` counts `reader.BytesRead()`, the header
     /// included).
-    async fn copy_checkpoint(
+    async fn copy_checkpoint<S: AsyncRead + Unpin>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         expected_size: u64,
         temp: &Path,
         raise_max_ballot: Option<BallotNumber>,
@@ -360,9 +389,9 @@ impl LearnClient {
     /// it, returning it with the number of bytes consumed. Mirrors
     /// `CheckpointHeader::UnMarshal(StreamReader*)` (`legislator.cpp:1032`):
     /// one page first, then the rest of the declared length.
-    async fn read_checkpoint_header(
+    async fn read_checkpoint_header<S: AsyncRead + Unpin>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         file_size: u64,
     ) -> Result<(CheckpointHeader, u64), TransferError> {
         let mut blob = vec![0u8; PAGE_SIZE as usize];
@@ -474,7 +503,7 @@ pub struct FetchedCheckpoint {
 /// has no futures-core dependency and this is the whole surface a caller needs.
 /// Wrapping it in a `Stream` is three lines in a consumer that wants one.
 pub struct VoteStream {
-    stream: TcpStream,
+    stream: Box<dyn Stream>,
     recv_timeout: Duration,
     buf: Vec<u8>,
     offset: u64,
