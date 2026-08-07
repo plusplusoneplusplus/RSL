@@ -1373,6 +1373,7 @@ int VerifyStorage(const char* dir)
             printf("%s: %s records=%zu stopOffset=%llu (%s)\n", n.c_str(),
                    OutcomeName(s.outcome), s.records.size(),
                    (unsigned long long)s.stopOffset, s.detail.c_str());
+            if (s.outcome == rsl_storage::Reject && rc == 0) { rc = 3; }
         }
         else if (ends_with(n, ".codex"))
         {
@@ -1381,12 +1382,14 @@ int VerifyStorage(const char* dir)
             printf("%s: %s version=%u userData=%llu (%s)\n", n.c_str(),
                    OutcomeName(v.outcome), v.version,
                    (unsigned long long)v.userDataSize, v.detail.c_str());
+            if (v.outcome == rsl_storage::Reject && rc == 0) { rc = 3; }
         }
         else if (ends_with(n, ".txt"))
         {
             UInt32 value = 0;
             bool ok = rsl_storage::DecodeDefunct(bytes.data(), bytes.size(), &value);
             printf("%s: %s value=%u\n", n.c_str(), ok ? "accept" : "reject", value);
+            if (!ok && rc == 0) { rc = 3; }
         }
         else
         {

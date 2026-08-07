@@ -1,0 +1,41 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(EnvironmentConfig)" />
+  <PropertyGroup Label="Globals">
+    <TargetName>RSLWindowsOracle</TargetName>
+    <ProjectGuid>{B7D15E0F-C9DE-4C74-B665-C25ACFCFD82A}</ProjectGuid>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <EmbedManifest>false</EmbedManifest>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+  <Import Project="$(SRCROOT)\build\native.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>
+        $(BinariesBuildTypeArchDirectory)\RSLib\RSLib.lib;
+        kernel32.lib;
+        user32.lib;
+        Dbghelp.lib;
+        ws2_32.lib;
+        crypt32.lib;
+        Advapi32.lib;
+        Secur32.lib;
+      </AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(SRCROOT)\lib\RSLib.vcxproj">
+      <Project>{828D388E-12C5-4E8A-9DAF-11FC42161C49}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <Import Project="$(ExtendedTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

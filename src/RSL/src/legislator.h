@@ -215,6 +215,7 @@ namespace RSLibImpl
         DWORD32 Open(const char *dir, UInt64 decree);
 
         bool Write(SIZED_BUFFER* bufs, UInt32 count);
+        bool WriteMessage(Message *msg, UInt32 *bytesWritten);
         bool Read(void* buf, UInt32 numBytes, UInt64 offset, HANDLE event);
         void AddMessage(Message *msg);
         DWORD32 SetWritePointer();
@@ -818,6 +819,7 @@ namespace RSLibImpl
         CRITSEC m_statsLock;
 
         friend class ExecuteQueue;
+        friend class RSLInteropTestFacade;
 
         bool m_acceptMessages;
     };

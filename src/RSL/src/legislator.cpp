@@ -594,6 +594,43 @@ LogFile::Write(SIZED_BUFFER *bufs, UInt32 count)
 }
 
 bool
+LogFile::WriteMessage(Message *msg, UInt32 *bytesWritten)
+{
+    LogAssert(msg != NULL);
+    LogAssert(bytesWritten != NULL);
+
+    if (msg->m_msgId == Message_Vote)
+    {
+        Vote *vote = static_cast<Vote *>(msg);
+        vote->CalculateChecksum();
+        DynamicBuffer<SIZED_BUFFER, 1024> buffers(vote->GetNumBuffers());
+        vote->GetBuffers(buffers, buffers.Size());
+
+        *bytesWritten = 0;
+        for (UInt32 i = 0; i < vote->GetNumBuffers(); i++)
+        {
+            *bytesWritten += buffers[(Int32)i].m_len;
+        }
+        return Write(buffers, vote->GetNumBuffers());
+    }
+
+    UInt32 toWrite = RoundUpToPage(msg->GetMarshalLen());
+    char *buf = (char *) VirtualAlloc(NULL, toWrite, MEM_COMMIT, PAGE_READWRITE);
+    LogAssert(buf);
+    msg->MarshalBuf(buf, toWrite);
+    msg->CalculateChecksum(buf, msg->GetMarshalLen());
+
+    SIZED_BUFFER buffer;
+    buffer.m_buf = buf;
+    buffer.m_len = toWrite;
+    bool success = Write(&buffer, 1);
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    *bytesWritten = toWrite;
+    return success;
+}
+
+bool
 LogFile::IssueWriteFileGather(FILE_SEGMENT_ELEMENT *segments, UInt64 offset, DWORD bytesToWrite)
 {
     LARGE_INTEGER i;
@@ -5128,21 +5165,13 @@ Legislator::LogVote(Vote *vote)
         LogAssert(log->Open(m_dataDir, vote->m_decree) == NO_ERROR);
     }
 
-    DynamicBuffer<SIZED_BUFFER, 1024> buffers(vote->GetNumBuffers());
-    vote->GetBuffers(buffers, buffers.Size());
     Int64 writeStarted = GetHiResTime();
-    LogAssert(log->Write(buffers, vote->GetNumBuffers()));
+    UInt32 cbWritten;
+    LogAssert(log->WriteMessage(vote, &cbWritten));
     Int64 writeFinished = GetHiResTime();
 
     RSLDebug("Vote logged", LogTag_RSLMsg, vote, LogTag_Offset, log->m_dataLen,
              LogTag_UInt1, vote->m_numRequests);
-
-    // Calculate total number of bytes in the votes just logged.
-    Int32 cbWritten = 0;
-    for (UInt32 i = 0; i < vote->GetNumBuffers(); i++)
-    {
-        cbWritten += buffers[(Int32)i].m_len;
-    }
 
     {
         // Update stats under the lock.
@@ -5205,21 +5234,10 @@ Legislator::LogPrepare(PrepareMsg *msg)
     {
         return;
     }
-    DWORD toWrite = RoundUpToPage(msg->GetMarshalLen());
-    char *buf = (char *) VirtualAlloc(NULL, toWrite, MEM_COMMIT, PAGE_READWRITE);
-    LogAssert(buf);
-    msg->MarshalBuf(buf, toWrite);
-    msg->CalculateChecksum(buf, msg->GetMarshalLen());
-
     LogAssert(m_logFiles.size() > 0);
     LogFile *log = m_logFiles.back();
-    SIZED_BUFFER buffers[1];
-    buffers[0].m_buf = buf;
-    buffers[0].m_len = toWrite;
-
-    LogAssert(log->Write(buffers, 1));
-
-    VirtualFree(buf, 0, MEM_RELEASE);
+    UInt32 bytesWritten;
+    LogAssert(log->WriteMessage(msg, &bytesWritten));
     RSLInfo("Prepare logged", LogTag_RSLMsg, msg, LogTag_Offset, log->m_dataLen);
 
     AutoCriticalSection lock(&m_lock);
@@ -5260,19 +5278,9 @@ Legislator::LogReconfigurationDecision(Message *decision)
 
     LogAssert(m_logFiles.size() > 0);
     LogFile *log = m_logFiles.back();
-    DWORD toWrite = RoundUpToPage(decision->GetMarshalLen());
-    char *buf = (char *) VirtualAlloc(NULL, toWrite, MEM_COMMIT, PAGE_READWRITE);
-    LogAssert(buf);
-    decision->MarshalBuf(buf, toWrite);
-    decision->CalculateChecksum(buf, decision->GetMarshalLen());
-
-    SIZED_BUFFER buffers[1];
-    buffers[0].m_buf = buf;
-    buffers[0].m_len = toWrite;
-
-    bool writeSuccess = log->Write(buffers, 1);
+    UInt32 bytesWritten;
+    bool writeSuccess = log->WriteMessage(decision, &bytesWritten);
     LogAssert(writeSuccess);
-    VirtualFree(buf, 0, MEM_RELEASE);
     RSLInfo("Reconfiguration decision logged",
             LogTag_RSLMsg, decision, LogTag_Offset, log->m_dataLen);
 

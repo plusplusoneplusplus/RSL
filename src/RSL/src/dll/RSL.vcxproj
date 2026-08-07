@@ -38,6 +38,7 @@
   <ItemGroup>
     <ClCompile Include="$(SRCROOT)\RSL\src\rslconfig.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\message.cpp" />
+    <ClCompile Include="$(SRCROOT)\RSL\src\interop_test_facade.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\legislator.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\rsl.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\rslutil.cpp" />

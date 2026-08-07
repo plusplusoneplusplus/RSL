@@ -7,7 +7,7 @@
 //! different subset of it, so unused-item warnings here are expected.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rsl_wire::MsgKind;
 
@@ -79,7 +79,12 @@ pub fn load_containers() -> Vec<Container> {
 /// Load and parse every block kind in the corpus.
 pub fn load_all() -> (Vec<Record>, Vec<Fprint>, Vec<Container>) {
     let path = corpus_path();
-    let text = std::fs::read_to_string(&path)
+    load_all_from(&path)
+}
+
+/// Load and parse every block kind in a corpus at `path`.
+pub fn load_all_from(path: &Path) -> (Vec<Record>, Vec<Fprint>, Vec<Container>) {
+    let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("failed to read corpus at {}: {e}", path.display()));
 
     let mut records = Vec::new();

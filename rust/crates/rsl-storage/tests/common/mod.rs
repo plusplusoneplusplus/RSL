@@ -23,8 +23,33 @@ fn env_path(name: &str) -> Option<PathBuf> {
     (!value.is_empty()).then(|| PathBuf::from(value))
 }
 
+pub fn authoritative_interop() -> bool {
+    std::env::var("RSL_AUTHORITATIVE_INTEROP")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// The production Windows oracle. Authoritative mode requires this variable to
+/// name an existing executable rather than silently reducing coverage.
+pub fn windows_oracle() -> Option<PathBuf> {
+    let path = env_path("RSL_WINDOWS_ORACLE");
+    if let Some(path) = path {
+        assert!(
+            path.is_file(),
+            "RSL_WINDOWS_ORACLE={} is not a file",
+            path.display()
+        );
+        return Some(path);
+    }
+    assert!(
+        !authoritative_interop(),
+        "RSL_AUTHORITATIVE_INTEROP requires RSL_WINDOWS_ORACLE"
+    );
+    None
+}
+
 /// The `golden-gen` binary, if it has been built (or `RSL_GOLDEN_GEN` points at
-/// one). Building it needs cmake + g++, so its absence is not a test failure.
+/// one). This is the portable extracted proxy, not the authoritative Windows
+/// implementation.
 pub fn golden_gen() -> Option<PathBuf> {
     if let Some(path) = env_path("RSL_GOLDEN_GEN") {
         return path.is_file().then_some(path);

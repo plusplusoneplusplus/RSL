@@ -1,18 +1,19 @@
-# golden-gen — Phase-1 golden-vector generator
+# golden-gen — portable extracted interoperability proxy
 
-This tool builds the **minimum slice** of the original RSL C++ that runs on
-Linux and emits byte-exact reference vectors (marshaled bytes + Rabin-64
-checksums, for every message type across every protocol version) for the
-pure-Rust port to check against.
+This Linux-only tool builds an extracted subset of RSL and emits portable
+reference vectors for the Rust implementation. It is useful for fast Ubuntu
+coverage, but it is not the authoritative C++ oracle for storage, networking,
+learning, or TLS. The authoritative process is the Windows production oracle
+in [`tools/windows-oracle`](../windows-oracle/README.md).
 
 It is the concrete implementation of
 `notes/Plans/rsl-rust-port/01-phase1-minimal-cpp-reference.plan.md`.
 
 ## What it compiles
 
-Only what the marshaling / fingerprint / message code actually needs — no
-threading, IOCP, or logging engine. Storage I/O and sockets appear only in the
-extracted Phase-3a/4a paths below, as plain blocking POSIX calls:
+Wire marshaling and fingerprinting compile production translation units.
+Storage, packet receive, and learn-port behavior use copied or ported subsets
+with blocking POSIX I/O rather than the shipping Windows engine:
 
 | Source | Role |
 | --- | --- |
@@ -20,10 +21,10 @@ extracted Phase-3a/4a paths below, as plain blocking POSIX calls:
 | `src/common/src/marshal.cpp` | `MarshalData` reader/writer (little-endian) |
 | `src/common/src/fingerprint.cpp` | `FingerPrint64` wrapper + singleton |
 | `src/common/src/utils.cpp` | `Utils::CalculateChecksum` |
-| `src/RSL/src/message.cpp` | all message types × versions |
+| `src/RSL/src/message.cpp` | production message implementations |
 | `tools/golden-gen/src/engine_min.cpp` | `MemberSet` / `RSLNodeCollection` / `RSLNode` — copied **verbatim** from `rsl.cpp` (message.cpp references them) |
-| `tools/golden-gen/src/packet_min.cpp` | `PacketHdr`/`Packet` + the `NetCxn` receive decision table + `Message::ReadFromSocket`, and the live TCP peer (Phase 4a) |
-| `tools/golden-gen/src/learn_min.cpp` | the learn port both ways: `HandleFetchRequest` + the three handlers + `SendFile`, and the `ReadNextMessage` / `CopyCheckpoint` client loops (Phase 4c) |
+| `tools/golden-gen/src/packet_min.cpp` | copied packet types and a ported receive decision table |
+| `tools/golden-gen/src/learn_min.cpp` | ported learn-server and learn-client behavior |
 | `tools/golden-gen/src/tls_peer.cpp` | the packet peer over TLS 1.2 via OpenSSL — a proxy oracle for SChannel (Phase 4d, optional: needs libssl-dev) |
 | `tools/golden-gen/src/main.cpp` | the generator driver |
 
@@ -147,9 +148,9 @@ bug could pass. The Rust port's `tests/fields.rs` does exactly this. Adding
 
 ### Phase 4a: `PACKET` / `LEARN` and the live peer
 
-Both block kinds work the way the storage MANIFEST does: the `OUTCOME` is
-produced by **running** the extracted C++ receive code over the bytes just
-emitted, never by reading the format spec. `PACKET` payloads are real corpus
+Both block kinds run the proxy receive implementation over the emitted bytes.
+They do not exercise production IOCP, Winsock, or `NetCxn`. `PACKET` payloads are
+production-marshaled corpus
 messages (one per message type, at the highest version that emits it) plus a few
 synthetic edge cases, and the negatives cover an empty/short buffer, every
 out-of-range size, both checksum domains — including a frame whose *inner*
@@ -182,11 +183,9 @@ flushes it before accepting, so a harness never has to race on a fixed port.
 
 ### Phase 4c: the live learn port (`--learn-server` / `--learn-client`)
 
-`learn_min.cpp` is the state-transfer slice: `HandleFetchRequest` and its three
-handlers, `SendFile`, and — on the other side — the `ReadNextMessage` loop
-`LearnVotes` drives plus the `CopyCheckpoint` copy loop. Both ends speak the
-real protocol over a real socket, so the Rust port can be tested as a client of
-the C++ *and* as a server to it.
+`learn_min.cpp` is a ported state-transfer proxy. It is useful for exercising
+both directions over a socket, but it does not execute the shipping Windows
+learn server/client or their asynchronous I/O.
 
 ```sh
 # C++ serves a data directory; a Rust client fetches from it.
@@ -260,12 +259,12 @@ What this does **not** prove, and the Windows checklist that closes it, are in
 fingerprint of the empty string, a quick correctness check for the Rabin-64
 port.
 
-## Phase 3a: storage corpus (`--storage` / `--verify-storage`)
+## Portable storage proxy (`--storage` / `--verify-storage`)
 
-Phase 3a extends the same golden-vector technique to **containers on disk** —
-`.log` records, `.codex` checkpoints, and `defunct.txt` — so the Rust storage
-port (Phase 3b/3c) has C++-generated files to parse, and C++ can verify
-Rust-written files on Linux without a Windows box or the full engine.
+The storage corpus covers `.log`, `.codex`, and `defunct.txt` layouts on
+Ubuntu. It is generated and verified by `storage_min.cpp`, a port of selected
+format-bearing code to in-memory byte buffers. It is not production storage I/O
+and its recovery outcomes are proxy results.
 
 The checkpoint **type declarations** are not copied at all — `ConfigurationInfo`
 and `CheckpointHeader` live in `RSL/src/checkpoint.h`, which both
@@ -276,34 +275,34 @@ layout has a single definition and cannot drift between the two builds. Only
 `GetCheckpointFileName`) are `#ifdef _WIN32` — they take engine-only types and
 carry no format information. Every data member and marshaling method is shared.
 
-The method *bodies* are extracted the same way `MemberSet` was:
+The proxy consists of:
 
 | Source | Extracted into |
 | --- | --- |
-| `ConfigurationInfo` + `CheckpointHeader` marshal/unmarshal (`legislator.cpp`) | `src/storage_min.cpp` (**verbatim**, line-cited) |
+| `ConfigurationInfo` + `CheckpointHeader` marshal/unmarshal (`legislator.cpp`) | `src/storage_min.cpp` (copied, line-cited) |
 | Log record padding + `Legislator::ReadNextMessage` recovery scan | `src/storage_min.cpp` (`rsl_storage::EncodeLogRecord` / `ScanLog`) |
 | `RSLCheckpointStreamWriter`/`Reader` 4 MiB block + trailing Rabin-64 (`rsl.cpp`) | `src/storage_min.cpp` (`BuildCheckpointFile` / `VerifyCheckpointFile`) |
 | `Read`/`UpdateDefunctFile` (`legislator.cpp`) | `src/storage_min.cpp` (`EncodeDefunct` / `DecodeDefunct`) |
 
-The verbatim class methods keep their `legislator.cpp` line citations; the
-`rsl_storage::` helpers are ports that replace the Windows unbuffered/overlapped
-I/O mechanism (`WriteFileGather`, `APSEQREAD`/`APSEQWRITE`) with plain in-memory
-byte buffers — the *bytes produced/consumed are unchanged*, and every deviation
-is commented (notably: the corpus **zero-fills page pads** for determinism,
-whereas the Windows engine leaves malloc/VirtualAlloc tails; readers tolerate
-non-zero pads, exercised by the `garbage-pad` sample).
+The helpers replace `WriteFileGather`, `APSEQREAD`, and `APSEQWRITE` with
+in-memory buffers and zero-fill padding for deterministic Ubuntu output. The
+Windows oracle is required for claims about literal production files and
+recovery decisions.
 
 ```sh
 ./build/golden-gen --storage        corpus/storage   # generate corpus + MANIFEST
 ./build/golden-gen --verify-storage  corpus/storage   # reverse: read a dir, report
 ```
 
+`--verify-storage` exits `0` when every file is accepted or reaches a tolerated
+recovery stop, `3` when any file is rejected, and `1` for I/O failure. The
+generated corpus contains negative vectors, so verifying the whole corpus
+normally exits `3`.
+
 ### Corpus layout (`corpus/storage/`)
 
-`MANIFEST.json` is the FIELDS-equivalent for storage: for every sample it records
-size, an `fp64` (Rabin-64 of the whole file), and the **executed** recovery
-outcome — `accept` / `stop-at-offset` / `reject` — produced by *running* the
-extracted C++ reader over the bytes just written (never by reading the spec).
+`MANIFEST.json` records size, whole-file `fp64`, and the proxy recovery outcome
+(`accept`, `stop-at-offset`, or `reject`) for every generated sample.
 Log entries also carry the recovered record list; checkpoint entries carry
 version / header length / recovered user-data size.
 
@@ -327,9 +326,9 @@ to what was recorded — the hash-compare the plan allows in place of checking t
 binaries in. Large checkpoints additionally record `statePattern:"ramp"` +
 `stateLen`, so their user state is reproducible from the manifest alone.
 
-Consumers (the Phase 3b/3c Rust tests) run `--storage` into a scratch directory
-first; CI already builds `golden-gen`, so this costs nothing there. CI diffs the
-MANIFEST and runs `--verify-storage` as a reverse-interop self-check.
+Portable Rust tests can run `--storage` into a scratch directory and compare the
+manifest. These tests complement rather than replace Windows mixed-language
+tests.
 
 ## Not covered (see the plan)
 
