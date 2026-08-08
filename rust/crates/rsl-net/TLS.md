@@ -219,7 +219,7 @@ Set `compat_tls12_only = false` once every replica is Rust to allow TLS 1.3 as
 well. A C++ replica cannot negotiate it, so a mixed fleet keeps landing on 1.2
 regardless — the flag costs nothing to leave on.
 
-## Interop, and what is *not* proven
+## Interoperability
 
 `golden-gen --tls-peer` / `--tls-client` is an RSL packet peer over **OpenSSL**,
 built when CMake finds libssl. `tests/tls_interop.rs` drives both directions:
@@ -233,48 +233,32 @@ round trip on top. It has already earned its keep: it caught a malformed
 `subject` is the Name's *contents*, without the SEQUENCE header) that two rustls
 peers ignore and OpenSSL rejects outright.
 
-**What this does not prove is SChannel compatibility.** SChannel cannot be
-executed on Linux, so no test in this repository speaks to it. The residual
-risk, concretely:
+Authoritative Windows tests in `tests/schannel_interop.rs` run the production
+SChannel/CryptoAPI implementation through `RSLWindowsOracle` in both directions:
 
-| Risk | Why OpenSSL does not cover it | Severity |
-| --- | --- | --- |
-| The simple-display-name algorithm | It is a Windows CryptoAPI function, not a TLS behaviour | **High** for a subject-rule fleet, none for a thumbprint-pinned one |
-| Suite negotiation against SChannel's actual `SCH_USE_STRONG_CRYPTO` set | The list is documented, not observed | Medium — a mismatch is a loud handshake failure, not a silent weakening |
-| Certificate-chain encoding SChannel accepts | OpenSSL is more permissive in places | Low |
-| TLS 1.2 extension handling (renegotiation info, EMS) | Both are conformant; SChannel has historically been stricter | Low |
+- Rust packet client to production C++ server;
+- production C++ packet client to Rust server;
+- Rust learn client to production C++ server;
+- production C++ learn client to Rust server.
 
-### Windows verification checklist
+The matrix uses ephemeral RSA certificates with both client and server EKUs.
+Keys and PFX files live only in a test scratch directory. C++ credentials and
+public peer certificates are installed temporarily in the current user's
+certificate stores and removed on drop; no private key is committed. Tests
+cover thumbprint and simple-display-name authorization, wrong identities,
+enforced-chain rejection versus the production log-only policy, mutual
+authentication failure, TLS on both ports, and the documented A/B rotation
+sequence.
 
-The closure condition for this phase, tracked into Phase 6's interop matrix. Run
-on a Windows host with the C++ RSL built:
+Production SChannel forces TLS 1.2 and `SCH_USE_STRONG_CRYPTO`. The Rust side of
+the authoritative matrix offers only the four suites listed above, so every
+successful connection proves SChannel selected TLS 1.2 from that intersection.
+OpenSSL tests remain supplemental foreign-stack coverage for certificate-chain
+encoding and TLS extension handling on portable CI.
 
-1. **Display names.** Build the certificates from `tests/certs/mod.rs`
-   (`cargo test -p rsl-net --test tls_names -- --nocapture` prints nothing
-   useful on its own; export the DER from the fixture, or re-mint equivalents).
-   For each, call `CertGetNameString(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0,
-   NULL, buf, 256)` and compare against the strings asserted in
-   `tests/tls_names.rs`. Any difference is a `simple_display_name` bug.
-2. **A C++ replica talks to a Rust replica.** Configure a C++ RSL with
-   `SetThumbprintsForSsl(<rust leaf thumbprint>, NULL, true, false)` and a Rust
-   replica pinning the C++ leaf. Confirm the packet port connects, in both
-   directions (each side dials the other).
-3. **The learn port too.** Run a `FetchCheckpoint` between them. This is the
-   path where the C++'s two-predicate bug lives, so confirm the C++ side is
-   configured with thumbprints (not subject names alone) or it will connect in
-   the clear and the Rust side will refuse it — which is the correct outcome and
-   worth seeing.
-4. **The subject rule.** Repeat (2) with `SetSubjectNamesForSsl` on the C++ side
-   and `subject_a` on the Rust side, using a CN that exercises step 1 of the
-   name algorithm.
-5. **Suite negotiation.** Capture the handshake (`netsh trace` or a packet
-   capture) and confirm the negotiated suite is one of the four pinned above.
-6. **Rotation.** Perform a full A/B roll across a mixed C++/Rust pair and
-   confirm no connection drops.
-
-Until 1–6 are done, a mixed-fleet deployment is not supported and the honest
-statement is: *the Rust port implements the documented SChannel trust model and
-interoperates with OpenSSL; it has not been tested against SChannel.*
+The Windows fixture uses CurrentUser stores because CI and developer test
+processes need no elevation. Shipping RSL retains LocalMachine `MY` as its
+default credential store.
 
 ## Cost
 

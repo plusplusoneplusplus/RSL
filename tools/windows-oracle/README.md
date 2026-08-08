@@ -62,6 +62,24 @@ Connection scheduling and callback timing are not part of the protocol
 contract; tests assert payload bytes and lifecycle states rather than callback
 thread order.
 
+Set these environment variables before any packet or learn command to enable
+the production SChannel/CryptoAPI transport:
+
+```powershell
+$env:RSL_TLS_THUMBPRINT_A = "<40 hex SHA-1>"
+$env:RSL_TLS_THUMBPRINT_B = "<optional rotation slot>"
+$env:RSL_TLS_STORE_SCOPE = "LocalMachine" # CurrentUser is test-only
+$env:RSL_TLS_VALIDATE_CHAIN = "yes"
+$env:RSL_TLS_CHECK_REVOCATION = "no"
+$env:RSL_TLS_WHITELIST = "yes"
+```
+
+Optional subject rules use `RSL_TLS_SUBJECT_A/B` and
+`RSL_TLS_PARENT_A/B`. Each parent value is the semicolon-separated issuer
+thumbprint format consumed by production `SSLAuth`. TLS configuration is
+process-global, so each endpoint and each A/B transition runs in a fresh oracle
+process.
+
 ## Artifact policy
 
 Every manifest has a schema version, generator identity, source revision when

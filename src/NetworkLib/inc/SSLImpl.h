@@ -74,6 +74,7 @@ namespace RSLibImpl
         static bool s_bValidateCAChain;
         static bool s_bCheckCertificateRevocation;
         static bool s_considerIdentitiesWhitelist;
+        static DWORD s_certificateStoreLocation;
 
         static BOOL InitializeSChannel();
         static BYTE HexToDec(char ch);
@@ -105,6 +106,7 @@ namespace RSLibImpl
         //static
         static bool HasAnyThumbprint();
         static bool IsSSLEnabled();
+        static void SetCertificateStoreLocation(DWORD location);
         static DWORD SetSSLThumbprints(LPCSTR store, LPCSTR thumbPrintA, LPCSTR thumbPrintB, bool validateCAChain, bool checkCertificateRevocation);
         static DWORD SetSSLSubjectNames(LPCSTR subjectA, LPCSTR thumbPrintsParentA, LPCSTR subjectB, LPCSTR thumbPrintsParentB, bool considerIdentitiesWhitelist);
     };

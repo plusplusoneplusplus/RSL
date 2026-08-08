@@ -5,6 +5,7 @@
 #include "message.h"
 #include "network_oracle.h"
 #include "rsl.h"
+#include "SSLImpl.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -19,6 +20,21 @@ using namespace RSLibImpl;
 
 namespace
 {
+void OracleLogEntry(
+    const char *,
+    const char *,
+    int,
+    int,
+    CallBackLogLevel,
+    const char *title,
+    const char *format,
+    va_list arguments)
+{
+    fprintf(stderr, "RSL_LOG %s: ", title == NULL ? "" : title);
+    vfprintf(stderr, format, arguments);
+    fputc('\n', stderr);
+}
+
 const int kSchemaVersion = 1;
 const char *kGeneratorIdentity = "rsl-windows-production-oracle";
 size_t g_recordCount;
@@ -948,14 +964,144 @@ int SelfTest()
     printf("self-test: production wire and storage paths passed\n");
     return 0;
 }
+
+bool EnvironmentFlag(const char *name, bool defaultValue, bool *valid)
+{
+    char value[16];
+    DWORD length = GetEnvironmentVariableA(name, value, _countof(value));
+    if (length == 0)
+    {
+        return defaultValue;
+    }
+    if (length >= _countof(value))
+    {
+        *valid = false;
+        return defaultValue;
+    }
+    if (_stricmp(value, "yes") == 0 || strcmp(value, "1") == 0 ||
+        _stricmp(value, "true") == 0)
+    {
+        return true;
+    }
+    if (_stricmp(value, "no") == 0 || strcmp(value, "0") == 0 ||
+        _stricmp(value, "false") == 0)
+    {
+        return false;
+    }
+    *valid = false;
+    return defaultValue;
+}
+
+std::string EnvironmentValue(const char *name)
+{
+    DWORD length = GetEnvironmentVariableA(name, NULL, 0);
+    if (length == 0)
+    {
+        return std::string();
+    }
+    std::vector<char> value(length);
+    GetEnvironmentVariableA(name, value.data(), length);
+    return std::string(value.data());
+}
+
+bool ConfigureTls()
+{
+    std::string thumbprintA = EnvironmentValue("RSL_TLS_THUMBPRINT_A");
+    std::string thumbprintB = EnvironmentValue("RSL_TLS_THUMBPRINT_B");
+    if (thumbprintA.empty() && thumbprintB.empty())
+    {
+        return true;
+    }
+
+    bool valid = true;
+    bool validateChain = EnvironmentFlag("RSL_TLS_VALIDATE_CHAIN", true, &valid);
+    bool checkRevocation = EnvironmentFlag("RSL_TLS_CHECK_REVOCATION", false, &valid);
+    bool whitelist = EnvironmentFlag("RSL_TLS_WHITELIST", true, &valid);
+    if (!valid)
+    {
+        fprintf(stderr, "TLS_CONFIG outcome=reject detail=invalid-boolean\n");
+        return false;
+    }
+
+    std::string storeScope = EnvironmentValue("RSL_TLS_STORE_SCOPE");
+    if (_stricmp(storeScope.c_str(), "CurrentUser") == 0)
+    {
+        SSLAuth::SetCertificateStoreLocation(CERT_SYSTEM_STORE_CURRENT_USER);
+    }
+    else if (!storeScope.empty() &&
+             _stricmp(storeScope.c_str(), "LocalMachine") != 0)
+    {
+        fprintf(stderr, "TLS_CONFIG outcome=reject detail=invalid-store-scope\n");
+        return false;
+    }
+
+    if (SSLAuth::SetSSLThumbprints(
+            "MY",
+            thumbprintA.empty() ? NULL : thumbprintA.c_str(),
+            thumbprintB.empty() ? NULL : thumbprintB.c_str(),
+            validateChain,
+            checkRevocation) != ERROR_SUCCESS)
+    {
+        fprintf(stderr, "TLS_CONFIG outcome=reject detail=credential-or-thumbprint\n");
+        return false;
+    }
+
+    std::string subjectA = EnvironmentValue("RSL_TLS_SUBJECT_A");
+    std::string parentA = EnvironmentValue("RSL_TLS_PARENT_A");
+    std::string subjectB = EnvironmentValue("RSL_TLS_SUBJECT_B");
+    std::string parentB = EnvironmentValue("RSL_TLS_PARENT_B");
+    if ((subjectA.empty() != parentA.empty()) ||
+        (subjectB.empty() != parentB.empty()))
+    {
+        fprintf(stderr, "TLS_CONFIG outcome=reject detail=incomplete-subject-rule\n");
+        return false;
+    }
+    if (!subjectA.empty() || !subjectB.empty())
+    {
+        if (SSLAuth::SetSSLSubjectNames(
+                subjectA.empty() ? NULL : subjectA.c_str(),
+                parentA.empty() ? NULL : parentA.c_str(),
+                subjectB.empty() ? NULL : subjectB.c_str(),
+                parentB.empty() ? NULL : parentB.c_str(),
+                whitelist) != ERROR_SUCCESS)
+        {
+            fprintf(stderr, "TLS_CONFIG outcome=reject detail=subject-rule\n");
+            return false;
+        }
+    }
+
+    fprintf(
+        stderr,
+        "TLS_CONFIG outcome=accept store=%s slotA=%s slotB=%s "
+        "chain=%s revocation=%s subjects=%s\n",
+        _stricmp(storeScope.c_str(), "CurrentUser") == 0 ? "CurrentUser" : "LocalMachine",
+        thumbprintA.empty() ? "no" : "yes",
+        thumbprintB.empty() ? "no" : "yes",
+        validateChain ? "enforce" : "log-only",
+        checkRevocation ? "check" : "skip",
+        subjectA.empty() && subjectB.empty() ? "no" : "yes");
+    return true;
+}
 }
 
 int main(int argc, char **argv)
 {
-    if (!RSLInit(NULL))
+    bool tlsRequested =
+        GetEnvironmentVariableA("RSL_TLS_THUMBPRINT_A", NULL, 0) != 0 ||
+        GetEnvironmentVariableA("RSL_TLS_THUMBPRINT_B", NULL, 0) != 0;
+    if (!RSLInit(
+            NULL,
+            false,
+            NULL,
+            tlsRequested ? &OracleLogEntry : NULL))
     {
         fprintf(stderr, "RSLInit failed\n");
         return 1;
+    }
+    if (!ConfigureTls())
+    {
+        RSLUnload();
+        return 4;
     }
 
     int result = 2;
@@ -994,7 +1140,22 @@ int main(int argc, char **argv)
                 waitForDisconnect = strcmp(argv[i + 1], "yes") == 0;
             }
         }
-        result = rsl_oracle::RunNetworkServer(atoi(argv[2]), mode, count, waitForDisconnect);
+        std::string rotateA = EnvironmentValue("RSL_TLS_ROTATE_THUMBPRINT_A");
+        std::string rotateB = EnvironmentValue("RSL_TLS_ROTATE_THUMBPRINT_B");
+        bool valid = true;
+        bool validateChain = EnvironmentFlag("RSL_TLS_VALIDATE_CHAIN", true, &valid);
+        bool checkRevocation = EnvironmentFlag("RSL_TLS_CHECK_REVOCATION", false, &valid);
+        result = valid ?
+            rsl_oracle::RunNetworkServer(
+                atoi(argv[2]),
+                mode,
+                count,
+                waitForDisconnect,
+                rotateA.empty() ? NULL : rotateA.c_str(),
+                rotateB.empty() ? NULL : rotateB.c_str(),
+                validateChain,
+                checkRevocation) :
+            2;
     }
     else if (argc >= 4 && strcmp(argv[1], "--net-client") == 0)
     {

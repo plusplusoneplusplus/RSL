@@ -16,6 +16,7 @@ use rcgen::{
     DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     RevokedCertParams, SerialNumber,
 };
+use rsa::pkcs8::EncodePrivateKey;
 use rsl_net::tls::{CertificateDer, CertificateRevocationListDer, Identity, Thumbprint};
 
 /// The date type rcgen's validity fields use.
@@ -47,6 +48,7 @@ pub struct LeafSpec {
     pub not_after: Date,
     /// The serial, so the CA can revoke it later.
     pub serial: u64,
+    pub rsa: bool,
 }
 
 impl Default for LeafSpec {
@@ -62,6 +64,7 @@ impl Default for LeafSpec {
             not_before: rcgen::date_time_ymd(2020, 1, 1),
             not_after: rcgen::date_time_ymd(4096, 1, 1),
             serial: 1,
+            rsa: false,
         }
     }
 }
@@ -89,6 +92,11 @@ impl LeafSpec {
 
     pub fn with_serial(mut self, serial: u64) -> LeafSpec {
         self.serial = serial;
+        self
+    }
+
+    pub fn rsa(mut self) -> LeafSpec {
+        self.rsa = true;
         self
     }
 }
@@ -142,7 +150,16 @@ impl Ca {
     /// [`LeafSpec`] describes — the way to build a DN with a repeated
     /// attribute type, which is what pins the "most specific wins" rule.
     pub fn issue_with_dn(&self, spec: LeafSpec, extra: &[(DnType, &str)]) -> Leaf {
-        let key = KeyPair::generate().expect("keygen");
+        let key = if spec.rsa {
+            let private =
+                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("RSA keygen");
+            let der = private.to_pkcs8_der().expect("encode RSA PKCS#8");
+            let pkcs8 = rustls_pki_types::PrivatePkcs8KeyDer::from(der.as_bytes());
+            KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &rcgen::PKCS_RSA_SHA256)
+                .expect("rcgen RSA key")
+        } else {
+            KeyPair::generate().expect("keygen")
+        };
         let mut params = CertificateParams::default();
         let mut attrs: Vec<(DnType, &str)> = Vec::new();
         if let Some(cn) = &spec.common_name {
@@ -230,6 +247,10 @@ impl Leaf {
     /// chain `identity()` builds.
     pub fn cert_pem(&self) -> String {
         format!("{}{}", self.cert_pem, self.ca_pem)
+    }
+
+    pub fn leaf_pem(&self) -> String {
+        self.cert_pem.clone()
     }
 
     pub fn key_pem(&self) -> String {

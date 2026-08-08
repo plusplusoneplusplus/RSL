@@ -82,6 +82,7 @@ rcgen = { version = "0.14", default-features = false, features = [
     "pem",
     "x509-parser",
 ] }
+rsa = "0.9"
 
 [[bench]]
 name = "framing"

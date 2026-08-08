@@ -2,6 +2,7 @@
 
 #include "NetPacket.h"
 #include "NetPacketSvc.h"
+#include "SSLImpl.h"
 
 #include <winsock2.h>
 
@@ -104,6 +105,7 @@ namespace
             m_destroySentPackets(destroySentPackets),
             m_received(0),
             m_sent(0),
+            m_successfulSent(0),
             m_connected(false),
             m_disconnected(false),
             m_failed(false),
@@ -133,9 +135,21 @@ namespace
         {
             EnterCriticalSection(&m_lock);
             ++m_sent;
-            if (status != TxSuccess)
+            if (status == TxSuccess)
             {
-                m_failed = true;
+                ++m_successfulSent;
+                if (m_received >= m_expected && m_successfulSent >= m_expected)
+                {
+                    m_failed = false;
+                }
+            }
+            if (status == TxNoConnection || status == TxAbort)
+            {
+                if (m_successfulSent < m_expected)
+                {
+                    m_failed = true;
+                    fprintf(stderr, "NETWORK_FAILURE callback=send status=%d\n", status);
+                }
             }
             if (!m_destroySentPackets)
             {
@@ -171,6 +185,7 @@ namespace
                     m_factory->DestroyPacket(packet);
                     EnterCriticalSection(&m_lock);
                     m_failed = true;
+                    fprintf(stderr, "NETWORK_FAILURE callback=echo-send status=%d\n", status);
                     LeaveCriticalSection(&m_lock);
                     SetEvent(m_done);
                 }
@@ -195,6 +210,16 @@ namespace
             else if (state == DisConnected || state == ConnectFailed)
             {
                 m_disconnected = true;
+                if (state == ConnectFailed || m_received < m_expected)
+                {
+                    m_failed = true;
+                    fprintf(
+                        stderr,
+                        "NETWORK_FAILURE callback=connect state=%d received=%d expected=%d\n",
+                        state,
+                        m_received,
+                        m_expected);
+                }
             }
             LeaveCriticalSection(&m_lock);
 
@@ -303,7 +328,7 @@ namespace
             EnterCriticalSection(&m_lock);
             bool completed =
                 m_received >= m_expected &&
-                (!m_echo || m_sent >= m_received) &&
+                (!m_echo || m_successfulSent >= m_received) &&
                 (!m_waitForDisconnect || m_disconnected);
             LeaveCriticalSection(&m_lock);
             if (completed)
@@ -320,6 +345,7 @@ namespace
         bool m_destroySentPackets;
         int m_received;
         int m_sent;
+        int m_successfulSent;
         bool m_connected;
         bool m_disconnected;
         bool m_failed;
@@ -351,7 +377,15 @@ namespace
     }
 }
 
-int RunNetworkServer(int port, const char *mode, int count, bool waitForDisconnect)
+int RunNetworkServer(
+    int port,
+    const char *mode,
+    int count,
+    bool waitForDisconnect,
+    const char *rotateThumbprintA,
+    const char *rotateThumbprintB,
+    bool validateChain,
+    bool checkRevocation)
 {
     if (count < 0 || (strcmp(mode, "echo") != 0 && strcmp(mode, "log") != 0))
     {
@@ -393,7 +427,27 @@ int RunNetworkServer(int port, const char *mode, int count, bool waitForDisconne
     printf("PORT %d\n", port);
     fflush(stdout);
 
+    bool rotated = true;
+    if (rotateThumbprintA != NULL)
+    {
+        std::string firstPayload;
+        rotated =
+            handler.WaitReceive(&firstPayload) &&
+            SSLAuth::SetSSLThumbprints(
+                "MY",
+                rotateThumbprintA,
+                rotateThumbprintB,
+                validateChain,
+                checkRevocation) == ERROR_SUCCESS;
+        fprintf(
+            stderr,
+            "TLS_ROTATE outcome=%s slotA=yes slotB=%s\n",
+            rotated ? "accept" : "reject",
+            rotateThumbprintB == NULL ? "no" : "yes");
+    }
     bool completed = handler.WaitDone();
+    Sleep(100);
+    bool failed = handler.Failed();
     service.Stop();
 
     std::vector<std::string> payloads = handler.Payloads();
@@ -406,7 +460,7 @@ int RunNetworkServer(int port, const char *mode, int count, bool waitForDisconne
         handler.Received(),
         handler.Sent(),
         waitForDisconnect ? "yes" : "not-required");
-    return completed && !handler.Failed() ? 0 : 1;
+    return completed && rotated && !failed ? 0 : 1;
 }
 
 int RunNetworkClient(

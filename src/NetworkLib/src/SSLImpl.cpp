@@ -28,6 +28,7 @@ namespace RSLibImpl
     bool SSLAuth::s_bValidateCAChain = true;
     bool SSLAuth::s_bCheckCertificateRevocation = true;
     bool SSLAuth::s_considerIdentitiesWhitelist = true;
+    DWORD SSLAuth::s_certificateStoreLocation = CERT_SYSTEM_STORE_LOCAL_MACHINE;
 
     SSLAuth::SSLAuth()
     {
@@ -332,6 +333,26 @@ namespace RSLibImpl
         OutputDebugString("Cert is trusted, connected\r\n");
 
         hr = s_pSSPIfnTbl->QueryContextAttributes(&m_ctxtHandle, SECPKG_ATTR_STREAM_SIZES, &m_secStreamSizes);
+
+        SecPkgContext_ConnectionInfo connectionInfo;
+        ZeroMemory(&connectionInfo, sizeof(connectionInfo));
+        if (SUCCEEDED(s_pSSPIfnTbl->QueryContextAttributes(
+                &m_ctxtHandle,
+                SECPKG_ATTR_CONNECTION_INFO,
+                &connectionInfo)))
+        {
+            Log(
+                LogID_Netlib,
+                LogLevel_Status,
+                "TLS negotiated",
+                LogTag_UInt1,
+                connectionInfo.dwProtocol,
+                LogTag_UInt2,
+                connectionInfo.aiCipher,
+                LogTag_Int1,
+                connectionInfo.dwCipherStrength,
+                LogTag_End);
+        }
 
         return S_OK;
     }
@@ -815,7 +836,12 @@ namespace RSLibImpl
                 return NULL;
             }
 
-        HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0, CERT_SYSTEM_STORE_LOCAL_MACHINE, Lstore);
+        HCERTSTORE hStore = CertOpenStore(
+            CERT_STORE_PROV_SYSTEM,
+            0,
+            0,
+            s_certificateStoreLocation,
+            Lstore);
 
         PCCERT_CONTEXT pCertCtx = NULL;
         for (
@@ -992,8 +1018,8 @@ namespace RSLibImpl
 
         if(SSLAuth::s_scServerCredHandleValid)
         {
-            s_pSSPIfnTbl->FreeCredentialsHandle(&SSLAuth::s_scClientCredHandle);
-            ZeroMemory(&SSLAuth::s_scClientCredHandle, sizeof(SSLAuth::s_scClientCredHandle));
+            s_pSSPIfnTbl->FreeCredentialsHandle(&SSLAuth::s_scServerCredHandle);
+            ZeroMemory(&SSLAuth::s_scServerCredHandle, sizeof(SSLAuth::s_scServerCredHandle));
             SSLAuth::s_scServerCredHandleValid = false;
         }
         
@@ -1051,6 +1077,14 @@ namespace RSLibImpl
     bool SSLAuth::IsSSLEnabled()
     {
         return SSLAuth::s_bSslEnabled;
+    }
+
+    void SSLAuth::SetCertificateStoreLocation(DWORD location)
+    {
+        LogAssert(
+            location == CERT_SYSTEM_STORE_LOCAL_MACHINE ||
+            location == CERT_SYSTEM_STORE_CURRENT_USER);
+        s_certificateStoreLocation = location;
     }
 
     BOOL SSLAuth::InitializeSChannel()
@@ -1251,4 +1285,3 @@ namespace RSLibImpl
         return hr;
     }
 }
-
