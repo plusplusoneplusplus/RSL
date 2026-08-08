@@ -1,9 +1,8 @@
-// packet_min.cpp -- see packet_min.h.
+// packet_model.cpp -- see packet_model.h.
 //
-// The class methods are copied verbatim from src/NetworkLib/src/NetPacket.cpp
-// (line-cited); the free functions are ports that keep every decision and byte
-// but swap NetBuffer/BufferPool/StreamSocket for plain buffers, the same way
-// storage_min.cpp treats the storage I/O paths.
+// Selected framing methods are copied and line-cited. Free functions model the
+// receive decisions with plain buffers/POSIX sockets; they do not execute
+// production NetBuffer, NetCxn, NetPacketSvc, or IOCP.
 
 // System headers first (the compat windows.h shim collides with the POSIX
 // headers if it is included first -- same ordering rule as main.cpp).
@@ -16,7 +15,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "packet_min.h"
+#include "packet_model.h"
 
 #include "marshal.h"
 #include "utils.h"
@@ -26,9 +25,9 @@
 // callers below always pass a >= SerialLen buffer, and this tool must report
 // rather than abort).
 //
-// The golden-gen binary does not link NetPacket.cpp, so we provide the
+// The rsl-linux-proxy binary does not link NetPacket.cpp, so we provide the
 // PacketHdr method bodies here.  The class itself now lives in PacketHdr.h
-// (RSLibImpl namespace); the `using` in packet_min.h brings it into
+// (RSLibImpl namespace); the `using` in packet_model.h brings it into
 // rsl_packet.
 // ---------------------------------------------------------------------------
 namespace RSLibImpl
@@ -64,7 +63,7 @@ bool PacketHdr::Serialize(void* buffer, UInt32 bufferLength)
 
 bool PacketHdr::Serialize(NetBuffer*)
 {
-    // Unused in the golden-gen slice; the full implementation lives in
+    // Unused in the rsl-linux-proxy slice; the full implementation lives in
     // NetPacket.cpp and depends on NetBuffer.
     return false;
 }
@@ -268,8 +267,8 @@ ScanResult ScanPackets(const char* data, size_t len, UInt32 maxSize, UInt32 maxA
 
 // Message::ReadFromSocket -- message.cpp:639-689, with StreamSocket::Read
 // replaced by a cursor over `data`. StreamSocket::Read fills the whole request
-// or reports bytesRead < requested; both are rejected identically there, so a
-// short buffer here maps to the same `bytesRead != requested` branch.
+// or reports bytesRead < requested. A short model buffer maps to that documented
+// rejection branch.
 LearnResult ReadMessage(const char* data, size_t len, UInt32 maxMessageSize, Message* out)
 {
     LearnResult res;
@@ -375,8 +374,7 @@ bool WriteAll(int fd, const char* data, size_t len)
     return true;
 }
 
-// NetPacket framing: consume whole packets out of `buf` with the real C++ path.
-// Returns false when the connection must be closed (the C++ CloseConnection).
+// Ported NetPacket receive model. Returns false when the model closes the link.
 bool ServePackets(int fd, std::vector<char>* buf, bool echo, int* packetCount)
 {
     ScanResult r = ScanPackets(buf->data(), buf->size(), 0, 0);

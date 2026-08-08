@@ -1,5 +1,5 @@
 {
-  "generator": "golden-gen --storage (Phase 3a)",
+  "generator": "rsl-linux-proxy --storage (supplemental model)",
   "pageSize": 512,
   "checksumBlockSize": 4194304,
   "checksumSize": 8,

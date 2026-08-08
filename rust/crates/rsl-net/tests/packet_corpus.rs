@@ -1,6 +1,6 @@
-//! Phase-4a `PACKET` corpus: every byte stream the C++ receive path was run
-//! over must produce the same decision here — and every accepted packet must be
-//! re-encodable to the exact bytes the C++ produced.
+//! Supplemental `PACKET` corpus: every byte stream run through the Linux
+//! receive model must produce the same model decision here, and every accepted
+//! packet must re-encode to the reference bytes.
 
 mod common;
 
@@ -9,7 +9,7 @@ use std::io::Cursor;
 use rsl_net::framing::packet::{self, FrameError, Packets};
 use rsl_net::{Limits, ReadError};
 
-/// Replay one vector through the streaming decoder, returning the C++'s outcome
+/// Replay one vector through the streaming decoder, returning the model's outcome
 /// vocabulary plus what was decoded.
 fn replay(bytes: &[u8], limits: Limits) -> (String, usize, Vec<Vec<u8>>, Option<FrameError>) {
     let mut packets = Packets::new(bytes, limits);
@@ -49,7 +49,7 @@ fn every_packet_vector_matches_the_cpp_decision() {
         assert_eq!(consumed, vector.consumed, "{}: consumed", vector.desc);
         assert_eq!(payloads, vector.payloads, "{}: payloads", vector.desc);
 
-        // The reject reason is reported in the C++'s own wording, so the whole
+        // The reject reason is reported in the model's wording, so the whole
         // string is comparable (the corpus may prefix an alert note).
         if let Some(error) = error {
             let rendered = error.to_string();
@@ -93,7 +93,7 @@ fn the_alert_threshold_logs_but_never_rejects() {
         let limits = Limits::from_raw(vector.max_size, vector.max_alert);
         let alerted = vector.detail.contains("alert:");
         if alerted {
-            // The C++ alerted, so this vector must be over the threshold here
+            // The model alerted, so this vector must be over the threshold here
             // too — and must still have been accepted.
             let hdr = packet::PacketHdr::decode(&vector.bytes).expect("header");
             assert!(limits.alerts_on(hdr.size), "{}: alert", vector.desc);
@@ -152,8 +152,8 @@ fn the_blocking_reader_agrees_with_the_streaming_decoder() {
     }
 }
 
-/// Corpus messages framed by this crate must be byte-identical to the C++'s
-/// frames for the same payload — the send direction of the interop.
+/// Corpus messages framed by this crate must match the model reference frames
+/// for the same payload.
 #[test]
 fn framing_a_corpus_message_reproduces_the_cpp_frame() {
     let (packets, _, messages) = common::load();

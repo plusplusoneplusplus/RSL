@@ -1,10 +1,9 @@
-//! `rsl-wire` — a byte-exact, pure-Rust port of the RSL Paxos wire format.
+//! `rsl-wire` — a pure-Rust implementation of the RSL Paxos wire format.
 //!
-//! This crate reads and writes every RSL message identically to the original
-//! C++ (`src/common/src/marshal.cpp`, `src/common/src/msn_fprint.cpp`,
-//! `src/RSL/src/message.cpp`), proven against the golden corpus emitted by
-//! `tools/golden-gen`. It performs zero I/O, contains zero `unsafe`, and has no
-//! runtime dependencies.
+//! Production-Windows compatibility is tested against `RSLWindowsOracle`
+//! artifacts. `tools/linux-proxy` supplies supplemental deterministic vectors.
+//! The crate performs zero I/O, contains zero `unsafe`, and has no runtime
+//! dependencies.
 //!
 //! ## Layout
 //! * [`fprint`] — Rabin-64 fingerprint (the message checksum).
@@ -20,8 +19,8 @@
 //!
 //! ## Differential-fuzzer whitelist (intentional divergences from C++)
 //!
-//! For every byte the writer emits for representable messages, and for
-//! accept/reject on well-formed input, this crate matches the C++ observably.
+//! For representable messages and covered well-formed inputs, production-oracle
+//! and proxy vectors constrain the observable encoding.
 //! The known exceptions are inputs where the C++ `LogAssert`-**aborts** the
 //! whole process; there the Rust stays safe (accepts or cleanly rejects)
 //! instead of crashing. A future C++-vs-Rust differential fuzzer (Phase 4/6)

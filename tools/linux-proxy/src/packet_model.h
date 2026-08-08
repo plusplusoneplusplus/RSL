@@ -1,4 +1,4 @@
-// packet_min.h -- Phase-4a extract of the RSL wire *framing* layer.
+// Supplemental Linux model of RSL packet and learn framing.
 //
 // Two independent framings live in the original code, and this header exposes
 // both over plain byte buffers (no IOCP, no BufferPool, no sockets in the core
@@ -15,10 +15,8 @@
 //      rest of the read.
 //      Source: Message::ReadFromSocket, src/RSL/src/message.cpp:639.
 //
-// As with storage_min.h (Phase 3a), the *decisions* are copied verbatim and
-// line-cited; only the buffer plumbing is replaced (NetBuffer/Buffer pool ->
-// std::vector<char>, StreamSocket -> a byte cursor). The bytes produced and
-// consumed, and every accept/reject outcome, are unchanged.
+// Decision branches are line-cited, but buffer/socket plumbing and surrounding
+// lifecycle are modeled. Outcomes are supplemental proxy results.
 #pragma once
 
 #include <string>
@@ -142,7 +140,7 @@ LearnResult ReadMessage(const char* data, size_t len, UInt32 maxMessageSize, Mes
 // returns. The chosen port is printed to stdout as "PORT <n>\n" and flushed
 // before the accept, so a test harness can start it without a fixed port.
 //
-//   echo       -- NetPacket framing: read packets with the real C++ path and
+//   echo       -- read packets with the Linux receive model and
 //                 write each accepted payload back as a freshly serialized packet.
 //   log        -- NetPacket framing: read and report, never respond.
 //   fetch-stub -- learn-port framing: read one Message with the real

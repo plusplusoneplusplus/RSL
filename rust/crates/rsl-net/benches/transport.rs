@@ -3,9 +3,8 @@
 //! Two peers are measured. The **Rust** peer is a full `PacketSvc` server that
 //! echoes each packet back down the accepted connection, so a round trip covers
 //! both services completely — dial, frame, write, decode, callback, and the
-//! same again in reverse. The **C++** peer is `golden-gen --packet-peer echo`,
-//! the extracted original receive path over a real socket; benchmarking against
-//! it says whether this port pays a price the original did not.
+//! same again in reverse. The optional peer is the Linux packet model over a
+//! real socket; it is a portable comparison point, not a production benchmark.
 //!
 //! Round trips go over loopback TCP, so absolute numbers include the kernel;
 //! what is worth reading is the shape across sizes and the gap between the two
@@ -120,8 +119,8 @@ fn rust_stack(runtime: &Runtime) -> Stack {
     }
 }
 
-/// The C++ peer, if it has been built.
-fn cpp_stack(runtime: &Runtime) -> Option<Stack> {
+/// The Linux proxy peer, if it has been built.
+fn proxy_stack(runtime: &Runtime) -> Option<Stack> {
     let child = PeerProcess::start()?;
     let peer = child.addr;
     let _guard = runtime.enter();
@@ -143,15 +142,10 @@ struct PeerProcess {
 
 impl PeerProcess {
     fn start() -> Option<PeerProcess> {
-        let binary = std::env::var_os("RSL_GOLDEN_GEN")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                Some(
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../../tools/golden-gen/build/golden-gen"),
-                )
-            })
-            .filter(|path| path.is_file())?;
+        let binary = Self::proxy_binary()?;
+        if !binary.is_file() {
+            return None;
+        }
 
         let mut child = Command::new(binary)
             .args(["--packet-peer", "0", "--mode", "echo"])
@@ -167,6 +161,21 @@ impl PeerProcess {
             child,
             addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
         })
+    }
+
+    fn proxy_binary() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("RSL_LINUX_PROXY") {
+            return Some(std::path::PathBuf::from(path));
+        }
+        #[cfg(unix)]
+        {
+            Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../tools/linux-proxy/build/rsl-linux-proxy"),
+            )
+        }
+        #[cfg(not(unix))]
+        None
     }
 }
 
@@ -186,9 +195,9 @@ fn round_trip(c: &mut Criterion) {
     let mut group = c.benchmark_group("svc/round_trip");
 
     let mut rust = rust_stack(&runtime);
-    let mut cpp = cpp_stack(&runtime);
-    if cpp.is_none() {
-        eprintln!("svc/round_trip: no golden-gen binary; skipping the C++ peer");
+    let mut proxy = proxy_stack(&runtime);
+    if proxy.is_none() {
+        eprintln!("svc/round_trip: no rsl-linux-proxy binary; skipping the proxy peer");
     }
 
     for size in SIZES {
@@ -202,10 +211,10 @@ fn round_trip(c: &mut Criterion) {
             b.iter(|| rust.round_trip(&runtime, &payload))
         });
 
-        if let Some(cpp) = cpp.as_mut() {
-            let payload = packet(cpp.peer, size);
-            group.bench_with_input(BenchmarkId::new("cpp_peer", size), &size, |b, _| {
-                b.iter(|| cpp.round_trip(&runtime, &payload))
+        if let Some(proxy) = proxy.as_mut() {
+            let payload = packet(proxy.peer, size);
+            group.bench_with_input(BenchmarkId::new("linux_proxy", size), &size, |b, _| {
+                b.iter(|| proxy.round_trip(&runtime, &payload))
             });
         }
     }
@@ -218,7 +227,7 @@ fn throughput(c: &mut Criterion) {
     group.sample_size(20);
 
     let mut rust = rust_stack(&runtime);
-    let mut cpp = cpp_stack(&runtime);
+    let mut proxy = proxy_stack(&runtime);
 
     for size in SIZES {
         let n = (THROUGHPUT_BUDGET / size).max(1);
@@ -229,10 +238,10 @@ fn throughput(c: &mut Criterion) {
             b.iter(|| rust.pipeline(&runtime, &payload, n))
         });
 
-        if let Some(cpp) = cpp.as_mut() {
-            let payload = packet(cpp.peer, size);
-            group.bench_with_input(BenchmarkId::new("cpp_peer", size), &size, |b, _| {
-                b.iter(|| cpp.pipeline(&runtime, &payload, n))
+        if let Some(proxy) = proxy.as_mut() {
+            let payload = packet(proxy.peer, size);
+            group.bench_with_input(BenchmarkId::new("linux_proxy", size), &size, |b, _| {
+                b.iter(|| proxy.pipeline(&runtime, &payload, n))
             });
         }
     }

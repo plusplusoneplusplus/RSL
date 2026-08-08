@@ -1,4 +1,4 @@
-// Logging stub for the golden-gen Linux slice.
+// Logging stub for the rsl-linux-proxy Linux slice.
 //
 // The real logging.cpp (~2.6k lines, SEH/minidump) is deliberately NOT ported.
 // This header satisfies the handful of logging macros the marshal/message code

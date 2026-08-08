@@ -1,8 +1,8 @@
 //! Portable learn-port proxy interop in both directions.
 //!
-//! `golden-gen --learn-server` runs the extracted `HandleFetchRequest` /
+//! `rsl-linux-proxy --learn-server` runs the ported `HandleFetchRequest` /
 //! `SendFile` paths over a real socket, serving a data directory this test
-//! built with `rsl-storage`; `golden-gen --learn-client` runs the extracted
+//! built with `rsl-storage`; `rsl-linux-proxy --learn-client` runs the ported
 //! `ReadNextMessage` / checkpoint-copy loops against the Rust server. Between
 //! them, every byte of every one of the three protocols crosses the boundary in
 //! both directions and is checked against what the files on disk actually say.
@@ -20,7 +20,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use learnfixture::{golden_gen, warn_no_peer, write_checkpoint, write_log, StubStatus, TempDir};
+use learnfixture::{linux_proxy, warn_no_peer, write_checkpoint, write_log, StubStatus, TempDir};
 use rsl_net::learnport::{
     DirSource, LearnClient, LearnConfig, LearnServer, Requester, TransferError,
 };
@@ -36,26 +36,26 @@ fn ballot() -> BallotNumber {
 }
 
 // ---------------------------------------------------------------------------
-// The C++ server
+// The Linux proxy server
 // ---------------------------------------------------------------------------
 
-/// A spawned `golden-gen --learn-server`, killed on drop.
-struct CppServer {
+/// A spawned `rsl-linux-proxy --learn-server`, killed on drop.
+struct ProxyServer {
     child: Child,
     addr: SocketAddr,
 }
 
-impl CppServer {
+impl ProxyServer {
     /// Serve `dir` for `connections` sequential requests.
-    fn start(dir: &TempDir, connections: usize) -> Option<CppServer> {
-        let binary = golden_gen()?;
+    fn start(dir: &TempDir, connections: usize) -> Option<ProxyServer> {
+        let binary = linux_proxy()?;
         let mut child = Command::new(binary)
             .args(["--learn-server", "0", "--dir"])
             .arg(dir.path())
             .args(["--connections", &connections.to_string()])
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn golden-gen learn server");
+            .expect("spawn rsl-linux-proxy learn server");
 
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut line = String::new();
@@ -67,7 +67,7 @@ impl CppServer {
             .parse()
             .expect("port number");
 
-        Some(CppServer {
+        Some(ProxyServer {
             child,
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         })
@@ -75,11 +75,14 @@ impl CppServer {
 
     fn finish(mut self) {
         let status = self.child.wait().expect("wait for server");
-        assert!(status.success(), "C++ learn server exited with {status}");
+        assert!(
+            status.success(),
+            "Linux proxy learn server exited with {status}"
+        );
     }
 }
 
-impl Drop for CppServer {
+impl Drop for ProxyServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -87,17 +90,17 @@ impl Drop for CppServer {
 }
 
 // ---------------------------------------------------------------------------
-// The C++ client
+// The Linux proxy client
 // ---------------------------------------------------------------------------
 
-/// Run `golden-gen --learn-client` against `addr` and return its stdout lines.
-fn cpp_client(addr: SocketAddr, args: &[&str]) -> Option<Vec<String>> {
-    let binary = golden_gen()?;
+/// Run `rsl-linux-proxy --learn-client` against `addr` and return its stdout lines.
+fn proxy_client(addr: SocketAddr, args: &[&str]) -> Option<Vec<String>> {
+    let binary = linux_proxy()?;
     let output = Command::new(binary)
         .args(["--learn-client", "127.0.0.1", &addr.port().to_string()])
         .args(args)
         .output()
-        .expect("run golden-gen learn client");
+        .expect("run rsl-linux-proxy learn client");
     Some(
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -141,20 +144,20 @@ fn a_data_dir(name: &str) -> TempDir {
 }
 
 // ---------------------------------------------------------------------------
-// Direction A: the C++ serves, Rust fetches
+// Direction A: the Linux proxy serves, Rust fetches
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn rust_fetches_votes_from_the_cpp_server() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("rust_fetches_votes_from_the_cpp_server");
+async fn rust_fetches_votes_from_the_linux_proxy_server() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("rust_fetches_votes_from_the_linux_proxy_server");
         return;
     };
     let dir = a_data_dir("interop-a-votes");
 
     // One connection per request: the protocol is one-shot.
     for from in [100u64, 102, 103, 104, 106] {
-        let server = CppServer::start(&dir, 1).expect("start C++ server");
+        let server = ProxyServer::start(&dir, 1).expect("start Linux proxy server");
         let mut stream = LearnClient::new()
             .fetch_votes(server.addr, &requester().fetch_votes(from, ballot()))
             .await
@@ -168,16 +171,16 @@ async fn rust_fetches_votes_from_the_cpp_server() {
         assert_eq!(
             got,
             expected_records(&dir, from),
-            "records served by the C++ from decree {from}"
+            "records served by the Linux proxy from decree {from}"
         );
         server.finish();
     }
 }
 
 #[tokio::test]
-async fn rust_fetches_a_checkpoint_from_the_cpp_server() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("rust_fetches_a_checkpoint_from_the_cpp_server");
+async fn rust_fetches_a_checkpoint_from_the_linux_proxy_server() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("rust_fetches_a_checkpoint_from_the_linux_proxy_server");
         return;
     };
     let source = TempDir::new("interop-a-cp-src");
@@ -190,7 +193,7 @@ async fn rust_fetches_a_checkpoint_from_the_cpp_server() {
 
     // Two connections: a status query to learn the size, then the fetch — which
     // is exactly the sequence the engine runs (legislator.cpp:1396-1408).
-    let server = CppServer::start(&source, 2).expect("start C++ server");
+    let server = ProxyServer::start(&source, 2).expect("start Linux proxy server");
     let client = LearnClient::new();
 
     let status = client
@@ -200,7 +203,7 @@ async fn rust_fetches_a_checkpoint_from_the_cpp_server() {
     assert_eq!(status.checkpointed_decree, 500);
     assert_eq!(
         status.checkpoint_size, size,
-        "the C++ reports the file size"
+        "the Linux proxy reports the file size"
     );
     assert_eq!(status.min_decree_in_log, 100);
 
@@ -218,7 +221,7 @@ async fn rust_fetches_a_checkpoint_from_the_cpp_server() {
     assert_eq!(
         std::fs::read(&fetched.path).expect("read copy"),
         std::fs::read(source.join("500.codex")).expect("read source"),
-        "the copy must be byte-identical to what the C++ served"
+        "the copy must be byte-identical to what the Linux proxy served"
     );
     assert!(rsl_storage::checkpoint::verify_file(&fetched.path)
         .expect("verify")
@@ -226,20 +229,20 @@ async fn rust_fetches_a_checkpoint_from_the_cpp_server() {
     server.finish();
 }
 
-/// The negative case the wire cannot express: a decree the C++ does not have
+/// The negative case the wire cannot express: a decree the Linux proxy does not have
 /// produces a close with no bytes at all.
 #[tokio::test]
-async fn the_cpp_server_closes_silently_on_an_unknown_decree() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("the_cpp_server_closes_silently_on_an_unknown_decree");
+async fn the_linux_proxy_server_closes_silently_on_an_unknown_decree() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("the_linux_proxy_server_closes_silently_on_an_unknown_decree");
         return;
     };
     let dir = a_data_dir("interop-a-missing");
     // A checkpoint *does* exist — at 500, not at the 42 asked for below. The
-    // C++ compares against its own checkpointed decree and nothing else.
+    // The model compares against its configured checkpointed decree.
     let size = write_checkpoint(dir.path(), 500, b"state");
 
-    let server = CppServer::start(&dir, 2).expect("start C++ server");
+    let server = ProxyServer::start(&dir, 2).expect("start Linux proxy server");
     let client = LearnClient::new();
 
     let mut stream = client
@@ -248,7 +251,7 @@ async fn the_cpp_server_closes_silently_on_an_unknown_decree() {
         .expect("connect");
     assert!(
         stream.next().await.expect("clean close").is_none(),
-        "the C++ answered a decree it does not have"
+        "the Linux proxy answered a decree it does not have"
     );
 
     // Same for a checkpoint decree that is not *the* checkpointed one.
@@ -266,7 +269,7 @@ async fn the_cpp_server_closes_silently_on_an_unknown_decree() {
 }
 
 // ---------------------------------------------------------------------------
-// Direction B: Rust serves, the C++ fetches
+// Direction B: Rust serves, the Linux proxy fetches
 // ---------------------------------------------------------------------------
 
 async fn rust_server(dir: &TempDir, status: StubStatus) -> LearnServer {
@@ -280,9 +283,9 @@ async fn rust_server(dir: &TempDir, status: StubStatus) -> LearnServer {
 }
 
 #[tokio::test]
-async fn the_cpp_client_reads_votes_from_the_rust_server() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("the_cpp_client_reads_votes_from_the_rust_server");
+async fn the_proxy_client_reads_votes_from_the_rust_server() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("the_proxy_client_reads_votes_from_the_rust_server");
         return;
     };
     let dir = a_data_dir("interop-b-votes");
@@ -292,7 +295,7 @@ async fn the_cpp_client_reads_votes_from_the_rust_server() {
     for from in [100u64, 103, 106] {
         let expected = expected_records(&dir, from);
         let lines = tokio::task::spawn_blocking(move || {
-            cpp_client(addr, &["--mode", "votes", "--decree", &from.to_string()])
+            proxy_client(addr, &["--mode", "votes", "--decree", &from.to_string()])
         })
         .await
         .expect("join")
@@ -309,7 +312,10 @@ async fn the_cpp_client_reads_votes_from_the_rust_server() {
                 )
             })
             .collect();
-        assert_eq!(votes, expected, "C++ client reading from decree {from}");
+        assert_eq!(
+            votes, expected,
+            "Linux proxy client reading from decree {from}"
+        );
         assert!(
             lines
                 .iter()
@@ -320,9 +326,9 @@ async fn the_cpp_client_reads_votes_from_the_rust_server() {
 }
 
 #[tokio::test]
-async fn the_cpp_client_reads_status_and_a_checkpoint_from_the_rust_server() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("the_cpp_client_reads_status_and_a_checkpoint_from_the_rust_server");
+async fn the_proxy_client_reads_status_and_a_checkpoint_from_the_rust_server() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("the_proxy_client_reads_status_and_a_checkpoint_from_the_rust_server");
         return;
     };
     let dir = TempDir::new("interop-b-cp");
@@ -340,7 +346,7 @@ async fn the_cpp_client_reads_status_and_a_checkpoint_from_the_rust_server() {
     .await;
     let addr = server.local_addr();
 
-    let lines = tokio::task::spawn_blocking(move || cpp_client(addr, &["--mode", "status"]))
+    let lines = tokio::task::spawn_blocking(move || proxy_client(addr, &["--mode", "status"]))
         .await
         .expect("join")
         .expect("run client");
@@ -355,7 +361,7 @@ async fn the_cpp_client_reads_status_and_a_checkpoint_from_the_rust_server() {
     let copy = out.join("copied.codex");
     let copy_arg = copy.to_str().expect("utf-8 path").to_string();
     let lines = tokio::task::spawn_blocking(move || {
-        cpp_client(
+        proxy_client(
             addr,
             &[
                 "--mode",
@@ -379,7 +385,7 @@ async fn the_cpp_client_reads_status_and_a_checkpoint_from_the_rust_server() {
         .unwrap_or_else(|| panic!("no CHECKPOINT line in {lines:?}"));
     assert_eq!(field(line, "outcome"), "accept");
     assert_eq!(field(line, "size"), size.to_string());
-    // The C++ verifier's own fingerprint of the copy must equal the source's.
+    // The Linux proxy verifier's own fingerprint of the copy must equal the source's.
     let original = std::fs::read(dir.join("500.codex")).expect("read source");
     assert_eq!(
         field(line, "fp64"),
@@ -388,12 +394,12 @@ async fn the_cpp_client_reads_status_and_a_checkpoint_from_the_rust_server() {
     assert_eq!(std::fs::read(&copy).expect("read copy"), original);
 }
 
-/// The Rust server's silent close is one the C++ client handles: it reports an
+/// The Rust server's silent close is one the Linux proxy client handles: it reports an
 /// empty stream, not a protocol error.
 #[tokio::test]
-async fn the_cpp_client_sees_the_rust_servers_silent_close() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("the_cpp_client_sees_the_rust_servers_silent_close");
+async fn the_proxy_client_sees_the_rust_servers_silent_close() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("the_proxy_client_sees_the_rust_servers_silent_close");
         return;
     };
     let dir = a_data_dir("interop-b-missing");
@@ -401,7 +407,7 @@ async fn the_cpp_client_sees_the_rust_servers_silent_close() {
     let addr = server.local_addr();
 
     let lines = tokio::task::spawn_blocking(move || {
-        cpp_client(addr, &["--mode", "votes", "--decree", "99"])
+        proxy_client(addr, &["--mode", "votes", "--decree", "99"])
     })
     .await
     .expect("join")
@@ -409,13 +415,13 @@ async fn the_cpp_client_sees_the_rust_servers_silent_close() {
     assert_eq!(lines, vec!["ERROR closed".to_string()], "got {lines:?}");
 }
 
-/// A Rust server that dies mid-stream: what the C++ client does about it is
+/// A Rust server that dies mid-stream: what the Linux proxy client does about it is
 /// *recorded from an actual run*, not assumed. It reports the short body — the
 /// `restore = false` path has no tolerated tail — and publishes nothing.
 #[tokio::test]
-async fn the_cpp_client_reports_a_rust_server_killed_mid_stream() {
-    let Some(_) = golden_gen() else {
-        warn_no_peer("the_cpp_client_reports_a_rust_server_killed_mid_stream");
+async fn the_proxy_client_reports_a_rust_server_killed_mid_stream() {
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("the_proxy_client_reports_a_rust_server_killed_mid_stream");
         return;
     };
     let dir = TempDir::new("interop-b-torn");
@@ -425,7 +431,7 @@ async fn the_cpp_client_reports_a_rust_server_killed_mid_stream() {
     let size = write_checkpoint(dir.path(), 500, &state);
 
     let config = LearnConfig {
-        stream_chunk: 4096,
+        stream_chunk: 512,
         ..LearnConfig::default()
     };
     let server = LearnServer::bind(
@@ -443,7 +449,7 @@ async fn the_cpp_client_reports_a_rust_server_killed_mid_stream() {
     let copy = out.join("torn.codex");
     let copy_arg = copy.to_str().expect("utf-8 path").to_string();
     let client = tokio::task::spawn_blocking(move || {
-        cpp_client(
+        proxy_client(
             addr,
             &[
                 "--mode",
@@ -458,31 +464,46 @@ async fn the_cpp_client_reports_a_rust_server_killed_mid_stream() {
         )
     });
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if copy
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > 1024 && metadata.len() < size)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("proxy client never began the checkpoint copy");
     drop(server); // kill the server mid-transfer
 
     let lines = client.await.expect("join").expect("run client");
     assert!(
         lines.iter().any(|l| l == "ERROR incomplete checkpoint"),
-        "executed C++ behaviour changed: {lines:?}"
+        "executed proxy behavior changed: {lines:?}"
     );
     // Its `lError` path deletes the partial file, so nothing is left.
-    assert!(!copy.exists(), "the C++ client kept a partial checkpoint");
+    assert!(
+        !copy.exists(),
+        "the Linux proxy client kept a partial checkpoint"
+    );
 }
 
 /// Both implementations must agree that the request framing is the *message's
-/// own* six bytes: a bad version is refused with no reply by the C++ server,
+/// own* six bytes: a bad version is refused with no reply by the Linux proxy server,
 /// exactly as the Rust one refuses it.
 #[tokio::test]
-async fn a_bad_request_version_is_refused_by_the_cpp_server() {
+async fn a_bad_request_version_is_refused_by_the_linux_proxy_server() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let Some(_) = golden_gen() else {
-        warn_no_peer("a_bad_request_version_is_refused_by_the_cpp_server");
+    let Some(_) = linux_proxy() else {
+        warn_no_peer("a_bad_request_version_is_refused_by_the_linux_proxy_server");
         return;
     };
     let dir = a_data_dir("interop-a-badversion");
-    let server = CppServer::start(&dir, 1).expect("start C++ server");
+    let server = ProxyServer::start(&dir, 1).expect("start Linux proxy server");
 
     let mut bytes =
         rsl_net::learn::encode_message(&Msg::Base(requester().fetch_votes(100, ballot())))
@@ -497,7 +518,7 @@ async fn a_bad_request_version_is_refused_by_the_cpp_server() {
     let _ = stream.read_to_end(&mut rest).await;
     assert!(
         rest.is_empty(),
-        "the C++ replied to a bad version: {rest:?}"
+        "the Linux proxy replied to a bad version: {rest:?}"
     );
     drop(stream);
     server.finish();

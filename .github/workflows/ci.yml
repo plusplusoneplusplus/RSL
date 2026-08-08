@@ -32,20 +32,20 @@ jobs:
 
       - name: Build Linux proxy
         run: |
-          cmake -S tools/golden-gen -B tools/golden-gen/build
-          cmake --build tools/golden-gen/build -j "$(nproc)"
+          cmake -S tools/linux-proxy -B tools/linux-proxy/build
+          cmake --build tools/linux-proxy/build -j "$(nproc)"
 
       - name: Verify portable proxy corpora
         run: |
-          ./tools/golden-gen/build/golden-gen > "$RUNNER_TEMP/golden-proxy.txt"
-          diff -u tools/golden-gen/corpus/phase1-golden.txt "$RUNNER_TEMP/golden-proxy.txt"
+          ./tools/linux-proxy/build/rsl-linux-proxy > "$RUNNER_TEMP/golden-proxy.txt"
+          diff -u tools/linux-proxy/corpus/proxy-vectors.txt "$RUNNER_TEMP/golden-proxy.txt"
 
           out="$RUNNER_TEMP/storage-proxy"
-          ./tools/golden-gen/build/golden-gen --storage "$out"
-          diff -u tools/golden-gen/corpus/storage/MANIFEST.json "$out/MANIFEST.json"
+          ./tools/linux-proxy/build/rsl-linux-proxy --storage "$out"
+          diff -u tools/linux-proxy/corpus/storage/MANIFEST.json "$out/MANIFEST.json"
 
           set +e
-          ./tools/golden-gen/build/golden-gen --verify-storage "$out"
+          ./tools/linux-proxy/build/rsl-linux-proxy --verify-storage "$out"
           rc=$?
           set -e
           if [ "$rc" -ne 3 ]; then
@@ -56,7 +56,7 @@ jobs:
       - name: Require OpenSSL supplemental peer
         run: |
           set +e
-          ./tools/golden-gen/build/golden-gen --tls-peer 0
+          ./tools/linux-proxy/build/rsl-linux-proxy --tls-peer 0
           rc=$?
           set -e
           if [ "$rc" -ne 2 ]; then
@@ -68,7 +68,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-proxy-${{ github.sha }}
-          path: tools/golden-gen/build/golden-gen
+          path: tools/linux-proxy/build/rsl-linux-proxy
           if-no-files-found: error
           retention-days: 3
 
@@ -221,17 +221,17 @@ jobs:
             "$RUNNER_TEMP/rsl-authority" \
             --expected-revision "${{ github.sha }}" \
             --expected-configuration Release
-          chmod +x "$RUNNER_TEMP/linux-proxy/golden-gen"
+          chmod +x "$RUNNER_TEMP/linux-proxy/rsl-linux-proxy"
           {
             echo "RSL_WINDOWS_WIRE=$RUNNER_TEMP/rsl-authority/wire/wire.txt"
             echo "RSL_WINDOWS_STORAGE=$RUNNER_TEMP/rsl-authority/storage"
-            echo "RSL_GOLDEN_GEN=$RUNNER_TEMP/linux-proxy/golden-gen"
+            echo "RSL_LINUX_PROXY=$RUNNER_TEMP/linux-proxy/rsl-linux-proxy"
           } >> "$GITHUB_ENV"
 
       - name: Prepare supplemental proxy storage corpus
         run: |
           proxy_storage="$RUNNER_TEMP/storage-proxy-rust"
-          "$RUNNER_TEMP/linux-proxy/golden-gen" --storage "$proxy_storage"
+          "$RUNNER_TEMP/linux-proxy/rsl-linux-proxy" --storage "$proxy_storage"
           echo "RSL_STORAGE_CORPUS=$proxy_storage" >> "$GITHUB_ENV"
 
       - name: Set up Rust
@@ -267,7 +267,7 @@ jobs:
             committed_production_windows_wire_artifacts_parse_and_verify \
             --all-features --locked
           cargo test -p rsl-storage --test windows_oracle \
-            committed_production_windows_storage_artifacts_match_rust \
+            production_windows_storage_artifacts_match_rust \
             --all-features --locked
 
       - name: Run portable Rust and proxy tests

@@ -1,4 +1,4 @@
-//! Portable proxy interop: `golden-gen --packet-peer` runs the extracted packet
+//! Portable proxy interop: `rsl-linux-proxy --packet-peer` runs the ported packet
 //! receive model over a TCP socket. Production Windows coverage lives in
 //! `windows_network_oracle.rs`.
 //!
@@ -31,12 +31,12 @@ struct Peer {
 impl Peer {
     /// Start the peer on an ephemeral port and wait for it to announce it.
     fn start(mode: &str) -> Option<Peer> {
-        let binary = common::golden_gen()?;
+        let binary = common::linux_proxy()?;
         let mut child = Command::new(binary)
             .args(["--packet-peer", "0", "--mode", mode])
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn golden-gen peer");
+            .expect("spawn rsl-linux-proxy peer");
 
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut line = String::new();
@@ -87,12 +87,12 @@ fn message(decree: u64) -> Msg {
     ))
 }
 
-/// Rust sends packets, the C++ validates and echoes them, Rust validates the
+/// Rust sends packets, the Linux proxy validates and echoes them, Rust validates the
 /// echoes. Both directions of the framing in one round trip.
 #[test]
-fn packets_survive_a_round_trip_through_the_cpp_peer() {
+fn packets_survive_a_round_trip_through_the_linux_proxy_peer() {
     let Some(peer) = Peer::start("echo") else {
-        common::warn_no_peer("packets_survive_a_round_trip_through_the_cpp_peer");
+        common::warn_no_peer("packets_survive_a_round_trip_through_the_linux_proxy_peer");
         return;
     };
     let mut stream = peer.connect();
@@ -135,13 +135,13 @@ fn packet_payload(decree: u64) -> Vec<u8> {
     message(decree).marshal_with_checksum().expect("marshal")
 }
 
-/// A frame with a broken checksum must make the C++ close the connection — not
+/// A frame with a broken checksum must make the Linux proxy close the connection — not
 /// skip the packet, not resynchronize. The proof is that the packet sent *after*
 /// the corrupt one is never echoed.
 #[test]
-fn a_corrupt_packet_closes_the_cpp_connection() {
+fn a_corrupt_packet_closes_the_linux_proxy_connection() {
     let Some(peer) = Peer::start("echo") else {
-        common::warn_no_peer("a_corrupt_packet_closes_the_cpp_connection");
+        common::warn_no_peer("a_corrupt_packet_closes_the_linux_proxy_connection");
         return;
     };
     let mut stream = peer.connect();
@@ -184,9 +184,9 @@ fn a_corrupt_packet_closes_the_cpp_connection() {
 /// A size field outside the cap is rejected on the header alone, before any
 /// body is read — the peer must close without waiting for the announced bytes.
 #[test]
-fn an_out_of_range_size_closes_the_cpp_connection() {
+fn an_out_of_range_size_closes_the_linux_proxy_connection() {
     let Some(peer) = Peer::start("echo") else {
-        common::warn_no_peer("an_out_of_range_size_closes_the_cpp_connection");
+        common::warn_no_peer("an_out_of_range_size_closes_the_linux_proxy_connection");
         return;
     };
     let mut stream = peer.connect();
@@ -204,13 +204,13 @@ fn an_out_of_range_size_closes_the_cpp_connection() {
     peer.finish();
 }
 
-/// Learn-port interop: Rust writes a bare marshaled message, the C++
-/// `ReadFromSocket` path accepts it and answers with a `StatusResponse` that
+/// Learn-model interop: Rust writes a bare marshaled message, and the Linux
+/// proxy answers with a `StatusResponse` that
 /// Rust parses back.
 #[test]
-fn the_learn_port_interoperates_with_the_cpp_peer() {
+fn the_learn_model_interoperates_with_the_linux_proxy_peer() {
     let Some(peer) = Peer::start("fetch-stub") else {
-        common::warn_no_peer("the_learn_port_interoperates_with_the_cpp_peer");
+        common::warn_no_peer("the_learn_model_interoperates_with_the_linux_proxy_peer");
         return;
     };
     let mut stream = peer.connect();
@@ -238,12 +238,12 @@ fn the_learn_port_interoperates_with_the_cpp_peer() {
     peer.finish();
 }
 
-/// A learn-port message the C++ rejects (bad version) must close the connection
+/// A learn-port message the Linux proxy rejects (bad version) must close the connection
 /// with no reply.
 #[test]
-fn a_bad_learn_version_closes_the_cpp_connection() {
+fn a_bad_learn_version_closes_the_linux_proxy_connection() {
     let Some(peer) = Peer::start("fetch-stub") else {
-        common::warn_no_peer("a_bad_learn_version_closes_the_cpp_connection");
+        common::warn_no_peer("a_bad_learn_version_closes_the_linux_proxy_connection");
         return;
     };
     let mut stream = peer.connect();

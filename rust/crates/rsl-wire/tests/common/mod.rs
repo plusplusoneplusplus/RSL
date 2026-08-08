@@ -1,6 +1,6 @@
-//! Shared corpus loader for the golden-vector tests.
+//! Shared corpus loader for supplemental Linux proxy vectors.
 //!
-//! Parses `tools/golden-gen/corpus/phase1-golden.txt` — a line-oriented,
+//! Parses `tools/linux-proxy/corpus/proxy-vectors.txt` — a line-oriented,
 //! blank-line-separated format of `RECORD` and `FPRINT` blocks.
 //!
 //! Each integration-test binary links its own copy of this module and uses a
@@ -58,11 +58,11 @@ impl Record {
     }
 }
 
-/// Absolute path to the golden corpus, resolved relative to this crate.
+/// Absolute path to the supplemental proxy corpus.
 pub fn corpus_path() -> PathBuf {
     // CARGO_MANIFEST_DIR = <repo>/rust/crates/rsl-wire
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../tools/golden-gen/corpus/phase1-golden.txt")
+        .join("../../../tools/linux-proxy/corpus/proxy-vectors.txt")
 }
 
 /// Load and parse the corpus into its records and fingerprint vectors.

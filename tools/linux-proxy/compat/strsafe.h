@@ -1,6 +1,6 @@
-// Minimal <strsafe.h> substitute for the golden-gen Linux slice.
+// Minimal <strsafe.h> substitute for the rsl-linux-proxy Linux slice.
 //
-// Only the StringC{b,ch}* entry points that message.cpp / rsl.cpp (engine_min)
+// Only the StringC{b,ch}* entry points that message.cpp / rsl.cpp (engine_support)
 // actually reference are provided. Byte-for-byte behaviour matters for the
 // StringCbPrintfA path that renders numeric member ids, so MSVC width
 // specifiers ("%I64u"/"%I64d"/"%I64x") are translated to their Linux
@@ -81,7 +81,7 @@ inline HRESULT StringCbCopyA(char* dst, size_t cbDst, const char* src)
     if (srcLen >= cbDst) { return STRSAFE_E_INSUFFICIENT_BUFFER; }
     // Zero-fill the whole destination, then copy. The engine marshals fixed-size
     // member-id fields (char[64]) whose tail past the null terminator is
-    // otherwise uninitialized; zeroing here makes the golden vectors
+    // otherwise uninitialized; zeroing here makes the proxy vectors
     // deterministic and matches the canonical zero-padded wire form that the
     // pure-Rust port produces.
     ::memset(dst, 0, cbDst);

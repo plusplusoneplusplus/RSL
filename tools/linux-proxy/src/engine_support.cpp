@@ -1,12 +1,12 @@
-// engine_min.cpp -- the minimum slice of RSL/src/rsl.cpp needed to link the
-// golden-gen tool: RSLNode member-id helpers, RSLNodeCollection, and MemberSet.
+// engine_support.cpp -- the minimum slice of RSL/src/rsl.cpp needed to link the
+// rsl-linux-proxy tool: RSLNode member-id helpers, RSLNodeCollection, and MemberSet.
 //
 // Every function below is copied VERBATIM from RSL/src/rsl.cpp (as of the
 // current tree) so the marshaled bytes are byte-identical to the original
 // engine. The only thing that differs is the set of #includes: instead of
 // pulling in legislator.h / apdiskio.h / SSLImpl.h (the whole engine), we use
 // the message.h + msg_engine_compat.h subset. See
-// notes: tools/golden-gen/README.md.
+// notes: tools/linux-proxy/README.md.
 #include "message.h"
 #include "msg_engine_compat.h"
 #include "utils.h"

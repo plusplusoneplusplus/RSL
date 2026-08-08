@@ -14,7 +14,7 @@ RSLibImpl::Logger::FailFast(assertMessage); \
 #include "logging_old.h"
 
 #else
-// Linux golden-gen slice: the full logging.cpp (SEH/minidump) is not ported.
+// Linux rsl-linux-proxy slice: the full logging.cpp (SEH/minidump) is not ported.
 // Use a small stub that aborts on assert and prints diagnostics to stderr.
 #include <pal_logging.h>
 #endif

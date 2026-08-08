@@ -1,16 +1,59 @@
 //! Production-Windows storage artifacts and optional live mixed-language test.
+//!
+//! The storage fixtures are literal, non-byte-stable Windows outputs, so they
+//! are generated rather than committed (see `tools/windows-oracle/.gitignore`).
+//! Tests resolve a corpus from `$RSL_WINDOWS_STORAGE` (a validated CI artifact)
+//! or by running `RSLWindowsOracle.exe --storage` into this test run's temp
+//! directory.
 
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-fn corpus_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("RSL_WINDOWS_STORAGE") {
-        assert!(!path.is_empty(), "RSL_WINDOWS_STORAGE is empty");
-        return PathBuf::from(path);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tools/windows-oracle/corpus/storage")
+/// The production Windows storage corpus for this test run, or `None` when
+/// neither a published artifact nor the oracle executable is available.
+fn corpus_dir() -> Option<&'static Path> {
+    static CORPUS: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CORPUS
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("RSL_WINDOWS_STORAGE") {
+                assert!(!path.is_empty(), "RSL_WINDOWS_STORAGE is empty");
+                let directory = PathBuf::from(path);
+                assert!(
+                    directory.join("MANIFEST.json").is_file(),
+                    "RSL_WINDOWS_STORAGE={} has no MANIFEST.json",
+                    directory.display()
+                );
+                return Some(directory);
+            }
+            Some(generate(&common::windows_oracle()?))
+        })
+        .as_deref()
+}
+
+/// Run the production oracle to write a fresh storage corpus.
+fn generate(oracle: &Path) -> PathBuf {
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("windows-oracle-storage");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("create Windows storage scratch directory");
+    let status = Command::new(oracle)
+        .arg("--storage")
+        .arg(&directory)
+        .status()
+        .unwrap_or_else(|e| panic!("run {} --storage: {e}", oracle.display()));
+    assert!(status.success(), "Windows oracle corpus generation failed");
+    directory
+}
+
+/// Print why a corpus-dependent test did nothing, in one consistent wording.
+fn warn_no_corpus(test: &str) {
+    eprintln!(
+        "{test}: SKIPPED — no production Windows storage corpus. Build the oracle \
+         (.\\tools\\windows-oracle\\build.ps1) and set RSL_WINDOWS_ORACLE, or set \
+         RSL_WINDOWS_STORAGE to a published artifact's storage directory."
+    );
 }
 
 fn manifest(directory: &Path) -> serde_json::Value {
@@ -54,8 +97,12 @@ fn assert_rust_matches_manifest(directory: &Path) {
 }
 
 #[test]
-fn committed_production_windows_storage_artifacts_match_rust() {
-    assert_rust_matches_manifest(&corpus_dir());
+fn production_windows_storage_artifacts_match_rust() {
+    let Some(corpus) = corpus_dir() else {
+        warn_no_corpus("production_windows_storage_artifacts_match_rust");
+        return;
+    };
+    assert_rust_matches_manifest(corpus);
 }
 
 #[test]

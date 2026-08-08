@@ -1,7 +1,7 @@
-// storage_min.h -- the Linux storage-format API used by the golden-gen driver.
+// storage_model.h -- the Linux storage-format API used by the rsl-linux-proxy driver.
 //
 // The class methods (ConfigurationInfo / CheckpointHeader marshal & unmarshal)
-// are extracted VERBATIM from legislator.cpp into storage_min.cpp. The helper
+// are extracted VERBATIM from legislator.cpp into storage_model.cpp. The helper
 // functions declared below in namespace rsl_storage are ports of the
 // format-bearing I/O paths in legislator.cpp / rsl.cpp, with the Windows
 // unbuffered/overlapped I/O mechanism replaced by plain in-memory byte buffers.

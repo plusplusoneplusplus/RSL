@@ -1,0 +1,8 @@
+build/
+
+# Generated Linux storage-model samples. The committed manifest pins proxy
+# output only; production Windows evidence comes from windows-oracle artifacts.
+corpus/storage/*.log
+corpus/storage/*.codex
+corpus/storage/defunct-*.txt
+!corpus/storage/MANIFEST.json

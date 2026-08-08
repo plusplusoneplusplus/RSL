@@ -1,7 +1,7 @@
-// Minimal <windows.h> substitute for the Phase-1 golden-vector slice on Linux.
+// Minimal <windows.h> substitute for the supplemental Linux proxy.
 //
-// This header is ONLY on the include path for the Linux golden-gen build (see
-// tools/golden-gen/CMakeLists.txt). The real Windows build never sees it. It
+// This header is ONLY on the include path for the Linux rsl-linux-proxy build (see
+// tools/linux-proxy/CMakeLists.txt). The real Windows build never sees it. It
 // supplies just enough of the Win32 type/function surface for basic_types.h,
 // inc/rsl.h, RefCount.h, message.{h,cpp} and marshal.{h,cpp} to compile and run.
 //

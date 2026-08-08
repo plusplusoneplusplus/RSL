@@ -1,7 +1,7 @@
 [package]
 name = "rsl-wire"
 version = "0.1.0"
-description = "Byte-exact Rust port of the RSL Paxos wire format (marshaling + Rabin-64 fingerprint + messages)."
+description = "Rust implementation of the RSL Paxos wire format."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

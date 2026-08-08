@@ -3,14 +3,12 @@
 #include "marshal.h"
 #include "rsl.h"
 #include "List.h"
+#include "HiResTime.h"
 #ifdef _WIN32
 #include "streamio.h"
 #else
-// Linux golden-gen slice: streamio.h pulls in winsock/SSL. StreamSocket is only
-// referenced here as a pointer param of ReadFromSocket, so a forward
-// declaration is enough. hirestime.h supplies GetHiResTime() for the inline
-// RslDateTime::Set() below.
-#include "HiResTime.h"
+// Linux rsl-linux-proxy slice: streamio.h pulls in winsock/SSL. StreamSocket is
+// only referenced here as a pointer parameter, so a forward declaration is enough.
 namespace RSLibImpl { class StreamSocket; }
 #endif
 #include "RefCount.h"

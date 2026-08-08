@@ -1,8 +1,7 @@
-// tls_peer.cpp -- Phase-4d interop oracle: an RSL packet peer that speaks
-// TLS 1.2, over OpenSSL.
+// Supplemental Linux packet-model peer over OpenSSL TLS 1.2.
 //
-// *This is a proxy oracle, and the proxy is the point of the file.* The real
-// C++ RSL speaks TLS through SChannel (src/NetworkLib/src/SSLImpl.cpp), which
+// This is supplemental foreign-stack coverage. Production RSL speaks TLS
+// through SChannel (src/NetworkLib/src/SSLImpl.cpp), which
 // cannot be executed on Linux. OpenSSL is the closest executable stand-in: it
 // lets the Rust port's rustls configuration be tested against a *different*
 // TLS implementation, which catches the class of bug where two rustls peers
@@ -13,7 +12,7 @@
 // residual risk and the Windows verification checklist that closes it.
 //
 // Everything above the TLS record layer is the same code the plaintext peer
-// runs: ScanPackets / SerializePacket out of packet_min.h, which are the
+// runs: ScanPackets / SerializePacket out of packet_model.h, which are the
 // verbatim C++ decisions.
 
 #include <cerrno>
@@ -30,7 +29,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#include "packet_min.h"
+#include "packet_model.h"
 
 namespace rsl_tls
 {

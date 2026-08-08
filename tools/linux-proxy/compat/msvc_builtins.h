@@ -1,4 +1,4 @@
-// MSVC fixed-width builtin keyword spellings, for the Linux golden-gen slice.
+// MSVC fixed-width builtin keyword spellings, for the Linux rsl-linux-proxy slice.
 // Force-included into every TU (see CMakeLists) so even freestanding files like
 // msn_fprint.cpp/.h -- which use `unsigned __int64` without including
 // windows.h -- compile on gcc/clang.

@@ -1,17 +1,17 @@
 # rsl-storage
 
-The RSL **on-disk formats** in pure Rust: everything a replica's data directory
-holds. Phase 3b covered the checkpoint (`<decree>.codex`) file — the
+The RSL **on-disk formats** in pure Rust: checkpoints, logs, directory metadata,
+and retention behavior. The checkpoint (`<decree>.codex`) file contains the
 `CheckpointHeader` and the block-checksummed user-state stream that
 `RSLCheckpointStreamWriter` / `RSLCheckpointStreamReader` (`src/RSL/src/rsl.cpp`)
-produce and consume. Phase 3c adds the log (`<decree>.log`) writer, its
+produce and consume. The log (`<decree>.log`) writer, its
 decree→offset index and the startup recovery scan (`Legislator::ReadNextMessage`
 + `RestoreState`), plus directory naming/enumeration, `defunct.txt`, and the
 log/checkpoint retention rule (`CleanupLogsAndCheckpoint`).
 
-- Files written here are **byte-identical** to the C++ ones; files written by the
-  C++ parse here with the **same accept/reject decisions**, proven against the
-  Phase-3a golden corpus (`tools/golden-gen --storage`).
+- Production Windows artifacts and recovery verdicts are checked through
+  `RSLWindowsOracle`; the Linux storage model adds deterministic POSIX and
+  corruption coverage.
 - **Zero `unsafe`** (`unsafe_code = "forbid"`), one dependency (`rsl-wire`).
 - **Bounded memory**: no path ever holds a whole checkpoint or a whole log.
 
@@ -67,7 +67,7 @@ checksum covers the message only, so readers tolerate arbitrary pad bytes — bu
 this writer always zeroes them, because recovery reads an all-zero header page as
 the clean end of the log.
 
-Recovery ends one of three ways, matching the C++ decision for decision:
+Recovery exposes the production-compatible three-way outcome:
 
 | Outcome | Meaning |
 | --- | --- |
@@ -157,36 +157,29 @@ if let Some(mut records) = log.replay_from(1042)? {
 
 `cargo test` runs eight harnesses:
 
-1. **`corpus`** — every `.codex` sample in the Phase-3a corpus parses with the
+1. **`corpus`** — every `.codex` Linux model sample parses with the
    outcome, `detail` wording, version, header length and recovered user-data size
    the MANIFEST recorded; each accepted sample's state streams back exactly; and
-   re-writing header+state with the Rust writer reproduces the C++ file
+   re-writing header+state with the Rust writer reproduces the model file
    **byte-for-byte**.
 2. **`log_corpus`** — every `.log` sample scans with the MANIFEST's outcome, stop
    offset, `detail` and full per-record list (offset, id, decree, lengths,
    checksum); rebuilding those messages and appending them through `LogWriter`
    reproduces each sample **byte-for-byte**; and batched appends produce the same
    file as one-at-a-time.
-3. **`interop`** — the reverse direction, via `golden-gen --verify-storage`: the
-   extracted **C++** readers accept Rust-written checkpoints (v3–v6, at and across
-   the 4 MiB boundary) and Rust-written logs (empty, mixed record kinds,
-   multi-page votes, 32-record runs), reporting the same sizes, record counts and
-   stop offsets — and reject damaged ones for the *same reason* we do. Plus the
-   **interop matrix**: whole data directories at every protocol version, in both
-   directions — a C++-written directory that Rust recovers, appends to,
-   checkpoints and garbage-collects before handing it back, and a Rust-built
-   directory (several logs, several checkpoints, `defunct.txt`) that the C++
-   reads before and after a retention pass. This is the rolling-upgrade handoff
-   at the storage layer, two phases before the engine exists.
+3. **`interop`** — reverse checks against the optional Linux storage model:
+   Rust-written checkpoints/logs, damaged tails, and whole-directory takeover
+   scenarios. These are supplemental model comparisons, not production Windows
+   recovery evidence.
 4. **`log_roundtrip`** — reopen → append → rescan idempotence over zero and torn
    tails; the decree index (re-votes, non-indexed record kinds, decree lengths)
    against `LogFile`'s rules; replay-from-decree; writer strictness; and property
    tests over random record sequences, batch splits and arbitrary truncation.
 5. **mutation tests** (in `log_roundtrip` and `roundtrip`) — every pad byte flip
-   must leave a record valid, every body flip must stop or reject exactly where
-   the C++ does, and a flip in any checkpoint block's data or checksum token, a
-   corrupted header, a bad version, truncation and extension are each rejected
-   with the specific reason the C++ gives.
+   must leave a record valid, while body/checkpoint mutations exercise stable
+   stop/reject behavior. A flip in any checkpoint block's data or checksum token, a
+   corrupted header, a bad version, truncation and extension are rejected with
+   stable Rust/model diagnostics.
 6. **`dir_gc`** — name parsing and enumeration order, `defunct.txt` round trips
    (against the corpus samples), and retention scenarios: which files survive a
    checkpoint at decree N, with and without a checkpoint present.
@@ -204,12 +197,18 @@ if let Some(mut records) = log.replay_from(1042)? {
    vanish, synced bytes never can, tears land on sector boundaries, and a rename
    is all-or-nothing.
 
-The corpus samples are generated test data and not committed. Tests locate them
-via `$RSL_STORAGE_CORPUS`, then `tools/golden-gen/corpus/storage`, and finally by
-running `golden-gen --storage` if the binary is built; with none of those
+Linux proxy corpus samples are generated test data and not committed. Tests locate them
+via `$RSL_STORAGE_CORPUS`, then `tools/linux-proxy/corpus/storage`, and finally by
+running `rsl-linux-proxy --storage` if the binary is built; with none of those
 available the corpus/interop tests print a skip instead of failing.
 
-Where the C++ `LogAssert`-**aborts** on a malformed file, this crate returns an
+Production Windows storage fixtures are likewise generated rather than committed
+(they are literal, non-byte-stable Windows outputs). `--test windows_oracle`
+uses `$RSL_WINDOWS_STORAGE` when a validated CI artifact is present, otherwise
+regenerates the corpus with `RSLWindowsOracle.exe --storage` from
+`$RSL_WINDOWS_ORACLE`, and skips when neither is available.
+
+Where production C++ `LogAssert`-**aborts** on a malformed file, this crate returns an
 error instead. The exhaustive list (needed to whitelist a future C++-vs-Rust
 differential fuzzer) is in the crate-level rustdoc (`src/lib.rs`).
 
@@ -218,7 +217,8 @@ differential fuzzer) is in the crate-level rustdoc (`src/lib.rs`).
 `cargo bench -p rsl-storage`. Indicative numbers on the development machine
 (`--release`, files in `/tmp`); treat as a baseline, not absolutes:
 
-These are the **Phase-3d baseline**: Phase 5 and 6 must not regress them.
+These are the portable storage baseline; production Windows artifacts add the
+native compatibility gate.
 
 | Benchmark | Time | Throughput |
 | --- | --- | --- |

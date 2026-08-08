@@ -1,13 +1,11 @@
-// learn_min.cpp -- see learn_min.h.
+// learn_model.cpp -- see learn_model.h.
 //
-// Every handler and every client loop below is a port of the corresponding
-// Legislator method, line-cited, with the socket and file plumbing replaced and
-// nothing else. Where the original consults engine state under m_lock, this
-// derives the same values from the directory it was pointed at; those points
-// are commented individually.
+// Handlers and client loops are line-cited ports of selected Legislator paths.
+// POSIX socket/file plumbing and directory-derived state make this a model, not
+// the shipping learn implementation.
 
 // System headers first (the compat windows.h shim collides with the POSIX
-// headers if it is included first -- same ordering rule as packet_min.cpp).
+// headers if it is included first -- same ordering rule as packet_model.cpp).
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -25,10 +23,10 @@
 #include <algorithm>
 #include <vector>
 
-#include "learn_min.h"
+#include "learn_model.h"
 
-#include "packet_min.h"    // ReadMessage (Message::ReadFromSocket's decisions)
-#include "storage_min.h"   // ScanLog, VerifyCheckpointFile
+#include "packet_model.h"    // ReadMessage (Message::ReadFromSocket's decisions)
+#include "storage_model.h"   // ScanLog, VerifyCheckpointFile
 #include "fingerprint.h"
 #include "marshal.h"
 #include "msg_engine_compat.h"
@@ -348,7 +346,7 @@ bool OffsetOfDecree(const LogFileInfo& log, UInt64 decree, UInt64* offset)
 // `length < 0` means "to the end of the file as it was when we opened it":
 // APSEQREAD::DoInit captures GetFileSize once (apdiskio.cpp:146) and
 // legislator.cpp:4515 computes `length = reader->FileSize() - offset` from that
-// snapshot. Growth after the open is never sent -- reproduced exactly here.
+// snapshot. This model also fixes length at open.
 bool SendFile(const std::string& path, UInt64 offset, Int64 length, int fd)
 {
     FILE* f = fopen(path.c_str(), "rb");
@@ -374,7 +372,7 @@ bool SendFile(const std::string& path, UInt64 offset, Int64 length, int fd)
         if (!WriteAll(fd, buf.data(), got))
         {
             // "Write to socket failed" (legislator.cpp:4530) -- give up on the
-            // whole response, exactly as the C++ does.
+            // whole modeled response.
             fclose(f);
             return false;
         }
@@ -616,7 +614,7 @@ int ClientVotes(int fd)
 // Deviation: the C++ additionally re-marshals the header with a raised
 // m_maxBallot (legislator.cpp:5535) before writing it. That step is engine
 // state, not protocol, and it would make the copy differ from the source; this
-// oracle copies verbatim so the interop test can compare bytes. The Rust client
+// proxy copies verbatim so the supplemental test can compare bytes. The Rust client
 // defaults to the same verbatim copy and offers the rewrite explicitly.
 int ClientCheckpoint(int fd, UInt64 size, const char* outFile)
 {
@@ -748,7 +746,7 @@ int RunClient(const char* host, int port, const char* mode,
 
     // The request the corresponding Legislator path builds. FetchCheckpoint
     // uses a dummy configuration number of 1 (legislator.cpp:5510); the others
-    // carry the real one, which this oracle fixes at 7 to match the fixtures.
+    // carry another value, which this proxy fixes at 7 to match its fixtures.
     Message req(RSLProtocolVersion_6, msgId, MemberId("102"), decree,
                 (msgId == Message_FetchCheckpoint) ? 1 : 7,
                 BallotNumber(3, MemberId("202")));

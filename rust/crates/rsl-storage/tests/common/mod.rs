@@ -1,5 +1,5 @@
-//! Shared test scaffolding: locating the Phase-3a storage corpus, reading its
-//! MANIFEST, and scratch directories.
+//! Shared test scaffolding for optional Linux-model storage corpora and scratch
+//! directories.
 //!
 //! Each integration-test binary links its own copy and uses a different subset,
 //! so unused-item warnings here are expected.
@@ -47,23 +47,33 @@ pub fn windows_oracle() -> Option<PathBuf> {
     None
 }
 
-/// The `golden-gen` binary, if it has been built (or `RSL_GOLDEN_GEN` points at
+/// The `rsl-linux-proxy` binary, if it has been built (or `RSL_LINUX_PROXY` points at
 /// one). This is the portable extracted proxy, not the authoritative Windows
 /// implementation.
-pub fn golden_gen() -> Option<PathBuf> {
-    if let Some(path) = env_path("RSL_GOLDEN_GEN") {
-        return path.is_file().then_some(path);
+pub fn linux_proxy() -> Option<PathBuf> {
+    if let Some(path) = env_path("RSL_LINUX_PROXY") {
+        assert!(
+            path.is_file(),
+            "RSL_LINUX_PROXY={} is not a file",
+            path.display()
+        );
+        return Some(path);
     }
-    let path = repo_root().join("tools/golden-gen/build/golden-gen");
-    path.is_file().then_some(path)
+    #[cfg(unix)]
+    {
+        let path = repo_root().join("tools/linux-proxy/build/rsl-linux-proxy");
+        path.is_file().then_some(path)
+    }
+    #[cfg(not(unix))]
+    None
 }
 
-/// The Phase-3a storage corpus directory, or `None` if it is unavailable here.
+/// The optional Linux-model storage corpus directory.
 ///
 /// The sample files are generated test data and deliberately not committed (see
-/// `tools/golden-gen/.gitignore`), so this looks, in order, at
+/// `tools/linux-proxy/.gitignore`), so this looks, in order, at
 /// `$RSL_STORAGE_CORPUS`, the in-repo corpus directory, and finally regenerates
-/// the corpus with `golden-gen --storage` into this test run's temp directory.
+/// the corpus with `rsl-linux-proxy --storage` into this test run's temp directory.
 pub fn storage_corpus() -> Option<&'static Path> {
     static CORPUS: OnceLock<Option<PathBuf>> = OnceLock::new();
     CORPUS
@@ -77,13 +87,13 @@ pub fn storage_corpus() -> Option<&'static Path> {
                 return Some(dir);
             }
 
-            let in_repo = repo_root().join("tools/golden-gen/corpus/storage");
+            let in_repo = repo_root().join("tools/linux-proxy/corpus/storage");
             if in_repo.join("cp-small.codex").is_file() {
                 return Some(in_repo);
             }
 
-            // Regenerate from the C++ generator if it is available.
-            let generator = golden_gen()?;
+            // Regenerate from the Linux proxy if it is available.
+            let generator = linux_proxy()?;
             let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("storage-corpus");
             let _ = std::fs::remove_dir_all(&out);
             let status = std::process::Command::new(&generator)
@@ -91,7 +101,10 @@ pub fn storage_corpus() -> Option<&'static Path> {
                 .arg(&out)
                 .status()
                 .unwrap_or_else(|e| panic!("failed to run {}: {e}", generator.display()));
-            assert!(status.success(), "golden-gen --storage failed: {status}");
+            assert!(
+                status.success(),
+                "rsl-linux-proxy --storage failed: {status}"
+            );
             Some(out)
         })
         .as_deref()
@@ -101,9 +114,9 @@ pub fn storage_corpus() -> Option<&'static Path> {
 /// wording (and the hint) stays consistent.
 pub fn warn_no_corpus(test: &str) {
     eprintln!(
-        "{test}: SKIPPED — no Phase-3a storage corpus. Build the generator \
-         (cmake -S tools/golden-gen -B tools/golden-gen/build && cmake --build \
-         tools/golden-gen/build) or set RSL_STORAGE_CORPUS."
+        "{test}: SKIPPED — no optional Linux proxy storage corpus. Build the proxy \
+         (cmake -S tools/linux-proxy -B tools/linux-proxy/build && cmake --build \
+         tools/linux-proxy/build) or set RSL_STORAGE_CORPUS."
     );
 }
 

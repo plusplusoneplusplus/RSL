@@ -273,10 +273,10 @@ namespace RSLibImpl
     };
 
     // ConfigurationInfo + CheckpointHeader (and s_ChecksumBlockSize) define the
-    // .codex on-disk layout and are shared verbatim with the Linux golden-vector
-    // tool, so they live in their own header. Included HERE, not at the top of
+    // .codex on-disk layout and are shared with the supplemental Linux proxy,
+    // so they live in their own header. Included HERE, not at the top of
     // the file, because they depend on the MemberSet declaration above.
-    // See tools/golden-gen/compat/storage_compat.h for the other includer.
+    // See tools/linux-proxy/compat/storage_compat.h for the other includer.
 }
 #include "checkpoint.h"
 namespace RSLibImpl
@@ -570,7 +570,7 @@ namespace RSLibImpl
 
         void HandleFetchVotesMsg(Message *msg, StreamSocket *sock);
         void HandleFetchCheckpointMsg(Message *msg, StreamSocket *sock);
-        void BuildLearnServerState(LearnServerState *state, UInt16 messageId);
+        void BuildLearnServerState(LearnServerState *state, const Message& request);
         void RecordLearnFileMetrics(const LearnFileMetrics& metrics);
         static BallotNumber GetLearnMaxBallot(void *context);
         void LearnVotesAndTransition(StatusResponse *resp);
@@ -619,7 +619,6 @@ namespace RSLibImpl
         void AddMessageToLog(Message *msg);
 
         void GetCheckpointFileName(DynString &file, UInt64 decree);
-        DWORD32 SendFile(char *file, UInt64 offset, Int64 length, StreamSocket *sock);
 
         UInt64 GetLastWriteFileTime(const char * fileName);
         bool RestoreState(UInt64 maxDecree, bool readOnly, UInt32 initialConfigNumber);

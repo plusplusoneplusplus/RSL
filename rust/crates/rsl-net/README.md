@@ -4,30 +4,28 @@ The RSL network layer in pure Rust: the **framing** (Phase 4a), the **transport*
 built on it (Phase 4b), the **learn port** a lagging replica catches up through
 (Phase 4c), and **TLS** over both ports (Phase 4d).
 
-- **`framing`** — a byte-exact port of the 20-byte NetPacket header that wraps
+- **`framing`** — the 20-byte NetPacket header that wraps
   every replica-to-replica message, and of the learn-port framing used by the
-  fetch/status sockets. It frames and parses identically to the original C++
-  (`src/NetworkLib/src/NetPacket.cpp`, `src/NetworkLib/src/NetCxn.cpp`,
-  `Message::ReadFromSocket` in `src/RSL/src/message.cpp`), proven against
-  C++-generated golden vectors **and** against the real C++ code over a live TCP
-  socket. No async runtime, no sockets in the API.
+  fetch/status sockets. Production compatibility is exercised by the Windows
+  oracle; Linux proxy vectors provide supplemental deterministic model cases.
+  No async runtime or sockets appear in the framing API.
 - **`svc`** — `PacketSvc`, the tokio replacement for `NetPacketSvc` + `NetCxn` +
-  the IOCP `NetProcessor`. Same statuses, same queue semantics, same
-  suspend/resume, same connection identity — proven by a deterministic contract
-  matrix and by talking to the C++ peer over real TCP.
+  the IOCP `NetProcessor`. A deterministic contract matrix covers statuses,
+  queues, suspend/resume and connection identity; Windows tests communicate
+  bidirectionally with production `NetPacketSvc`.
 
 - **`learnport`** — the state-transfer protocols: `StatusQuery`, `FetchVotes`
   and `FetchCheckpoint`, server and client. This is where the network layer
   meets the disk, so it is the one part of the crate that depends on
-  [`rsl-storage`](../rsl-storage). Proven against the extracted C++
-  (`golden-gen --learn-server` / `--learn-client`) in **both** directions.
+  [`rsl-storage`](../rsl-storage). Windows tests run production Legislator/file
+  paths in both directions; the Linux proxy adds fast portable model coverage.
 
 - **`tls`** — mutual TLS on both ports, with the C++'s operator-facing trust
   model (SHA-1 thumbprint pins, subject + issuer-pin rules, an A/B pair for
   rotation) over rustls instead of SChannel. One config object gates the packet
   port and the learn port, in both directions. See [TLS.md](TLS.md) for the
-  model, the eight deliberate divergences, the operational migration from the
-  Windows certificate store, and the SChannel residual-risk note.
+  model, deliberate divergences, certificate-store migration, and authoritative
+  SChannel interoperability.
 
 Zero `unsafe` (`unsafe_code = "forbid"`). The framing kernel's only dependency
 is [`rsl-wire`](../rsl-wire); `default-features = false` drops tokio and leaves
@@ -199,7 +197,7 @@ of the last *valid* record. They differ only for a file ending in a torn or
 zeroed tail, which the C++ would stream to the peer as garbage for the peer to
 reject; here the transfer simply ends on a record boundary. (`tests/learnport.rs`
 executes the snapshot property; the C++ side is a code reading — `APSEQREAD` is
-Windows-only and cannot be executed on Linux, so the golden-gen `SendFile` port
+Windows-only and cannot be executed on Linux, so the rsl-linux-proxy `SendFile` port
 reproduces the same open-time `fstat` and the interop tests run against that.)
 
 ### Timeouts, and the stall budget
@@ -241,18 +239,16 @@ that keeps stalling.
 
 ## Correctness
 
-`cargo test` runs sixteen harnesses. Framing (Phase 4a):
+`cargo test` runs portable, proxy, and authoritative harnesses. Framing:
 
-1. **`packet_corpus`** — the 30 `PACKET` vectors in
-   `tools/golden-gen/corpus/phase1-golden.txt`. Each is a byte stream the *real
-   C++ receive path was executed over*; the recorded outcome (`accept` /
+1. **`packet_corpus`** — `PACKET` vectors from the Linux receive model. The
+   recorded outcome (`accept` /
    `need-more` / `reject-header` / `reject-checksum`), consumed byte count,
-   payloads and reject wording must all match. Every accepted packet must also
-   **re-encode byte-for-byte** to the frame the C++ produced.
-2. **`learn_corpus`** — the 15 `LEARN` vectors, likewise executed through
-   `Message::ReadFromSocket`'s decision table.
-3. **`live_peer`** — spawns `golden-gen --packet-peer` (the extracted C++ over a
-   real TCP socket) and talks to it by hand: N packets out, validated and echoed
+   payloads and model wording must all match. Accepted packets re-encode to the
+   reference frame.
+2. **`learn_corpus`** — `LEARN` vectors from the ported read model.
+3. **`live_peer`** — spawns the Linux proxy packet model over a
+   real TCP socket and talks to it by hand: N packets out, validated and echoed
    back; a corrupt frame really does kill the connection; the learn port
    exchanges a request and a `StatusResponse`.
 4. **`proptest`** — round-trips, many packets per buffer, arbitrary truncation,
@@ -261,7 +257,7 @@ that keeps stalling.
    accepted re-encodes to its own bytes, and a hostile size field allocates
    nothing.
 
-Transport (Phase 4b):
+Transport:
 
 6. **`svc_contract`** — the behaviour matrix over `tokio::io::duplex` under
    `tokio::time::pause()`: queue across a reconnect, a deadline firing
@@ -276,12 +272,12 @@ Transport (Phase 4b):
 8. **`svc_runtime`** — the guarantees that are about *where* code runs (no
    callback on the caller's thread, a blocking handler does not stall the
    service) plus a full request/response over loopback TCP.
-9. **`svc_live_peer`** — a `PacketSvc` client against the C++ peer: a sustained
+9. **`svc_live_peer`** — a `PacketSvc` client against the Linux proxy peer:
    24-packet exchange across four sizes, the peer dying mid-packet (a
    disconnect, not a framing error, and no half packet surfaced), and a frame
    the peer will happily send but this service is configured to refuse.
 
-Learn port (Phase 4c):
+Learn port:
 
 10. **`learnport`** — the Rust server serving real `rsl-storage` files to the
     Rust client: every protocol, the snapshot property (records appended
@@ -291,14 +287,14 @@ Learn port (Phase 4c):
     than resynchronizing, an all-zero page treated as corruption (`restore` is
     false here, unlike recovery), a server killed mid-checkpoint leaving no temp
     file, and the receive timeout firing on a silent peer.
-11. **`learnport_interop`** — both directions against executed C++.
-    `golden-gen --learn-server` serves a generated data directory and the Rust
+11. **`learnport_interop`** — both directions against the Linux learn model.
+    `rsl-linux-proxy --learn-server` serves a generated data directory and the Rust
     client's results are compared against reading those files directly through
-    `rsl-storage`; `golden-gen --learn-client` runs the extracted
+    `rsl-storage`; `rsl-linux-proxy --learn-client` runs the ported
     `ReadNextMessage` and checkpoint-copy loops against the Rust server and its
     printed records are compared the same way. Includes the silent-close cases
-    on both sides, and a Rust server killed mid-stream where the C++ client's
-    behaviour is *recorded from the run* (it reports an incomplete checkpoint
+    on both sides, and a Rust server killed mid-stream where the proxy client's
+    observed behavior is recorded (it reports an incomplete checkpoint
     and deletes its partial file).
 12. **`learnport_proptest`** — `fetch_votes` over generated multi-file log sets,
     requesting every decree in turn and checking the response against the files;
@@ -308,7 +304,7 @@ Learn port (Phase 4c):
     page and checksum-block boundaries, plus streaming chunk sizes from 512 B to
     twice the file size.
 
-TLS (Phase 4d):
+TLS:
 
 13. **`tls_rules`** — the acceptance-rule matrix, every case a real mutual
     handshake over loopback rather than a direct call into the verifier:
@@ -329,12 +325,17 @@ TLS (Phase 4d):
     as fallbacks, no name at all, the 255-character truncation, "this is not a
     DN" stated as an assertion, both EKU roles, the two Server Gated Crypto
     OIDs, and a repeated CN taking the most specific.
-16. **`tls_interop`** — `golden-gen --tls-peer` / `--tls-client`: the real C++
-    packet framing over **OpenSSL**, mutual auth, TLS 1.2, in both directions.
-    A proxy oracle for SChannel, which cannot run here — and it has already
-    caught a real bug (a malformed `certificate_authorities` hint that two
-    rustls peers ignore and OpenSSL rejects). See [TLS.md](TLS.md) for what it
-    does *not* prove and the Windows checklist that closes it.
+16. **`tls_interop`** — the Linux packet model over **OpenSSL**, mutual auth and
+    TLS 1.2 in both directions. This is supplemental foreign-stack coverage;
+    `schannel_interop` is the production Windows authority.
+17. **`windows_network_oracle`** — bidirectional Rust/production
+    `NetPacketSvc` IOCP traffic, fragmentation/coalescing, corrupt/truncated
+    frames and reconnects.
+18. **`windows_learn_oracle`** — production Legislator/file paths in both
+    directions, all message versions, checkpoint versions 3–6, exact log ranges,
+    ballot rewriting and transfer failures.
+19. **`schannel_interop`** — production SChannel/CryptoAPI mutual TLS on packet
+    and learn ports, trust policy, TLS 1.2 negotiation and A/B rotation.
 
 ### Deliberate divergences
 
@@ -407,10 +408,10 @@ across the frame's three regions instead of copying it to zero the checksum
 field; encoding still allocates the frame.
 
 Transport — loopback TCP round trips (send + echo back), against a `PacketSvc`
-echo server and against `golden-gen --packet-peer echo`. Throughput counts both
+echo server and against `rsl-linux-proxy --packet-peer echo`. Throughput counts both
 directions:
 
-| Benchmark | Payload | Rust peer | C++ peer |
+| Benchmark | Payload | Rust peer | Linux proxy |
 | --- | --- | --- | --- |
 | `svc/round_trip` | 1 KiB | ~80 µs | ~95 µs |
 | `svc/round_trip` | 100 KiB | ~417 µs (468 MiB/s) | ~576 µs (339 MiB/s) |
@@ -456,10 +457,9 @@ payload is several TLS records but per-record overhead has not amortized, and
 least at checkpoint sizes, which is the case worth worrying about.
 
 Round-trip latency at 1 KiB is loopback and scheduling, not framing — the frame
-itself costs well under a microsecond. The C++ peer is slower because it is a
-single-threaded blocking loop that copies each payload into a fresh frame; it is
-here as a correctness oracle that also happens to bound the port's cost, not as
-a tuned implementation.
+itself costs well under a microsecond. The Linux proxy is slower because it is a
+single-threaded blocking model that copies each payload into a fresh frame. It
+is a portable comparison point, not a production benchmark or authority.
 
 ## TLS
 

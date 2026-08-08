@@ -73,7 +73,7 @@ wire/storage artifact containing source revision, toolchain provenance, and a
 SHA-256 for every file. Linux Rust CI downloads and validates that same-run
 artifact before testing the portable implementation against it.
 
-The Linux `golden-gen` build remains a supplemental proxy for portable
+The Linux `rsl-linux-proxy` build remains a supplemental proxy for portable
 marshaling, POSIX filesystem behavior, OpenSSL interoperability, and fuzzing.
 It does not replace the production Windows storage, IOCP, learn-port, or
 SChannel authority.

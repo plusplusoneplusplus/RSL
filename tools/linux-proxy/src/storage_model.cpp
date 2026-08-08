@@ -1,20 +1,14 @@
-// storage_min.cpp -- the minimum slice of the RSL storage format needed to
-// generate and verify golden .log / .codex / defunct.txt corpora on Linux.
+// Supplemental Linux storage format/recovery model.
 //
-// The class methods below are copied VERBATIM from RSL/src/legislator.cpp so the
-// marshaled bytes are byte-identical to the original engine; only the set of
-// #includes differs (storage_compat.h instead of legislator.h). Each block cites
-// its source line range so drift is auditable, exactly as engine_min.cpp does
-// for MemberSet.
+// Selected format class methods are copied and line-cited for drift auditing.
 //
 // The namespace rsl_storage helpers underneath are ports (NOT verbatim copies)
 // of the format-bearing I/O paths -- LogFile write/AddMessage,
 // Legislator::ReadNextMessage, RSLCheckpointStreamWriter/Reader,
 // CheckpointHeader::Marshal(const char*), Read/UpdateDefunctFile. The Windows
-// unbuffered/overlapped/WriteFileGather mechanism is replaced by plain in-memory
-// byte buffers; the bytes produced/consumed are unchanged. Each helper cites the
-// legislator.cpp / rsl.cpp lines it mirrors and comments every deviation.
-#include "storage_min.h"
+// unbuffered/overlapped/WriteFileGather mechanism is replaced by in-memory
+// buffers. Outcomes belong to this model, not production Windows recovery.
+#include "storage_model.h"
 
 #include "msg_engine_compat.h"   // RoundUpToPage, MemberSet, s_PageSize
 #include "utils.h"               // Utils::CalculateChecksum
@@ -231,7 +225,7 @@ const char* OutcomeName(Outcome o)
 namespace {
 
 // Marshal a message and patch the Rabin-64 checksum into its header, matching
-// tools/golden-gen/src/main.cpp's MarshalWithChecksum (which mirrors
+// tools/linux-proxy/src/main.cpp's MarshalWithChecksum (which mirrors
 // Message/Vote::CalculateChecksum). Returns the exact marshaled bytes (no pad).
 std::vector<char> MarshalMessage(Message& msg)
 {

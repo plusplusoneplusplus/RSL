@@ -1,15 +1,8 @@
 #pragma once
 
 #include "basic_types.h"
+#include "IMarshalMemoryManager.h"
 #include "logging.h"
-#ifdef _WIN32
-#include "netpacket.h"
-#else
-// On the Linux golden-gen slice, netpacket.h drags in the whole networking
-// stack; marshal.h only needs IMarshalMemoryManager from it, so use a minimal
-// stand-in that defines just that base class.
-#include <netpacket_min.h>
-#endif
 #include <string>
 // using namespace std;
 
@@ -346,4 +339,3 @@ private:
 };
 
 } // namespace RSLibImpl
-

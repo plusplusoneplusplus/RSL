@@ -19,6 +19,7 @@
 //
 
 #include "PacketHdr.h"
+#include "IMarshalMemoryManager.h"
 #include "logging.h"
 #include "NetBuffer.h"
 #include "PacketUtil.h"
@@ -29,46 +30,6 @@ namespace RSLibImpl
 
 class NetPacketCtx;
 class NetPacketSvc;
-
-class IMarshalMemoryManager
-{
-public:
-    /* return the current size of the allocated buffer */
-    virtual UInt32 GetBufferLength() = 0;
-
-    /* return a pointer to the allocated buffer; this becomes invalid
-       if the buffer is resized. */
-    virtual void* GetBuffer() = 0;
-
-    /* this call is for the use of clients which are growing the
-       buffer: if the space remaining in the current buffer is smaller
-       than writePtr+lengthDelta, it will reallocate the buffer to be
-       at least of length writePtr+lengthDelta, and potentially larger
-       (the standard implementation resizes to the next larger power
-       of 2). */
-    virtual void EnsureBuffer(UInt32 writePtr, UInt32 lengthDelta) = 0;
-
-    /* this call is for the use of clients which know what total
-       buffer size they want: if GetBufferLength() is smaller than
-       length, it will typically reallocate the buffer to the smallest
-       power of 2 >= length. This call will not necessarily shrink the
-       buffer if length is smaller than GetBufferLength(). */
-    virtual void ResizeBuffer(UInt32 length) = 0;
-
-    /* the memory manager also keeps track of two pointers within the
-       buffer which are typically used for reading and writing. The
-       memory manager will assert fail if the valid length is set to
-       be larger than the buffer size, or if the read pointer is set
-       to be larger than the valid length. If the valid length is
-       shrunk to be smaller than the read pointer, the read pointer is
-       set to zero. When the buffer is shrunk the new state of both
-       pointers is undefined. */
-    virtual UInt32 GetReadPointer() = 0;
-    virtual void SetReadPointer(UInt32 readPointer) = 0;
-    virtual UInt32 GetValidLength() = 0;
-    virtual void SetValidLength(UInt32 validLength) = 0;
-    virtual ~IMarshalMemoryManager() {};
-};
 
 class PacketMarshalMemoryManager : public IMarshalMemoryManager
 {

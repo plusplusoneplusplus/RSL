@@ -1,5 +1,4 @@
-// learn_min.h -- Phase-4c extract of the RSL *learn port*: the state-transfer
-// protocols (StatusQuery / FetchVotes / FetchCheckpoint) a lagging replica uses
+// Supplemental model of the RSL learn-port state-transfer protocols.
 // to catch up.
 //
 // Source: src/RSL/src/legislator.cpp --
@@ -14,12 +13,12 @@
 //           ReadNextMessage        :3851
 //           CopyCheckpoint         :5485
 //
-// As in packet_min.h and storage_min.h, the *decisions* are the original's,
+// As in packet_model.h and storage_model.h, the *decisions* are the original's,
 // line-cited; only the plumbing is replaced. Specifically:
 //
 //   * StreamSocket        -> a raw POSIX fd with blocking read/write helpers.
 //   * APSEQREAD/APSEQWRITE (unbuffered overlapped Windows I/O) -> stdio reads
-//     and writes. The snapshot semantics are preserved exactly: SendFile takes
+//     and writes. The model takes
 //     the file's size ONCE, when it opens it (APSEQREAD::DoInit,
 //     apdiskio.cpp:146, feeding `length = reader->FileSize() - offset` at
 //     legislator.cpp:4515), and never looks at it again.

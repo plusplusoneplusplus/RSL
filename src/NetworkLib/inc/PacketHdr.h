@@ -3,7 +3,7 @@
 //
 // PacketHdr.h
 //      The 20-byte wire header shared by the full NetworkLib (NetPacket.h) and
-//      the lightweight golden-gen slice (packet_min.h).
+//      the supplemental Linux proxy model (packet_model.h).
 //
 //      Only depends on basic_types.h -- no sockets, no BufferPool, no NetBuffer.
 //

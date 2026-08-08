@@ -3338,7 +3338,7 @@ void
 Legislator::HandleStatusQueryMsg(Message *msg, StreamSocket *sock)
 {
     LearnServerState learnState;
-    BuildLearnServerState(&learnState, Message_StatusQuery);
+    BuildLearnServerState(&learnState, *msg);
     if (learnState.relinquishing)
     {
         RSLInfo("Skip handling status query since I am reqlinquish the primary.", LogTag_RSLMsg, msg);
@@ -3654,7 +3654,7 @@ Legislator::HandleFetchVotesMsg(Message *msg, StreamSocket *sock)
 {
     RSLInfo("Handling fetch votes", LogTag_RSLMsg, msg);
     LearnServerState state;
-    BuildLearnServerState(&state, Message_FetchVotes);
+    BuildLearnServerState(&state, *msg);
     LearnFileMetrics metrics;
     ServeLearnRequest(*msg, sock, state, &metrics);
     RecordLearnFileMetrics(metrics);
@@ -3665,14 +3665,14 @@ Legislator::HandleFetchCheckpointMsg(Message *msg, StreamSocket *sock)
 {
     RSLInfo("Handling fetch checkpoint", LogTag_RSLMsg, msg);
     LearnServerState state;
-    BuildLearnServerState(&state, Message_FetchCheckpoint);
+    BuildLearnServerState(&state, *msg);
     LearnFileMetrics metrics;
     ServeLearnRequest(*msg, sock, state, &metrics);
     RecordLearnFileMetrics(metrics);
 }
 
 void
-Legislator::BuildLearnServerState(LearnServerState *state, UInt16 messageId)
+Legislator::BuildLearnServerState(LearnServerState *state, const Message& request)
 {
     AutoCriticalSection lock(&m_lock);
     state->relinquishing = m_relinquishPrimary;
@@ -3688,21 +3688,38 @@ Legislator::BuildLearnServerState(LearnServerState *state, UInt16 messageId)
     state->maxBallot = m_maxBallot;
     state->state = m_state;
     state->logs.clear();
-    if (messageId == Message_StatusQuery && !m_logFiles.empty())
+    if (request.m_msgId == Message_StatusQuery && !m_logFiles.empty())
     {
         LearnLogFile log;
         log.minDecree = m_logFiles.front()->m_minDecree;
         state->logs.push_back(log);
     }
-    else if (messageId == Message_FetchVotes)
+    else if (request.m_msgId == Message_FetchVotes)
     {
-        for (size_t i = 0; i < m_logFiles.size(); ++i)
+        vector<LogFile *>::iterator first = m_logFiles.end();
+        for (vector<LogFile *>::iterator log = m_logFiles.begin();
+             log != m_logFiles.end();
+             ++log)
         {
-            LearnLogFile log;
-            log.fileName = m_logFiles[i]->m_fileName;
-            log.minDecree = m_logFiles[i]->m_minDecree;
-            log.decreeOffsets = m_logFiles[i]->m_decreeOffsets;
-            state->logs.push_back(log);
+            if ((*log)->HasDecree(request.m_decree))
+            {
+                first = log;
+                break;
+            }
+        }
+        if (first != m_logFiles.end())
+        {
+            LearnLogFile firstLog;
+            firstLog.fileName = (*first)->m_fileName;
+            firstLog.minDecree = request.m_decree;
+            firstLog.decreeOffsets.push_back((*first)->GetOffset(request.m_decree));
+            state->logs.push_back(firstLog);
+            for (++first; first != m_logFiles.end(); ++first)
+            {
+                LearnLogFile laterLog;
+                laterLog.fileName = (*first)->m_fileName;
+                state->logs.push_back(laterLog);
+            }
         }
     }
 
@@ -4508,15 +4525,6 @@ Legislator::SendJoinMessage(UInt32 ip, UInt16 port, bool asClient)
     }
 }
 
-DWORD32
-Legislator::SendFile(char *file, UInt64 offset, Int64 length, StreamSocket *sock)
-{
-    LearnFileMetrics metrics;
-    DWORD32 error = SendLearnFile(file, offset, length, sock, &metrics);
-    RecordLearnFileMetrics(metrics);
-    return error;
-}
-
 void
 Legislator::SendStatusRequestMessage()
 {
@@ -5282,7 +5290,7 @@ Legislator::HandleFetchRequest(void *ctx)
         return;
     }
     LearnServerState state;
-    BuildLearnServerState(&state, msg.m_msgId);
+    BuildLearnServerState(&state, msg);
     LearnFileMetrics metrics;
     if (ServeLearnRequest(msg, pSocket.get(), state, &metrics) == ERROR_INVALID_DATA)
     {
@@ -5437,10 +5445,14 @@ Legislator::CopyCheckpoint(UInt32 ip, UInt16 port, UInt64 checkpointedDecree, UI
             file,
             &copyResult))
     {
-        if (copyResult.outcome == LearnCheckpointCopyResult::VerificationFailed)
+        if (copyResult.outcome == LearnCheckpointCopyResult::CreateFailed ||
+            copyResult.outcome == LearnCheckpointCopyResult::HeaderWriteFailed ||
+            copyResult.outcome == LearnCheckpointCopyResult::BodyWriteFailed ||
+            copyResult.outcome == LearnCheckpointCopyResult::FlushFailed ||
+            copyResult.outcome == LearnCheckpointCopyResult::VerificationFailed)
         {
             RSLError(
-                "Failed to verify the checkpoint, terminating the process to prevent codex corruption.",
+                "Local checkpoint persistence failed, terminating the process to prevent codex corruption.",
                 LogTag_Filename,
                 file);
             LogAssert(false);

@@ -1,7 +1,7 @@
 // tls_peer.h -- see tls_peer.cpp.
 //
 // Built only when CMake finds OpenSSL; `main.cpp` guards every call with
-// RSL_GOLDEN_TLS and tells the caller to install libssl-dev otherwise.
+// RSL_PROXY_TLS and tells the caller to install libssl-dev otherwise.
 #pragma once
 
 namespace rsl_tls

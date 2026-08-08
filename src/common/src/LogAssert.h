@@ -14,7 +14,7 @@ do { \
     } \
 } while (0)
 #else
-// Linux golden-gen slice: <crtdbg.h> does not exist and the LogAssert macro is
+// Linux rsl-linux-proxy slice: <crtdbg.h> does not exist and the LogAssert macro is
 // already provided by pal_logging.h (pulled in through logging.h above). Don't
 // redefine it here. This keeps DynamicBuffer.h -- which includes this header --
 // compilable on Linux. No effect on the Windows build.

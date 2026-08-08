@@ -45,7 +45,8 @@ namespace RSLibImpl
             ConnectFailed,
             HeaderRejected,
             HeaderWriteFailed,
-            Incomplete,
+            ReadFailed,
+            BodyWriteFailed,
             FlushFailed,
             VerificationFailed
         };

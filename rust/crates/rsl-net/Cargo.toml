@@ -1,7 +1,7 @@
 [package]
 name = "rsl-net"
 version = "0.1.0"
-description = "Byte-exact Rust port of the RSL network framing (20-byte packet header + learn-port message framing)."
+description = "Rust implementation of RSL packet and learn-port networking."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

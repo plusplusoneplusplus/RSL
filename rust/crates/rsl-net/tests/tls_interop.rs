@@ -1,13 +1,13 @@
 //! rustls against a TLS stack that is not rustls.
 //!
-//! The peer here is `golden-gen --tls-peer` / `--tls-client`: the real C++
-//! packet framing, over OpenSSL. It is a **proxy oracle** — the C++ RSL speaks
-//! TLS through SChannel, which cannot run on Linux — and it exists to catch the
+//! The peer here is `rsl-linux-proxy --tls-peer` / `--tls-client`: the Linux
+//! packet model over OpenSSL. It is supplemental foreign-stack coverage and
+//! exists to catch the
 //! failure mode two rustls peers cannot: a version, cipher suite, chain
 //! encoding or client-certificate exchange that only rustls agrees with.
 //!
-//! Skipped, loudly, when `golden-gen` has not been built or was built without
-//! OpenSSL. See `TLS.md` for the residual SChannel risk this does not close.
+//! Skipped, loudly, when `rsl-linux-proxy` has not been built or was built without
+//! OpenSSL. `schannel_interop` supplies production Windows TLS authority.
 
 mod certs;
 mod harness;
@@ -21,11 +21,11 @@ use std::time::Duration;
 
 use certs::{Ca, LeafSpec};
 use harness::Recorder;
-use learnfixture::{golden_gen, warn_no_peer, TempDir};
+use learnfixture::{linux_proxy, warn_no_peer, TempDir};
 use rsl_net::svc::{Packet, PacketSvc, SvcConfig, TxRxStatus};
 use rsl_net::tls::{Tls, TlsConfig};
 
-/// A CA, a certificate for each side, and PEM files on disk for the C++ peer.
+/// A CA, a certificate for each side, and PEM files on disk for the Linux proxy peer.
 struct Fixture {
     dir: TempDir,
     ca: Ca,
@@ -83,13 +83,13 @@ fn write(path: &std::path::Path, bytes: &[u8]) {
         .expect("write pem");
 }
 
-/// True when the built `golden-gen` has the OpenSSL peer compiled in.
+/// True when the built `rsl-linux-proxy` has the OpenSSL peer compiled in.
 fn tls_peer_available(bin: &std::path::Path) -> bool {
     let out = Command::new(bin)
         .arg("--tls-peer")
         .arg("0")
         .output()
-        .expect("run golden-gen");
+        .expect("run rsl-linux-proxy");
     // Exit 3 is the "built without OpenSSL" path; 2 is "arguments missing",
     // which means the peer is there.
     out.status.code() != Some(3)
@@ -97,12 +97,12 @@ fn tls_peer_available(bin: &std::path::Path) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rust_client_talks_to_an_openssl_server() {
-    let Some(bin) = golden_gen() else {
+    let Some(bin) = linux_proxy() else {
         return warn_no_peer("a_rust_client_talks_to_an_openssl_server");
     };
     if !tls_peer_available(&bin) {
         eprintln!(
-            "a_rust_client_talks_to_an_openssl_server: SKIPPED — golden-gen was built \
+            "a_rust_client_talks_to_an_openssl_server: SKIPPED — rsl-linux-proxy was built \
              without OpenSSL (install libssl-dev and re-run cmake)"
         );
         return;
@@ -155,12 +155,12 @@ async fn a_rust_client_talks_to_an_openssl_server() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_openssl_client_talks_to_a_rust_server() {
-    let Some(bin) = golden_gen() else {
+    let Some(bin) = linux_proxy() else {
         return warn_no_peer("an_openssl_client_talks_to_a_rust_server");
     };
     if !tls_peer_available(&bin) {
         eprintln!(
-            "an_openssl_client_talks_to_a_rust_server: SKIPPED — golden-gen was built \
+            "an_openssl_client_talks_to_a_rust_server: SKIPPED — rsl-linux-proxy was built \
              without OpenSSL"
         );
         return;
@@ -169,8 +169,8 @@ async fn an_openssl_client_talks_to_a_rust_server() {
     let fixture = Fixture::new("tls-interop-client");
     let tls = fixture.tls();
 
-    // A server that echoes every packet it receives, so the C++ client can
-    // count what came back and the round trip is proven end to end.
+    // A server that echoes every packet it receives, so the Linux proxy client can
+    // count what came back and check the round trip end to end.
     struct Forward(tokio::sync::mpsc::UnboundedSender<Arc<Packet>>);
     impl rsl_net::svc::PacketHandler for Forward {
         fn process_send(&self, _: &Arc<Packet>, _: TxRxStatus) {}

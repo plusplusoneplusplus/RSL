@@ -8,7 +8,7 @@
 #include "limits.h"
 #include "FingerPrint.h"
 #else
-// Linux golden-gen slice: hirestime.h/rsldebug.h symbols are unused here, and
+// Linux rsl-linux-proxy slice: hirestime.h/rsldebug.h symbols are unused here, and
 // legislator.h would drag in the whole engine. msg_engine_compat.h supplies the
 // MemberSet declaration and page-rounding helpers that message.cpp actually
 // needs. FingerPrint.h differs only in case from the real fingerprint.h.

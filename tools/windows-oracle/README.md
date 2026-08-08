@@ -31,9 +31,10 @@ RSLWindowsOracle.exe --verify-storage <directory>
 ```
 
 `--wire` emits line-oriented message, fingerprint, and `MarshalData` container
-vectors. `--storage` writes the small reviewable logs/checkpoints committed under
-`corpus/`. `--storage-full` additionally writes 4 MiB checksum-block boundary
-and multi-block checkpoints for workflow artifacts. Negative vectors are
+vectors. `--storage` writes the small reviewable logs/checkpoints used by the
+local Rust interop tests. `--storage-full` additionally writes 4 MiB
+checksum-block boundary and multi-block checkpoints for workflow artifacts.
+Both write a `MANIFEST.json` describing the files. Negative vectors are
 created by mutating or truncating production-written files externally before
 passing them to the production readers.
 
@@ -94,8 +95,13 @@ across builds. Their manifests mark `byteStable` as `false`; the canonical
 contract is message type/version/length plus production parser verdicts for
 wire, and production reader verdicts plus recovered metadata for storage.
 
-The small committed corpus is a reviewable local fallback. CI generates the
-full Release corpus from a clean checkout:
+Storage fixtures are therefore not committed (see `.gitignore`): committing
+non-byte-stable binaries only produces churn. `RSLWindowsOracle.exe --storage
+<directory>` regenerates them on demand, and the Rust interop tests do this
+automatically when `RSL_WINDOWS_ORACLE` is set. Only the text wire corpus under
+`corpus/` stays in the tree, because it diffs reviewably.
+
+CI generates the full Release corpus from a clean checkout:
 
 ```powershell
 .\tools\windows-oracle\New-InteropArtifact.ps1 `
@@ -127,6 +133,8 @@ $env:RSL_WINDOWS_ORACLE = "<path>\RSLWindowsOracle.exe"
 cargo test -p rsl-storage --test windows_oracle
 ```
 
-Authoritative mode fails if `RSL_WINDOWS_ORACLE` is missing or invalid.
-Portable corpus-only tests can instead set `RSL_WINDOWS_WIRE` to `wire.txt` and
+Authoritative mode fails if `RSL_WINDOWS_ORACLE` is missing or invalid. With
+`RSL_WINDOWS_ORACLE` set, the storage tests regenerate their corpus from the
+oracle; without it they skip unless `RSL_WINDOWS_STORAGE` names a storage
+directory. Portable corpus-only tests set `RSL_WINDOWS_WIRE` to `wire.txt` and
 `RSL_WINDOWS_STORAGE` to its storage directory.

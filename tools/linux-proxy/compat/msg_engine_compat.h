@@ -1,12 +1,12 @@
 // Linux compat stand-in for the parts of legislator.h that message.cpp needs.
 //
-// message.cpp includes legislator.h but, for the golden-gen slice, only three
+// message.cpp includes legislator.h but, for the rsl-linux-proxy slice, only three
 // things from it are actually referenced: the page-rounding helpers used by
 // Vote's buffer management, and the MemberSet class (used by reconfiguration
 // Votes and BootstrapMsg). Pulling in the full legislator.h would drag in the
 // whole engine (net, disk, config), so we reproduce just those declarations
 // here. The MemberSet declaration is kept identical to legislator.h so this
-// header and engine_min.cpp agree on its layout.
+// header and engine_support.cpp agree on its layout.
 #pragma once
 
 #include "rsl.h"        // RSLNodeCollection, RSLNodeArray, RSLNode, RSLMemberSet
@@ -41,7 +41,7 @@ namespace RSLibImpl
     }
 
     // Declaration copied verbatim from RSL/src/legislator.h so that message.cpp
-    // and engine_min.cpp share one definition. Implemented in engine_min.cpp
+    // and engine_support.cpp share one definition. Implemented in engine_support.cpp
     // (extracted verbatim from RSL/src/rsl.cpp).
     class MemberSet : public RefCount
     {

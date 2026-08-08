@@ -2,7 +2,7 @@
 //!
 //! The `StartContainer`/`CloseContainer` back-patch rule (a caller-chosen
 //! 1-byte or 4-byte length field, filled in on close) has no message-level
-//! corpus coverage until checkpoint headers arrive in Phase 3, so golden-gen
+//! corpus coverage until checkpoint headers arrive in Phase 3, so rsl-linux-proxy
 //! emits raw `MarshalData` CONTAINER vectors directly. This harness rebuilds
 //! each scenario, keyed by its corpus `DESC`, with the Rust [`Writer`] and
 //! requires byte-identical output.
@@ -11,8 +11,8 @@ mod common;
 
 use rsl_wire::marshal::Writer;
 
-/// Rebuild the C++ scenario named `desc` (see `GenerateContainers` in
-/// `tools/golden-gen/src/main.cpp` — the two must stay in sync).
+/// Rebuild the proxy reference scenario named `desc` (see `GenerateContainers` in
+/// `tools/linux-proxy/src/main.cpp` — the two must stay in sync).
 fn build(desc: &str) -> Writer {
     let mut w = Writer::new();
     match desc {
@@ -70,7 +70,7 @@ fn container_vectors_match_cpp_backpatch() {
         assert_eq!(
             w.as_bytes(),
             &c.bytes[..],
-            "{}: Rust container bytes differ from C++",
+            "{}: Rust container bytes differ from the proxy reference",
             c.desc
         );
     }

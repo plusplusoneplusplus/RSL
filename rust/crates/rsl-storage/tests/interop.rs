@@ -1,19 +1,14 @@
 //! Portable proxy interop: checkpoints and logs written by *this* crate are read
-//! by the extracted Linux C++ proxy (`golden-gen --verify-storage`). Production
+//! by the Linux storage model (`rsl-linux-proxy --verify-storage`). Production
 //! Windows coverage lives in `windows_oracle.rs`.
 //!
-//! `corpus.rs` proves the Rust side reads (and reproduces) C++-written files;
-//! this closes the loop in the other direction, which is what the Phase-3a
-//! reverse mode exists for. It needs the `golden-gen` binary (cmake + g++); when
-//! that is not built the test reports a skip rather than failing.
+//! `corpus.rs` checks Rust against Linux-model files; this module exercises the
+//! reverse model direction. It needs `rsl-linux-proxy` (CMake + g++); absence is
+//! an explicit optional local skip, while CI always supplies it.
 //!
-//! The last two tests are the Phase-3d **interop matrix**: a whole data
-//! directory, not a single file. One starts from C++-written files (the Phase-3a
-//! corpus), has Rust recover, append and checkpoint into it, then hands it back
-//! to the C++ readers; the other starts from a Rust-written directory, has the
-//! C++ verify it, then has Rust restart on it. Both run across every protocol
-//! version — which is the handoff a rolling upgrade actually performs, two
-//! phases before the engine exists.
+//! The last two tests use whole directories across every protocol version. They
+//! compare Rust takeover/restart behavior with the Linux model; production
+//! rolling-upgrade evidence comes from Windows authority tests.
 
 mod common;
 
@@ -70,12 +65,12 @@ fn header(version: ProtocolVersion, decree: u64) -> CheckpointHeader {
 }
 
 #[test]
-fn cpp_accepts_rust_written_checkpoints() {
-    let Some(generator) = common::golden_gen() else {
+fn linux_proxy_accepts_rust_written_checkpoints() {
+    let Some(generator) = common::linux_proxy() else {
         eprintln!(
-            "cpp_accepts_rust_written_checkpoints: SKIPPED — golden-gen is not built \
-             (cmake -S tools/golden-gen -B tools/golden-gen/build && cmake --build \
-             tools/golden-gen/build), and RSL_GOLDEN_GEN is unset."
+            "linux_proxy_accepts_rust_written_checkpoints: SKIPPED — rsl-linux-proxy is not built \
+             (cmake -S tools/linux-proxy -B tools/linux-proxy/build && cmake --build \
+             tools/linux-proxy/build), and RSL_LINUX_PROXY is unset."
         );
         return;
     };
@@ -120,7 +115,7 @@ fn cpp_accepts_rust_written_checkpoints() {
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", generator.display()));
     assert!(
         output.status.success(),
-        "golden-gen --verify-storage exited {}",
+        "rsl-linux-proxy --verify-storage exited {}",
         output.status
     );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -133,7 +128,7 @@ fn cpp_accepts_rust_written_checkpoints() {
             .unwrap_or_else(|| panic!("no verdict for {name} in:\n{stdout}"));
         assert!(
             line.contains(" accept "),
-            "C++ rejected a Rust-written checkpoint: {line}"
+            "Linux proxy rejected a Rust-written checkpoint: {line}"
         );
         assert!(
             line.contains(&format!("version={}", version.raw())),
@@ -147,9 +142,9 @@ fn cpp_accepts_rust_written_checkpoints() {
 }
 
 #[test]
-fn cpp_rejects_a_corrupted_rust_checkpoint() {
-    let Some(generator) = common::golden_gen() else {
-        eprintln!("cpp_rejects_a_corrupted_rust_checkpoint: SKIPPED — golden-gen is not built.");
+fn linux_proxy_rejects_a_corrupted_rust_checkpoint() {
+    let Some(generator) = common::linux_proxy() else {
+        eprintln!("linux_proxy_rejects_a_corrupted_rust_checkpoint: SKIPPED — rsl-linux-proxy is not built.");
         return;
     };
     let dir = common::TempDir::new("interop-bad");
@@ -161,8 +156,7 @@ fn cpp_rejects_a_corrupted_rust_checkpoint() {
     writer.write_all(&common::ramp_state(4096)).expect("write");
     writer.finish().expect("finish");
 
-    // Flip a user-data byte: the C++ must reject on the block checksum, and so
-    // must we — the two readers agree on corrupt files, not just clean ones.
+    // Flip a user-data byte and compare the two model verdicts.
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[header_len + 17] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
@@ -178,7 +172,7 @@ fn cpp_rejects_a_corrupted_rust_checkpoint() {
         .arg("--verify-storage")
         .arg(dir.path())
         .output()
-        .expect("run golden-gen");
+        .expect("run rsl-linux-proxy");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let line = stdout
         .lines()
@@ -186,11 +180,11 @@ fn cpp_rejects_a_corrupted_rust_checkpoint() {
         .unwrap_or_else(|| panic!("no verdict in:\n{stdout}"));
     assert!(
         line.contains(" reject "),
-        "C++ accepted a corrupt file: {line}"
+        "Linux proxy accepted a corrupt file: {line}"
     );
     assert!(
         line.contains("block checksum mismatch"),
-        "C++ rejected for a different reason: {line}"
+        "Linux proxy rejected for a different reason: {line}"
     );
 }
 
@@ -240,18 +234,18 @@ fn verify_storage(generator: &std::path::Path, dir: &std::path::Path) -> String 
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", generator.display()));
     assert!(
         output.status.success() || output.status.code() == Some(3),
-        "golden-gen --verify-storage exited {}",
+        "rsl-linux-proxy --verify-storage exited {}",
         output.status
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The extracted C++ reader accepts logs this crate writes, and reports the
+/// The Linux storage-model reader accepts logs this crate writes, and reports the
 /// same record count and stop offset the Rust scan does.
 #[test]
-fn cpp_accepts_rust_written_logs() {
-    let Some(generator) = common::golden_gen() else {
-        eprintln!("cpp_accepts_rust_written_logs: SKIPPED — golden-gen is not built.");
+fn linux_proxy_accepts_rust_written_logs() {
+    let Some(generator) = common::linux_proxy() else {
+        eprintln!("linux_proxy_accepts_rust_written_logs: SKIPPED — rsl-linux-proxy is not built.");
         return;
     };
     let dir = common::TempDir::new("interop-log");
@@ -299,7 +293,7 @@ fn cpp_accepts_rust_written_logs() {
         let line = verdict_for(&stdout, &name);
         assert!(
             line.contains(" accept "),
-            "C++ rejected a Rust-written log: {line}"
+            "Linux proxy rejected a Rust-written log: {line}"
         );
         assert!(
             line.contains(&format!("records={}", records.len())),
@@ -310,11 +304,11 @@ fn cpp_accepts_rust_written_logs() {
         assert_eq!(scan.records.len(), records.len());
         assert!(
             line.contains(&format!("stopOffset={}", scan.stop_offset)),
-            "C++ and Rust disagree on the stop offset: {line}"
+            "Linux proxy and Rust disagree on the stop offset: {line}"
         );
         assert!(
             line.contains(scan.detail()),
-            "C++ and Rust disagree on the detail: {line}"
+            "Linux proxy and Rust disagree on the detail: {line}"
         );
     }
 }
@@ -323,9 +317,9 @@ fn cpp_accepts_rust_written_logs() {
 /// the file. Each case mirrors one Phase-3a corpus sample, built from the Rust
 /// side this time.
 #[test]
-fn cpp_and_rust_agree_on_damaged_rust_logs() {
-    let Some(generator) = common::golden_gen() else {
-        eprintln!("cpp_and_rust_agree_on_damaged_rust_logs: SKIPPED — golden-gen is not built.");
+fn linux_proxy_and_rust_agree_on_damaged_rust_logs() {
+    let Some(generator) = common::linux_proxy() else {
+        eprintln!("linux_proxy_and_rust_agree_on_damaged_rust_logs: SKIPPED — rsl-linux-proxy is not built.");
         return;
     };
     let dir = common::TempDir::new("interop-log-bad");
@@ -360,7 +354,7 @@ fn cpp_and_rust_agree_on_damaged_rust_logs() {
         let line = verdict_for(&stdout, name);
         assert!(
             line.contains(&format!(" {} ", scan.outcome())),
-            "C++ and Rust disagree on the outcome for {name}: {line} vs {}",
+            "Linux proxy and Rust disagree on the outcome for {name}: {line} vs {}",
             scan.outcome()
         );
         assert!(
@@ -414,8 +408,7 @@ fn versioned_vote(version: ProtocolVersion, decree: u64, request_len: usize) -> 
     vote.marshal_with_checksum().unwrap()
 }
 
-/// Check every `*.log`, `*.codex` and `*.txt` in `dir` against the C++ readers,
-/// asserting they reach exactly the verdict this crate reaches.
+/// Compare every storage file in `dir` with the Linux model verdict.
 fn cross_check_directory(generator: &Path, dir: &Path, what: &str) {
     let stdout = verify_storage(generator, dir);
     let listing = DataDir::scan(dir).expect("scan the data directory");
@@ -433,7 +426,7 @@ fn cross_check_directory(generator: &Path, dir: &Path, what: &str) {
                 && line.contains(&format!("records={}", scan.records.len()))
                 && line.contains(&format!("stopOffset={}", scan.stop_offset))
                 && line.contains(scan.detail()),
-            "{what}: C++ and Rust disagree on {name}: {line} vs \
+            "{what}: Linux proxy and Rust disagree on {name}: {line} vs \
              {} records={} stopOffset={} ({})",
             scan.outcome(),
             scan.records.len(),
@@ -451,7 +444,7 @@ fn cross_check_directory(generator: &Path, dir: &Path, what: &str) {
             line.contains(&format!(" {} ", verified.outcome()))
                 && line.contains(&format!("userData={}", verified.user_data_size))
                 && line.contains(verified.detail()),
-            "{what}: C++ and Rust disagree on {name}: {line} vs \
+            "{what}: Linux proxy and Rust disagree on {name}: {line} vs \
              {} userData={} ({})",
             verified.outcome(),
             verified.user_data_size,
@@ -463,23 +456,23 @@ fn cross_check_directory(generator: &Path, dir: &Path, what: &str) {
         let line = verdict_for(&stdout, dir::DEFUNCT_FILE);
         assert!(
             line.contains(" accept ") && line.contains(&format!("value={value}")),
-            "{what}: C++ read defunct.txt differently: {line} vs value={value}"
+            "{what}: proxy model read defunct.txt differently: {line} vs value={value}"
         );
     }
 }
 
-/// The C++ → Rust handoff. A data directory whose log and checkpoint were
-/// written by the C++ (the Phase-3a corpus) is recovered by this crate, appended
-/// to, checkpointed over, garbage-collected — and then handed back to the C++
-/// readers, which must still accept every file.
+/// A Linux-model directory is recovered, extended and garbage-collected by
+/// Rust, then compared with the model again.
 #[test]
-fn a_cpp_written_directory_survives_a_rust_takeover() {
-    let Some(generator) = common::golden_gen() else {
-        eprintln!("a_cpp_written_directory_survives_a_rust_takeover: SKIPPED — golden-gen.");
+fn a_linux_proxy_written_directory_survives_a_rust_takeover() {
+    let Some(generator) = common::linux_proxy() else {
+        eprintln!(
+            "a_linux_proxy_written_directory_survives_a_rust_takeover: SKIPPED — rsl-linux-proxy."
+        );
         return;
     };
     let Some(corpus) = common::storage_corpus() else {
-        common::warn_no_corpus("a_cpp_written_directory_survives_a_rust_takeover");
+        common::warn_no_corpus("a_linux_proxy_written_directory_survives_a_rust_takeover");
         return;
     };
 
@@ -487,7 +480,7 @@ fn a_cpp_written_directory_survives_a_rust_takeover() {
         let v = version.raw();
         let scratch = common::TempDir::new(&format!("matrix-cpp-v{v}"));
 
-        // Lay out the C++ files under the names a data directory uses. The log
+        // Lay out the Linux proxy files under the names a data directory uses. The log
         // is named after the first decree it holds, the checkpoint after the
         // last decree it contains.
         let log_bytes = std::fs::read(corpus.join(format!("vote-v{v}.log"))).expect("read log");
@@ -518,12 +511,12 @@ fn a_cpp_written_directory_survives_a_rust_takeover() {
             "v{v}: checkpoint not enumerated"
         );
 
-        // ...recovers the C++ log and keeps writing into it...
+        // ...recovers the Linux proxy log and keeps writing into it...
         let mut writer = LogWriter::open(scratch.path(), log_decree).expect("recover the log");
         assert_eq!(
             writer.index().max_decree(),
             log_decree,
-            "v{v}: the C++ log's decree was not recovered"
+            "v{v}: the Linux proxy log's decree was not recovered"
         );
         for step in 1..=3 {
             let decree = log_decree + step;
@@ -552,19 +545,20 @@ fn a_cpp_written_directory_survives_a_rust_takeover() {
             "v{v}: cleanup deleted the only log"
         );
 
-        // --- and hand the directory back to the C++ -----------------------
-        cross_check_directory(&generator, scratch.path(), &format!("v{v} cpp->rust"));
+        // --- and hand the directory back to the Linux proxy -----------------------
+        cross_check_directory(&generator, scratch.path(), &format!("v{v} proxy->rust"));
     }
 }
 
-/// The Rust → C++ direction: a data directory built entirely by this crate —
-/// several logs, several checkpoints, `defunct.txt` — is read by the C++, then
-/// garbage-collected and re-read by both. This is the rolling upgrade running
-/// backwards, which a mixed cluster also has to survive.
+/// The Rust → proxy-model direction: a data directory built entirely by this crate —
+/// several logs, several checkpoints, `defunct.txt` — is read by the Linux proxy, then
+/// garbage-collected and re-read by both model implementations.
 #[test]
-fn a_rust_written_directory_is_readable_by_the_cpp() {
-    let Some(generator) = common::golden_gen() else {
-        eprintln!("a_rust_written_directory_is_readable_by_the_cpp: SKIPPED — golden-gen.");
+fn a_rust_written_directory_is_readable_by_the_linux_proxy() {
+    let Some(generator) = common::linux_proxy() else {
+        eprintln!(
+            "a_rust_written_directory_is_readable_by_the_linux_proxy: SKIPPED — rsl-linux-proxy."
+        );
         return;
     };
 

@@ -213,7 +213,7 @@ offers them only on recent Windows 10 and not by default, so leaving them in
 would make the negotiated suite depend on which Windows build a peer happens to
 be running. The right-hand column is the OpenSSL spelling used by the interop
 oracle, so the pin is checkable from both sides
-(`tools/golden-gen/src/tls_peer.cpp`).
+(`tools/linux-proxy/src/tls_peer.cpp`).
 
 Set `compat_tls12_only = false` once every replica is Rust to allow TLS 1.3 as
 well. A C++ replica cannot negotiate it, so a mixed fleet keeps landing on 1.2
@@ -221,7 +221,7 @@ regardless — the flag costs nothing to leave on.
 
 ## Interoperability
 
-`golden-gen --tls-peer` / `--tls-client` is an RSL packet peer over **OpenSSL**,
+`rsl-linux-proxy --tls-peer` / `--tls-client` is an RSL packet peer over **OpenSSL**,
 built when CMake finds libssl. `tests/tls_interop.rs` drives both directions:
 
 - Rust client → OpenSSL server, and

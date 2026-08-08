@@ -5,9 +5,9 @@
 //! written by [`checkpoint::CheckpointWriter`] and read back by
 //! [`checkpoint::CheckpointReader`]. Files written here are byte-compatible with
 //! `RSLCheckpointStreamWriter` (`src/RSL/src/rsl.cpp`) and
-//! `CheckpointHeader::Marshal` (`src/RSL/src/legislator.cpp`), and files written
-//! by the C++ parse here with identical accept/reject decisions — proven against
-//! the Phase-3a golden corpus (`tools/golden-gen --storage`).
+//! `CheckpointHeader::Marshal` (`src/RSL/src/legislator.cpp`). Compatibility
+//! with literal production files and recovery verdicts is checked against
+//! `RSLWindowsOracle`; `tools/linux-proxy` adds supplemental POSIX/model cases.
 //!
 //! Phase 3c adds the rest of the data directory: the log (`<decree>.log`)
 //! writer, its decree→offset index and the startup recovery scan ([`log`]);

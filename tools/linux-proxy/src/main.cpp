@@ -1,4 +1,4 @@
-// golden-gen -- Phase-1 golden-vector generator.
+// rsl-linux-proxy -- supplemental Linux protocol models and reference vectors.
 //
 // Constructs RSL messages of every type, across every protocol version that
 // affects their layout, marshals them with the original C++ marshaling code,
@@ -27,11 +27,11 @@
 #include "msg_engine_compat.h"
 #include "utils.h"
 #include "fingerprint.h"
-#include "storage_min.h"       // Phase 3a: storage corpus + reverse verify
-#include "packet_min.h"        // Phase 4a: packet + learn-port framing
-#include "learn_min.h"         // Phase 4c: the live learn port, both directions
-#ifdef RSL_GOLDEN_TLS
-#include "tls_peer.h"          // Phase 4d: the TLS 1.2 interop oracle (OpenSSL)
+#include "storage_model.h"       // Phase 3a: storage corpus + reverse verify
+#include "packet_model.h"        // Phase 4a: packet + learn-port framing
+#include "learn_model.h"         // Phase 4c: the live learn port, both directions
+#ifdef RSL_PROXY_TLS
+#include "tls_peer.h"          // Supplemental OpenSSL TLS 1.2 peer.
 #endif
 
 using namespace RSLib;
@@ -206,7 +206,7 @@ void SelfCheck(const char* desc, std::vector<char>& buf)
     }
 }
 
-// Every message emitted as a RECORD is kept here so the Phase-4a packet and
+// Every message emitted as a RECORD is kept so packet and
 // learn-port vectors can frame real corpus messages rather than inventing new
 // payloads.
 struct CorpusMsg
@@ -506,7 +506,7 @@ void GenerateBootstrap()
 }
 
 // ---------------------------------------------------------------------------
-// Raw MarshalData container vectors (Phase-2 gap closure, item 4a). The
+// Raw MarshalData container vectors. The
 // StartContainer/CloseContainer back-patch rule (1-byte vs 4-byte length is
 // caller-chosen) has no message-level coverage until checkpoint headers arrive
 // in Phase 3, so emit it directly here. CONTAINER blocks carry no checksum:
@@ -615,10 +615,8 @@ void GenerateFingerprints()
 }
 
 // ===========================================================================
-// Phase 4a: packet framing vectors (PACKET) and learn-port framing vectors
-// (LEARN). As everywhere else in this tool, the OUTCOME lines are produced by
-// RUNNING the extracted C++ receive path over the bytes emitted -- never by
-// reading the spec.
+// Packet and learn framing vectors. OUTCOME lines come from the Linux proxy
+// model, not the production Windows IOCP or learn-port implementation.
 // ===========================================================================
 
 void EmitPacket(const char* desc, const std::vector<char>& frame,
@@ -899,10 +897,7 @@ void GenerateLearn()
 }
 
 // ===========================================================================
-// Phase 3a: storage corpus generation (--storage) and reverse verification
-// (--verify-storage). The extracted C++ readers in storage_min.cpp are the
-// ground truth: every MANIFEST outcome is produced by RUNNING them over the
-// bytes just written, never by reading the format spec (plan item 6 caution).
+// Supplemental storage-model corpus generation and reverse verification.
 // ===========================================================================
 using rsl_storage::Outcome;
 using rsl_storage::OutcomeName;
@@ -1311,7 +1306,7 @@ int GenerateStorage(const char* outdir)
     // ---- MANIFEST ---------------------------------------------------------
     std::string manifest;
     manifest += "{\n";
-    manifest += "  \"generator\": \"golden-gen --storage (Phase 3a)\",\n";
+    manifest += "  \"generator\": \"rsl-linux-proxy --storage (supplemental model)\",\n";
     char nums[64];
     snprintf(nums, sizeof(nums), "  \"pageSize\": %u,\n", (unsigned)s_PageSize);
     manifest += nums;
@@ -1333,10 +1328,7 @@ int GenerateStorage(const char* outdir)
     return 0;
 }
 
-// Reverse mode: run the extracted C++ readers over every file in a directory
-// and report per-file accept/stop/reject + recovered record counts. This is how
-// "C++ reads (Rust-written) files" works without Windows or the full engine; in
-// CI it re-reads the C++ generator's own output as a sanity check.
+// Run the Linux storage model over every file and report model outcomes.
 int VerifyStorage(const char* dir)
 {
     DIR* d = opendir(dir);
@@ -1411,16 +1403,14 @@ int main(int argc, char** argv)
     {
         return VerifyStorage(argv[2]);
     }
-    // Phase 4a: live C++ TCP peer, the interop oracle for the Rust net tests.
-    // Not part of corpus regeneration; spawned on demand.
+    // Linux packet-model peer, spawned by optional proxy tests.
     if (argc >= 3 && strcmp(argv[1], "--packet-peer") == 0)
     {
         const char* mode = "echo";
         if (argc >= 5 && strcmp(argv[3], "--mode") == 0) { mode = argv[4]; }
         return rsl_packet::RunPeer(atoi(argv[2]), mode);
     }
-    // Phase 4d: the same peer over TLS 1.2, via OpenSSL. A *proxy* oracle --
-    // the real C++ uses SChannel, which does not run here. See tls_peer.cpp.
+    // Supplemental packet-model peer over OpenSSL. Production uses SChannel.
     //
     //   --tls-peer   <port> --cert <pem> --key <pem> --ca <pem> [--mode echo|log]
     //   --tls-client <host> <port> --cert <pem> --key <pem> --ca <pem>
@@ -1428,7 +1418,7 @@ int main(int argc, char** argv)
     if (argc >= 3 &&
         (strcmp(argv[1], "--tls-peer") == 0 || strcmp(argv[1], "--tls-client") == 0))
     {
-#ifndef RSL_GOLDEN_TLS
+#ifndef RSL_PROXY_TLS
         fprintf(stderr,
                 "%s needs OpenSSL: install libssl-dev and re-run cmake\n", argv[1]);
         return 3;
@@ -1503,7 +1493,7 @@ int main(int argc, char** argv)
         return rsl_learn::RunClient(argv[2], atoi(argv[3]), mode, decree, size, out);
     }
 
-    printf("# RSL Phase-1 golden vectors (generated by tools/golden-gen)\n");
+    printf("# RSL supplemental Linux proxy vectors (tools/linux-proxy)\n");
     printf("# magic=0x%08x checksumOffset=%u\n\n",
            (unsigned)s_MessageMagic, (unsigned)s_ChecksumOffset);
 

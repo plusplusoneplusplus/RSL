@@ -291,11 +291,16 @@ bool CopyLearnCheckpointFile(
     {
         UInt32 bytesRead;
         error = reader.Read(memory.GetBuffer(), memory.GetBufferLength(), &bytesRead);
-        if (error != NO_ERROR ||
-            writer->Write(memory.GetBuffer(), bytesRead) != NO_ERROR)
+        if (error != NO_ERROR)
         {
-            result->outcome = LearnCheckpointCopyResult::Incomplete;
+            result->outcome = LearnCheckpointCopyResult::ReadFailed;
             result->detail = "incomplete checkpoint";
+            goto Error;
+        }
+        if (writer->Write(memory.GetBuffer(), bytesRead) != NO_ERROR)
+        {
+            result->outcome = LearnCheckpointCopyResult::BodyWriteFailed;
+            result->detail = "checkpoint body write failed";
             goto Error;
         }
     }

@@ -1,7 +1,7 @@
 //! Wire types shared across messages: [`MemberId`], [`BallotNumber`],
 //! [`RslNode`], [`MemberSet`]. Ports of the same-named C++ classes in
 //! `message.cpp` (member id / ballot) and `rsl.cpp` (node / member set,
-//! extracted into `engine_min.cpp`).
+//! supplied to the Linux proxy by `engine_support.cpp`).
 
 use crate::marshal::{Reader, Writer};
 use crate::version::ProtocolVersion;
@@ -292,7 +292,7 @@ pub struct RslNode {
 }
 
 /// A replica set plus an opaque configuration cookie. Port of `MemberSet`
-/// (`engine_min.cpp`).
+/// (`tools/linux-proxy/src/engine_support.cpp` supplies the proxy dependency).
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct MemberSet {
     pub members: Vec<RslNode>,

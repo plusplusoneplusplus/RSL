@@ -228,7 +228,7 @@ pub fn unmarshal_base(buf: &[u8]) -> Option<Header> {
 
 /// Recompute the Rabin-64 checksum over the post-checksum region and patch it
 /// into the 8-byte checksum field. Shared by every top-level marshal.
-/// (`Message::CalculateChecksum` / the golden-gen driver.)
+/// (`Message::CalculateChecksum` / the rsl-linux-proxy driver.)
 pub(crate) fn finalize(mut bytes: Vec<u8>) -> Vec<u8> {
     let data_off = CHECKSUM_OFFSET + 8;
     debug_assert!(bytes.len() >= data_off);

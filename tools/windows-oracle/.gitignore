@@ -1,0 +1,6 @@
+# Generated production-oracle storage fixtures. These are literal Windows
+# outputs and are explicitly not byte-stable (the generated MANIFEST.json
+# records `byteStable: false`), so committing them only produces binary churn.
+# Regenerate on demand with `RSLWindowsOracle.exe --storage <directory>`; the
+# Rust interop tests do this automatically.
+corpus/storage/

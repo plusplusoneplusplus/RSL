@@ -54,21 +54,31 @@ pub fn repo_root() -> PathBuf {
 }
 
 pub fn corpus_path() -> PathBuf {
-    repo_root().join("tools/golden-gen/corpus/phase1-golden.txt")
+    repo_root().join("tools/linux-proxy/corpus/proxy-vectors.txt")
 }
 
-/// The `golden-gen` binary, if it has been built (or `RSL_GOLDEN_GEN` points at
+/// The `rsl-linux-proxy` binary, if it has been built (or `RSL_LINUX_PROXY` points at
 /// one). Building it needs cmake + g++, so its absence is not a test failure —
 /// the live-peer tests skip instead.
-pub fn golden_gen() -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os("RSL_GOLDEN_GEN") {
+pub fn linux_proxy() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("RSL_LINUX_PROXY") {
         if !value.is_empty() {
             let path = PathBuf::from(value);
-            return path.is_file().then_some(path);
+            assert!(
+                path.is_file(),
+                "RSL_LINUX_PROXY={} is not a file",
+                path.display()
+            );
+            return Some(path);
         }
     }
-    let path = repo_root().join("tools/golden-gen/build/golden-gen");
-    path.is_file().then_some(path)
+    #[cfg(unix)]
+    {
+        let path = repo_root().join("tools/linux-proxy/build/rsl-linux-proxy");
+        path.is_file().then_some(path)
+    }
+    #[cfg(not(unix))]
+    None
 }
 
 pub fn authoritative_interop() -> bool {
@@ -97,9 +107,9 @@ pub fn windows_oracle() -> Option<PathBuf> {
 
 pub fn warn_no_peer(test: &str) {
     eprintln!(
-        "{test}: SKIPPED — no golden-gen binary. Build it with \
-         `cmake -S tools/golden-gen -B tools/golden-gen/build && \
-         cmake --build tools/golden-gen/build`, or set RSL_GOLDEN_GEN."
+        "{test}: SKIPPED — no rsl-linux-proxy binary. Build it with \
+         `cmake -S tools/linux-proxy -B tools/linux-proxy/build && \
+         cmake --build tools/linux-proxy/build`, or set RSL_LINUX_PROXY."
     );
 }
 

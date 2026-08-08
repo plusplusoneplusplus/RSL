@@ -1,12 +1,11 @@
 #pragma once
 
 // checkpoint.h -- declarations of the checkpoint (.codex) format types shared
-// by the Windows RSL engine and the Linux golden-vector tool.
+// by the Windows RSL engine and the supplemental Linux proxy model.
 //
 // ConfigurationInfo and CheckpointHeader define the byte layout of the .codex
 // checkpoint file, so their data members and marshaling methods must stay
-// identical between the engine and tools/golden-gen (which generates and
-// verifies golden .log/.codex corpora on Linux for the Rust port). They used to
+// identical between the engine and tools/linux-proxy. They used to
 // be declared inline in legislator.h and copied by hand into the tool's compat
 // header; having ONE declaration removes that drift risk.
 //
@@ -14,7 +13,7 @@
 // BallotNumber, Vote, MarshalData, Ptr<>/RefCount and RSLProtocolVersion are
 // already declared. Both includers satisfy that:
 //   - Windows: legislator.h includes it right after its MemberSet declaration.
-//   - Linux:   tools/golden-gen/compat/storage_compat.h includes it after
+//   - Linux:   tools/linux-proxy/compat/storage_compat.h includes it after
 //              msg_engine_compat.h (which supplies MemberSet + page helpers).
 //
 // Everything here is shared verbatim EXCEPT the Windows-only file/stream entry

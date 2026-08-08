@@ -1,7 +1,7 @@
 //! Portable transport proxy coverage over a real socket.
 //!
 //! `tests/live_peer.rs` (Phase 4a) proved the *bytes* agree by driving the
-//! extracted C++ receive proxy from a hand-written socket. Authoritative
+//! Linux receive model from a hand-written socket. Authoritative
 //! production Windows service/IOCP coverage lives in
 //! `windows_network_oracle.rs`.
 //!
@@ -32,12 +32,12 @@ struct Peer {
 
 impl Peer {
     fn start(mode: &str) -> Option<Peer> {
-        let binary = common::golden_gen()?;
+        let binary = common::linux_proxy()?;
         let mut child = Command::new(binary)
             .args(["--packet-peer", "0", "--mode", mode])
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn golden-gen peer");
+            .expect("spawn rsl-linux-proxy peer");
 
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut line = String::new();
@@ -75,12 +75,12 @@ fn client(handler: Arc<Recorder>, limits: Limits) -> PacketSvc {
 }
 
 /// A sustained exchange: many packets across a range of sizes go out through
-/// the service, are validated and echoed by the C++, and come back through the
+/// the service, are validated and echoed by the proxy, and come back through the
 /// service's receive path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sustained_exchange_with_the_cpp_peer() {
+async fn a_sustained_exchange_with_the_linux_proxy_peer() {
     let Some(peer) = Peer::start("echo") else {
-        common::warn_no_peer("a_sustained_exchange_with_the_cpp_peer");
+        common::warn_no_peer("a_sustained_exchange_with_the_linux_proxy_peer");
         return;
     };
     let (recorder, mut events) = Recorder::new();
@@ -113,7 +113,7 @@ async fn a_sustained_exchange_with_the_cpp_peer() {
     }
 
     // Every packet is acknowledged, and every echo comes back intact and in
-    // order — the C++ writes them back in the order it accepted them.
+    // order — the proxy writes them back in acceptance order.
     for _ in &payloads {
         assert_eq!(events.next_send().await.1, TxRxStatus::Success);
     }
@@ -124,7 +124,7 @@ async fn a_sustained_exchange_with_the_cpp_peer() {
     assert_eq!(svc.connections(), vec![peer.addr], "one connection, reused");
 }
 
-/// The C++ closing the connection part-way through a frame is a disconnect,
+/// The proxy closing the connection part-way through a frame is a disconnect,
 /// not a framing error: no half packet is surfaced, and the service reports
 /// `DisConnected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -168,9 +168,9 @@ async fn the_peer_dying_mid_packet_is_a_clean_disconnect() {
 /// A frame the peer is happy to send but this service is configured to refuse
 /// closes the connection — the receive cap is enforced on the header alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_oversize_frame_from_the_cpp_peer_closes_the_connection() {
+async fn an_oversize_frame_from_the_linux_proxy_peer_closes_the_connection() {
     let Some(peer) = Peer::start("echo") else {
-        common::warn_no_peer("an_oversize_frame_from_the_cpp_peer_closes_the_connection");
+        common::warn_no_peer("an_oversize_frame_from_the_linux_proxy_peer_closes_the_connection");
         return;
     };
     let (recorder, mut events) = Recorder::new();
@@ -182,7 +182,7 @@ async fn an_oversize_frame_from_the_cpp_peer_closes_the_connection() {
     assert_eq!(
         svc.send(Arc::new(Packet::to_server(peer.addr, oversize)), TIMEOUT),
         TxRxStatus::Success,
-        "the send path has no cap, exactly like the C++"
+        "the send path intentionally has no cap"
     );
     assert_eq!(events.next_send().await.1, TxRxStatus::Success);
 

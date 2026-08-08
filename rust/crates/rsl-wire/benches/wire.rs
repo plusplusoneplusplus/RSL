@@ -2,7 +2,7 @@
 //!
 //! Run with `cargo bench -p rsl-wire`. Numbers feed the crate README as a
 //! baseline for later phases' perf work. The C++ side can time itself via
-//! `golden-gen` for comparison.
+//! `rsl-linux-proxy` for comparison.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rsl_wire::messages::{Header, MSG_VOTE};
