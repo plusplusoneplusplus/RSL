@@ -26,13 +26,16 @@ RSLWindowsOracle.exe --identity
 RSLWindowsOracle.exe --self-test
 RSLWindowsOracle.exe --wire <wire.txt>
 RSLWindowsOracle.exe --storage <directory>
+RSLWindowsOracle.exe --storage-full <directory>
 RSLWindowsOracle.exe --verify-storage <directory>
 ```
 
 `--wire` emits line-oriented message, fingerprint, and `MarshalData` container
-vectors. `--storage` writes logs and checkpoints with production Windows I/O,
-then creates negative vectors by mutating or truncating those files externally
-before passing them to the production readers.
+vectors. `--storage` writes the small reviewable logs/checkpoints committed under
+`corpus/`. `--storage-full` additionally writes 4 MiB checksum-block boundary
+and multi-block checkpoints for workflow artifacts. Negative vectors are
+created by mutating or truncating production-written files externally before
+passing them to the production readers.
 
 `--verify-storage` emits one JSON object per file. It exits `0` when every file
 is accepted or reaches a production-tolerated recovery stop, `3` when any file
@@ -80,7 +83,7 @@ thumbprint format consumed by production `SSLAuth`. TLS configuration is
 process-global, so each endpoint and each A/B transition runs in a fresh oracle
 process.
 
-## Artifact policy
+## Artifact policy and workflow flow
 
 Every manifest has a schema version, generator identity, source revision when
 Git is available, dirty-worktree flag, architecture, and configuration.
@@ -90,8 +93,29 @@ page-rounded storage regions can contain allocator padding that is not stable
 across builds. Their manifests mark `byteStable` as `false`; the canonical
 contract is message type/version/length plus production parser verdicts for
 wire, and production reader verdicts plus recovered metadata for storage.
-Portable Rust CI consumes the committed artifacts, while the Windows
-mixed-language job regenerates artifacts and runs the live oracle.
+
+The small committed corpus is a reviewable local fallback. CI generates the
+full Release corpus from a clean checkout:
+
+```powershell
+.\tools\windows-oracle\New-InteropArtifact.ps1 `
+  -OraclePath <RSLWindowsOracle.exe> `
+  -OutputDirectory <artifact-directory>
+python .\tools\windows-oracle\validate_artifact.py <artifact-directory> `
+  --expected-revision <git-sha>
+```
+
+`artifact-manifest.json` records schema version, source revision/dirty state,
+architecture/configuration, Windows runner image, MSBuild/compiler/Rust
+versions, generator executable hash, command identity, and each file's size and
+SHA-256. Validation rejects missing/extra files, hash changes, wrong schema,
+dirty provenance, wrong revision/configuration, and missing large checkpoint
+boundary cases.
+
+The Release Windows job uploads this package. Linux downloads and validates the
+same-run package, sets `RSL_WINDOWS_WIRE` and `RSL_WINDOWS_STORAGE`, and runs
+the portable Rust readers over it. Linux never regenerates authoritative
+compatibility evidence from the extracted C++ proxy.
 
 ## Rust authoritative mode
 
@@ -104,3 +128,5 @@ cargo test -p rsl-storage --test windows_oracle
 ```
 
 Authoritative mode fails if `RSL_WINDOWS_ORACLE` is missing or invalid.
+Portable corpus-only tests can instead set `RSL_WINDOWS_WIRE` to `wire.txt` and
+`RSL_WINDOWS_STORAGE` to its storage directory.

@@ -16,8 +16,14 @@ contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additio
 
 ## Prerequisites
 
-Install [Git for Windows](https://git-scm.com/download/win) and Visual Studio 2022 or newer. In the Visual Studio
-Installer, select **Desktop development with C++** and a Windows 10 or Windows 11 SDK.
+Install [Git for Windows](https://git-scm.com/download/win), Rust stable, and
+Visual Studio 2022 or newer. In the Visual Studio Installer, select **Desktop
+development with C++** and a Windows 10 or Windows 11 SDK.
+
+CI uses the x64 `windows-2022` image, Visual Studio 2022's default C++ toolset,
+and the installed Windows SDK. `ossbuild\ossbuild.ps1` locates the latest
+compatible Visual Studio installation through `vswhere`; no VS 2017 developer
+prompt is required.
 
 ## Build the native library
 
@@ -58,3 +64,16 @@ Then run:
 
 Use `.\build-rust.ps1 -Release` for an optimized build. The script builds the entire workspace with all targets and
 features.
+
+## CI and interoperability artifacts
+
+The Windows authority job builds native RSL and Rust in Debug and Release. Its
+Release leg runs the production Windows oracle and publishes a schema-versioned
+wire/storage artifact containing source revision, toolchain provenance, and a
+SHA-256 for every file. Linux Rust CI downloads and validates that same-run
+artifact before testing the portable implementation against it.
+
+The Linux `golden-gen` build remains a supplemental proxy for portable
+marshaling, POSIX filesystem behavior, OpenSSL interoperability, and fuzzing.
+It does not replace the production Windows storage, IOCP, learn-port, or
+SChannel authority.

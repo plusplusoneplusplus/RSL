@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn corpus_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("RSL_WINDOWS_STORAGE") {
+        assert!(!path.is_empty(), "RSL_WINDOWS_STORAGE is empty");
+        return PathBuf::from(path);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tools/windows-oracle/corpus/storage")
 }
 

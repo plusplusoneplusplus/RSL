@@ -9,6 +9,10 @@ use std::process::Command;
 use rsl_wire::{fingerprint, messages::verify_checksum, Msg};
 
 fn corpus_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("RSL_WINDOWS_WIRE") {
+        assert!(!path.is_empty(), "RSL_WINDOWS_WIRE is empty");
+        return PathBuf::from(path);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tools/windows-oracle/corpus/wire.txt")
 }
 

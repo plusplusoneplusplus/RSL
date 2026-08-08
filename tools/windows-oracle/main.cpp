@@ -13,6 +13,7 @@
 #include <cstring>
 #include <io.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace RSLib;
@@ -755,7 +756,7 @@ int VerifyStorage(const std::string &directory)
     return rejected ? 3 : 0;
 }
 
-bool GenerateStorage(const std::string &directory)
+bool GenerateStorage(const std::string &directory, bool includeLarge)
 {
     if (!CreateDirectoryA(directory.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
@@ -857,27 +858,60 @@ bool GenerateStorage(const std::string &directory)
         return false;
     }
 
-    struct Expected
+    std::vector<std::pair<std::string, std::string> > expected;
+    expected.push_back(std::make_pair("100.log", "accept"));
+    expected.push_back(std::make_pair("200.log", "stop-at-offset"));
+    expected.push_back(std::make_pair("300.log", "reject"));
+    expected.push_back(std::make_pair("500.codex", "accept"));
+    expected.push_back(std::make_pair("501-corrupt.codex", "reject"));
+
+    if (includeLarge)
     {
-        const char *name;
-        const char *outcome;
-    };
-    const Expected expected[] = {
-        { "100.log", "accept" },
-        { "200.log", "stop-at-offset" },
-        { "300.log", "reject" },
-        { "500.codex", "accept" },
-        { "501-corrupt.codex", "reject" },
-    };
+        const size_t dataOnlyBlock = s_ChecksumBlockSize - sizeof(UInt64);
+        const size_t stateLengths[] = {
+            dataOnlyBlock,
+            dataOnlyBlock + 1,
+            dataOnlyBlock * 2 + 50,
+        };
+        const UInt64 decrees[] = { 600, 601, 602 };
+        for (size_t i = 0; i < _countof(stateLengths); ++i)
+        {
+            std::vector<char> largeState(stateLengths[i]);
+            for (size_t j = 0; j < largeState.size(); ++j)
+            {
+                largeState[j] = static_cast<char>(j & 0xff);
+            }
+            CheckpointHeader *largeHeader =
+                MakeCheckpointHeader(RSLProtocolVersion_6, decrees[i]);
+            char name[64];
+            sprintf_s(name, "%I64u.codex", decrees[i]);
+            if (RSLInteropTestFacade::WriteCheckpoint(
+                    Join(directory, name).c_str(),
+                    largeHeader,
+                    largeState.data(),
+                    largeState.size()) != NO_ERROR)
+            {
+                return false;
+            }
+            expected.push_back(std::make_pair(name, "accept"));
+        }
+    }
 
     std::string entries;
-    for (size_t i = 0; i < _countof(expected); ++i)
+    for (size_t i = 0; i < expected.size(); ++i)
     {
         std::string json;
-        VerifyOne(directory, expected[i].name, &json);
-        if (json.find(std::string("\"outcome\":\"") + expected[i].outcome + "\"") == std::string::npos)
+        VerifyOne(directory, expected[i].first, &json);
+        if (json.find(
+                std::string("\"outcome\":\"") +
+                expected[i].second +
+                "\"") == std::string::npos)
         {
-            fprintf(stderr, "unexpected production verdict for %s: %s\n", expected[i].name, json.c_str());
+            fprintf(
+                stderr,
+                "unexpected production verdict for %s: %s\n",
+                expected[i].first.c_str(),
+                json.c_str());
             return false;
         }
         if (!entries.empty())
@@ -935,7 +969,7 @@ int SelfTest()
     }
     char directory[MAX_PATH];
     sprintf_s(directory, "%sRSLWindowsOracle-%lu", tempPath, GetCurrentProcessId());
-    if (!GenerateStorage(directory))
+    if (!GenerateStorage(directory, false))
     {
         return 1;
     }
@@ -1120,7 +1154,11 @@ int main(int argc, char **argv)
     }
     else if (argc == 3 && strcmp(argv[1], "--storage") == 0)
     {
-        result = GenerateStorage(argv[2]) ? 0 : 1;
+        result = GenerateStorage(argv[2], false) ? 0 : 1;
+    }
+    else if (argc == 3 && strcmp(argv[1], "--storage-full") == 0)
+    {
+        result = GenerateStorage(argv[2], true) ? 0 : 1;
     }
     else if (argc == 3 && strcmp(argv[1], "--verify-storage") == 0)
     {
@@ -1242,7 +1280,8 @@ int main(int argc, char **argv)
             stderr,
             "usage: RSLWindowsOracle "
             "--identity | --self-test | --wire <file> | "
-            "--storage <directory> | --verify-storage <directory> | "
+            "--storage <directory> | --storage-full <directory> | "
+            "--verify-storage <directory> | "
             "--net-server <port> [--mode echo|log] [--count n] "
             "[--wait-disconnect yes|no] | "
             "--net-client <ip> <port> [--payload hex] [--count n] "
