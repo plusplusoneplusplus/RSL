@@ -2,9 +2,11 @@
 
 #include "apdiskio.h"
 #include "legislator.h"
+#include "learn_protocol.h"
 #include "rsl.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 using namespace RSLib;
 
@@ -13,6 +15,151 @@ namespace RSLibImpl
 namespace
 {
     const UInt64 MaxCheckpointWriteSize = 32 * 1024 * 1024;
+
+    BallotNumber FixedMaxBallot(void *context)
+    {
+        return *static_cast<BallotNumber *>(context);
+    }
+
+    int ReserveLoopbackPort()
+    {
+        SOCKET socketHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socketHandle == INVALID_SOCKET)
+        {
+            return 0;
+        }
+        sockaddr_in address;
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = inet_addr("127.0.0.1");
+        address.sin_port = 0;
+        int port = 0;
+        if (bind(socketHandle, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0)
+        {
+            int length = sizeof(address);
+            if (getsockname(
+                    socketHandle,
+                    reinterpret_cast<sockaddr *>(&address),
+                    &length) == 0)
+            {
+                port = ntohs(address.sin_port);
+            }
+        }
+        closesocket(socketHandle);
+        return port;
+    }
+
+    bool EndsWith(const std::string& value, const char* suffix)
+    {
+        size_t suffixLength = strlen(suffix);
+        return value.size() >= suffixLength &&
+            value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
+    }
+
+    std::string JoinPath(const char* directory, const std::string& name)
+    {
+        std::string path(directory);
+        if (!path.empty() && path[path.size() - 1] != '\\')
+        {
+            path += '\\';
+        }
+        path += name;
+        return path;
+    }
+
+    bool BuildLearnState(
+        const char* directory,
+        RSLProtocolVersion version,
+        LearnServerState* state)
+    {
+        state->version = version;
+        state->memberId = MemberId("101");
+        state->configurationNumber = 7;
+        state->ballot = BallotNumber(3, MemberId("202"));
+        state->maxBallot = BallotNumber(9, MemberId("202"));
+
+        std::vector<std::pair<UInt64, std::string> > logs;
+        std::vector<std::pair<UInt64, std::string> > checkpoints;
+        WIN32_FIND_DATAA data;
+        HANDLE find = FindFirstFileA(JoinPath(directory, "*").c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        do
+        {
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                continue;
+            }
+            std::string name = data.cFileName;
+            char* end = NULL;
+            UInt64 decree = _strtoui64(name.c_str(), &end, 10);
+            if (end == name.c_str())
+            {
+                continue;
+            }
+            if (EndsWith(name, ".log"))
+            {
+                logs.push_back(std::make_pair(decree, name));
+            }
+            else if (EndsWith(name, ".codex"))
+            {
+                checkpoints.push_back(std::make_pair(decree, name));
+            }
+        } while (FindNextFileA(find, &data));
+        FindClose(find);
+
+        std::sort(logs.begin(), logs.end());
+        for (size_t i = 0; i < logs.size(); ++i)
+        {
+            InteropLogVerdict verdict;
+            std::string path = JoinPath(directory, logs[i].second);
+            if (!RSLInteropTestFacade::ScanLog(path.c_str(), &verdict) ||
+                verdict.outcome == InteropStorageReject)
+            {
+                return false;
+            }
+            LearnLogFile log;
+            log.fileName = path;
+            for (size_t j = 0; j < verdict.records.size(); ++j)
+            {
+                if (verdict.records[j].msgId == Message_Vote)
+                {
+                    if (log.decreeOffsets.empty())
+                    {
+                        log.minDecree = verdict.records[j].decree;
+                    }
+                    log.decreeOffsets.push_back(verdict.records[j].offset);
+                    if (verdict.records[j].decree > state->decree)
+                    {
+                        state->decree = verdict.records[j].decree;
+                    }
+                }
+            }
+            if (!log.decreeOffsets.empty())
+            {
+                state->logs.push_back(log);
+            }
+        }
+
+        std::sort(checkpoints.begin(), checkpoints.end());
+        if (!checkpoints.empty())
+        {
+            state->checkpointedDecree = checkpoints.back().first;
+            state->checkpointFile = JoinPath(directory, checkpoints.back().second);
+            InteropCheckpointVerdict verdict;
+            if (!RSLInteropTestFacade::VerifyCheckpoint(
+                    state->checkpointFile.c_str(),
+                    &verdict) ||
+                verdict.outcome != InteropStorageAccept)
+            {
+                return false;
+            }
+            state->checkpointSize = verdict.fileSize;
+        }
+        return !state->logs.empty() || !state->checkpointFile.empty();
+    }
 
     UInt64 FileSize(const char *fileName)
     {
@@ -112,6 +259,7 @@ RSLInteropTestFacade::ScanLog(const char *fileName, InteropLogVerdict *verdict)
 
         InteropLogRecord record;
         record.offset = offset;
+        record.version = static_cast<UInt16>(message->m_version);
         record.msgId = message->m_msgId;
         record.decree = message->m_decree;
         record.unMarshalLen = message->m_unMarshalLen;
@@ -228,5 +376,174 @@ RSLInteropTestFacade::VerifyCheckpoint(
     verdict->outcome = InteropStorageAccept;
     verdict->detail = "checkpoint valid";
     return true;
+}
+
+int
+RSLInteropTestFacade::RunLearnServer(
+    UInt16 port,
+    const char *directory,
+    int connections,
+    RSLProtocolVersion version)
+{
+    if (connections <= 0)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+    LearnServerState state;
+    if (!BuildLearnState(directory, version, &state))
+    {
+        return ERROR_INVALID_DATA;
+    }
+    if (port == 0)
+    {
+        port = static_cast<UInt16>(ReserveLoopbackPort());
+    }
+
+    std::unique_ptr<StreamSocket> listener(StreamSocket::CreateStreamSocket());
+    DWORD32 error = listener->BindAndListen(
+        inet_addr("127.0.0.1"),
+        port,
+        16,
+        1,
+        10);
+    if (error != NO_ERROR)
+    {
+        return error;
+    }
+    printf("PORT %u\n", static_cast<unsigned int>(port));
+    fflush(stdout);
+
+    for (int i = 0; i < connections; ++i)
+    {
+        std::unique_ptr<StreamSocket> socket(StreamSocket::CreateStreamSocket());
+        error = listener->Accept(socket.get(), 30000, 30000);
+        if (error != NO_ERROR)
+        {
+            return error;
+        }
+        Message request;
+        if (!request.ReadFromSocket(socket.get(), s_AvgMessageLen))
+        {
+            continue;
+        }
+        error = ServeLearnRequest(request, socket.get(), state, NULL);
+        if (error != NO_ERROR && error != ERROR_INVALID_DATA)
+        {
+            return error;
+        }
+    }
+    return NO_ERROR;
+}
+
+bool
+RSLInteropTestFacade::QueryLearnStatus(
+    UInt32 ip,
+    UInt16 port,
+    RSLProtocolVersion version,
+    StatusResponse *response)
+{
+    std::unique_ptr<StreamSocket> socket(StreamSocket::CreateStreamSocket());
+    Message request(
+        version,
+        Message_StatusQuery,
+        MemberId("102"),
+        0,
+        7,
+        BallotNumber(3, MemberId("202")));
+    MarshalData marshal;
+    request.Marshal(&marshal);
+    return
+        socket->Connect(ip, port, 30000, 30000) == NO_ERROR &&
+        socket->Write(marshal.GetMarshaled(), marshal.GetMarshaledLength()) == NO_ERROR &&
+        response->ReadFromSocket(socket.get(), s_AvgMessageLen);
+}
+
+bool
+RSLInteropTestFacade::FetchLearnVotes(
+    UInt32 ip,
+    UInt16 port,
+    RSLProtocolVersion version,
+    UInt64 decree,
+    std::vector<InteropLogRecord> *records)
+{
+    records->clear();
+    std::unique_ptr<StreamSocket> socket(StreamSocket::CreateStreamSocket());
+    Message request(
+        version,
+        Message_FetchVotes,
+        MemberId("102"),
+        decree,
+        7,
+        BallotNumber(3, MemberId("202")));
+    MarshalData marshal;
+    request.Marshal(&marshal);
+    if (socket->Connect(ip, port, 30000, 30000) != NO_ERROR ||
+        socket->Write(marshal.GetMarshaled(), marshal.GetMarshaledLength()) != NO_ERROR)
+    {
+        return false;
+    }
+
+    SocketStreamReader reader(socket.get());
+    StandardMarshalMemoryManager memory(s_AvgMessageLen);
+    for (;;)
+    {
+        UInt64 offset = reader.BytesRead();
+        Message *message = NULL;
+        if (!Legislator::ReadNextMessage(&reader, &memory, &message, false))
+        {
+            return false;
+        }
+        if (message == NULL)
+        {
+            return true;
+        }
+        InteropLogRecord record;
+        record.offset = offset;
+        record.version = static_cast<UInt16>(message->m_version);
+        record.msgId = message->m_msgId;
+        record.decree = message->m_decree;
+        record.unMarshalLen = message->m_unMarshalLen;
+        record.paddedLen = RoundUpToPage(message->m_unMarshalLen);
+        record.checksum = message->m_checksum;
+        records->push_back(record);
+        delete message;
+    }
+}
+
+bool
+RSLInteropTestFacade::CopyLearnCheckpoint(
+    UInt32 ip,
+    UInt16 port,
+    RSLProtocolVersion version,
+    UInt64 decree,
+    UInt64 size,
+    const BallotNumber& localMaxBallot,
+    const char *outputFile,
+    BallotNumber *sourceMaxBallot,
+    BallotNumber *writtenMaxBallot)
+{
+    LearnCheckpointCopyResult result;
+    bool success = CopyLearnCheckpointFile(
+        ip,
+        port,
+        version,
+        MemberId("102"),
+        decree,
+        size,
+        &FixedMaxBallot,
+        const_cast<BallotNumber *>(&localMaxBallot),
+        30000,
+        30000,
+        outputFile,
+        &result);
+    if (sourceMaxBallot != NULL)
+    {
+        *sourceMaxBallot = result.sourceMaxBallot;
+    }
+    if (writtenMaxBallot != NULL)
+    {
+        *writtenMaxBallot = result.writtenMaxBallot;
+    }
+    return success;
 }
 }

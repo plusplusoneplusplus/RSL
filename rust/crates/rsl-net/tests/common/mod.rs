@@ -1,6 +1,5 @@
-//! Shared scaffolding for the Phase-4a framing tests: the `PACKET` and `LEARN`
-//! blocks of `tools/golden-gen/corpus/phase1-golden.txt`, plus locating the
-//! `golden-gen` binary for the live-peer tests.
+//! Shared scaffolding for portable proxy framing tests and authoritative
+//! Windows oracle tests.
 //!
 //! Each integration-test binary links its own copy and uses a different subset,
 //! so unused-item warnings here are expected.
@@ -8,8 +7,7 @@
 
 use std::path::PathBuf;
 
-/// One `PACKET` block: a byte stream fed to the C++ receive path, and the
-/// decision that path actually made.
+/// One `PACKET` block: a byte stream fed to the extracted proxy receive path.
 pub struct PacketVector {
     pub desc: String,
     /// `MAXSIZE`/`MAXALERT` exactly as passed to the C++ (0 = library default).
@@ -71,6 +69,30 @@ pub fn golden_gen() -> Option<PathBuf> {
     }
     let path = repo_root().join("tools/golden-gen/build/golden-gen");
     path.is_file().then_some(path)
+}
+
+pub fn authoritative_interop() -> bool {
+    std::env::var("RSL_AUTHORITATIVE_INTEROP")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+pub fn windows_oracle() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("RSL_WINDOWS_ORACLE") {
+        if !value.is_empty() {
+            let path = PathBuf::from(value);
+            assert!(
+                path.is_file(),
+                "RSL_WINDOWS_ORACLE={} is not a file",
+                path.display()
+            );
+            return Some(path);
+        }
+    }
+    assert!(
+        !authoritative_interop(),
+        "RSL_AUTHORITATIVE_INTEROP requires RSL_WINDOWS_ORACLE"
+    );
+    None
 }
 
 pub fn warn_no_peer(test: &str) {

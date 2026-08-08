@@ -13,6 +13,8 @@
 
 namespace RSLibImpl
 {
+    struct LearnServerState;
+    struct LearnFileMetrics;
     static const UInt32 s_PageSize = 512;
     static const UInt32 s_SystemPageSize = 4096;
     static const UInt32 PAGES_PER_WRITE = 512;
@@ -568,6 +570,9 @@ namespace RSLibImpl
 
         void HandleFetchVotesMsg(Message *msg, StreamSocket *sock);
         void HandleFetchCheckpointMsg(Message *msg, StreamSocket *sock);
+        void BuildLearnServerState(LearnServerState *state, UInt16 messageId);
+        void RecordLearnFileMetrics(const LearnFileMetrics& metrics);
+        static BallotNumber GetLearnMaxBallot(void *context);
         void LearnVotesAndTransition(StatusResponse *resp);
         bool LearnVotes(UInt32 ip, UInt16 port);
         static bool ReadNextMessage(StreamReader *stream, IMarshalMemoryManager *memory,

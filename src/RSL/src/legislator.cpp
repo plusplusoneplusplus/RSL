@@ -1,4 +1,5 @@
 #include "legislator.h"
+#include "learn_protocol.h"
 #include "rsldebug.h"
 #include "hirestime.h"
 #include "apdiskio.h"
@@ -3336,34 +3337,16 @@ Legislator::HandleNotAcceptedMsg(Message *msg)
 void
 Legislator::HandleStatusQueryMsg(Message *msg, StreamSocket *sock)
 {
-    if(m_relinquishPrimary)
+    LearnServerState learnState;
+    BuildLearnServerState(&learnState, Message_StatusQuery);
+    if (learnState.relinquishing)
     {
         RSLInfo("Skip handling status query since I am reqlinquish the primary.", LogTag_RSLMsg, msg);
         return;
     }
     RSLInfo("Handling status query", LogTag_RSLMsg, msg);
-    m_lock.Enter();
-    StatusResponse resp(
-        m_version,
-        m_memberId,
-        m_maxAcceptedVote->m_decree,
-        PaxosConfiguration(),
-        m_maxAcceptedVote->m_ballot);
-
-    resp.m_queryDecree = msg->m_decree;
-    resp.m_queryBallot = msg->m_ballot;
-
-    Int64 rcvdAgo = GetHiResTime() - m_maxAcceptedVote->m_receivedAt.HiResTime();
-
-    resp.m_lastReceivedAgo = (rcvdAgo < 0) ? 0 : rcvdAgo/HRTIME_MSECOND;
-    resp.m_minDecreeInLog = m_logFiles.front()->m_minDecree;
-    resp.m_checkpointedDecree = m_checkpointedDecree;
-    resp.m_checkpointSize = m_checkpointSize;
-
-    // These 2 fields are used only by the test cases.
-    resp.m_maxBallot = m_maxBallot;
-    resp.m_state = m_state;
-    m_lock.Leave();
+    StatusResponse resp;
+    BuildLearnStatusResponse(learnState, *msg, &resp);
 
     if (sock == NULL)
     {
@@ -3669,72 +3652,80 @@ Legislator::IsExecuteQueueReady()
 void
 Legislator::HandleFetchVotesMsg(Message *msg, StreamSocket *sock)
 {
-    // ignore the ballot number
-    // send all proposals >= msg->Decree()
-    // if we don't have the starting decree, close the connection
-
     RSLInfo("Handling fetch votes", LogTag_RSLMsg, msg);
-
-    UInt64 offset;
-    vector<DynString> logFiles;
-    {
-        AutoCriticalSection lock(&m_lock);
-        // check if we have this decree in the log
-        vector<LogFile *>::iterator iter;
-        for (iter = m_logFiles.begin(); iter != m_logFiles.end(); iter++)
-        {
-            if ((*iter)->HasDecree(msg->m_decree))
-            {
-                break;
-            }
-        }
-
-        if (iter == m_logFiles.end())
-        {
-            RSLInfo("Requested message not found",
-                    LogTag_RSLMsg, msg, LogTag_RSLMsg, (Vote *)m_maxAcceptedVote);
-            return;
-        }
-        // we have the votes
-        offset = (*iter)->GetOffset(msg->m_decree);
-        for (; iter != m_logFiles.end(); iter++)
-        {
-            LogFile *log = *iter;
-            logFiles.push_back(DynString(log->m_fileName));
-        }
-    }
-
-    int ec = NO_ERROR;
-    for (int i = 0; i < (int) logFiles.size() && ec == NO_ERROR; i++)
-    {
-        RSLInfo("Sending votes", LogTag_RSLMsg, msg,
-                LogTag_Filename, logFiles[i].Str(), LogTag_Offset, offset);
-        ec = SendFile(logFiles[i], offset, -1, sock);
-        offset = 0;
-    }
+    LearnServerState state;
+    BuildLearnServerState(&state, Message_FetchVotes);
+    LearnFileMetrics metrics;
+    ServeLearnRequest(*msg, sock, state, &metrics);
+    RecordLearnFileMetrics(metrics);
 }
 
 void
 Legislator::HandleFetchCheckpointMsg(Message *msg, StreamSocket *sock)
 {
     RSLInfo("Handling fetch checkpoint", LogTag_RSLMsg, msg);
+    LearnServerState state;
+    BuildLearnServerState(&state, Message_FetchCheckpoint);
+    LearnFileMetrics metrics;
+    ServeLearnRequest(*msg, sock, state, &metrics);
+    RecordLearnFileMetrics(metrics);
+}
 
-    // ignore the ballot number
-    UInt64 decree = msg->m_decree;
+void
+Legislator::BuildLearnServerState(LearnServerState *state, UInt16 messageId)
+{
+    AutoCriticalSection lock(&m_lock);
+    state->relinquishing = m_relinquishPrimary;
+    state->version = m_version;
+    state->memberId = m_memberId;
+    state->decree = m_maxAcceptedVote->m_decree;
+    state->configurationNumber = PaxosConfiguration();
+    state->ballot = m_maxAcceptedVote->m_ballot;
+    Int64 receivedAgo = GetHiResTime() - m_maxAcceptedVote->m_receivedAt.HiResTime();
+    state->lastReceivedAgo = (receivedAgo < 0) ? 0 : receivedAgo / HRTIME_MSECOND;
+    state->checkpointedDecree = m_checkpointedDecree;
+    state->checkpointSize = m_checkpointSize;
+    state->maxBallot = m_maxBallot;
+    state->state = m_state;
+    state->logs.clear();
+    if (messageId == Message_StatusQuery && !m_logFiles.empty())
     {
-        AutoCriticalSection lock(&m_lock);
-        if (m_checkpointedDecree != decree)
+        LearnLogFile log;
+        log.minDecree = m_logFiles.front()->m_minDecree;
+        state->logs.push_back(log);
+    }
+    else if (messageId == Message_FetchVotes)
+    {
+        for (size_t i = 0; i < m_logFiles.size(); ++i)
         {
-            RSLInfo("Requested checkpoint not found", LogTag_RSLMsg, msg,
-                    LogTag_RSLDecree, m_checkpointedDecree);
-            return;
+            LearnLogFile log;
+            log.fileName = m_logFiles[i]->m_fileName;
+            log.minDecree = m_logFiles[i]->m_minDecree;
+            log.decreeOffsets = m_logFiles[i]->m_decreeOffsets;
+            state->logs.push_back(log);
         }
     }
-    DynString checkpointFile;
-    GetCheckpointFileName(checkpointFile, decree);
-    RSLInfo("Sending checkpoint", LogTag_RSLMsg, msg,
-            LogTag_Filename, checkpointFile.Str());
-    SendFile(checkpointFile, 0, -1, sock);
+
+    if (m_checkpointedDecree != 0)
+    {
+        DynString checkpointFile(m_dataDir);
+        CheckpointHeader::GetCheckpointFileName(checkpointFile, m_checkpointedDecree);
+        state->checkpointFile = checkpointFile.Str();
+    }
+}
+
+void
+Legislator::RecordLearnFileMetrics(const LearnFileMetrics& metrics)
+{
+    AutoCriticalSection lock(&m_statsLock);
+    m_stats.m_cLogReads += metrics.fileReads;
+    m_stats.m_cLogReadBytes += metrics.bytesRead;
+    m_stats.m_cLogReadMicroseconds += metrics.readMicroseconds;
+    if (metrics.maxReadMicroseconds > m_stats.m_cLogReadMaxMicroseconds)
+    {
+        m_stats.m_cLogReadMaxMicroseconds =
+            static_cast<UInt32>(metrics.maxReadMicroseconds);
+    }
 }
 
 void
@@ -4520,73 +4511,10 @@ Legislator::SendJoinMessage(UInt32 ip, UInt16 port, bool asClient)
 DWORD32
 Legislator::SendFile(char *file, UInt64 offset, Int64 length, StreamSocket *sock)
 {
-    void *buf;
-    DWORD bytesRead;
-    int ec;
-
-    // We want to capture the amount of time we spend reading data from the disk, but we're using APSEQREAD which involves parallel async I/O. So we'll measure
-    // the total time taken to read all of the data minus the time we spend sending it.
-    Int64 diskReadTimeSoFar = 0;
-    Int64 timer = GetHiResTime();
-
-    auto_ptr<APSEQREAD> reader(new APSEQREAD());
-    ec = reader->DoInit(file, APSEQREAD::c_maxReadsDefault, APSEQREAD::c_readBufSize, true);
-    if (ec != NO_ERROR)
-    {
-        RSLError("Open file failed", LogTag_Filename, file, LogTag_ErrorCode, ec);
-        return ec;
-    }
-    if (offset > 0)
-    {
-        ec = reader->Reset(offset);
-        if (ec != NO_ERROR)
-        {
-            RSLError("Reset file offset failed",
-                     LogTag_Filename, file, LogTag_Offset, offset, LogTag_ErrorCode, ec);
-            return ec;
-        }
-    }
-
-    if (length < 0)
-    {
-        length = reader->FileSize() - offset;
-    }
-
-    for (Int64 toRead = length; toRead > 0; toRead -= bytesRead)
-    {
-        ec = reader->GetDataPointer(&buf, APSEQREAD::c_readBufSize, &bytesRead);
-        if (ec != NO_ERROR)
-        {
-            RSLError("Read from file failed",
-                     LogTag_Filename, file, LogTag_Int64_1, length,
-                     LogTag_Int64_2, toRead, LogTag_ErrorCode, ec);
-            return ec;
-        }
-
-        diskReadTimeSoFar += GetHiResTime() - timer;
-
-        ec = sock->Write(buf, bytesRead);
-        if (ec != NO_ERROR)
-        {
-            RSLInfo("Write to socket failed", LogTag_ErrorCode, ec);
-            return ec;
-        }
-
-        timer = GetHiResTime();
-    }
-
-    // Update statistics under the lock.
-    {
-        AutoCriticalSection lock(&m_statsLock);
-
-        m_stats.m_cLogReads++;
-        m_stats.m_cLogReadBytes += length;
-        m_stats.m_cLogReadMicroseconds += (UInt32)diskReadTimeSoFar;
-        if (diskReadTimeSoFar > m_stats.m_cLogReadMaxMicroseconds)
-            m_stats.m_cLogReadMaxMicroseconds  = (UInt32)diskReadTimeSoFar;
-    }
-
-    return NO_ERROR;
+    LearnFileMetrics metrics;
+    DWORD32 error = SendLearnFile(file, offset, length, sock, &metrics);
+    RecordLearnFileMetrics(metrics);
+    return error;
 }
 
 void
@@ -5353,22 +5281,14 @@ Legislator::HandleFetchRequest(void *ctx)
         RSLError("Failed to unmarshal message");
         return;
     }
-    if (msg.m_msgId == Message_FetchVotes)
-    {
-        HandleFetchVotesMsg(&msg, pSocket.get());
-    }
-    else if (msg.m_msgId == Message_FetchCheckpoint)
-    {
-        HandleFetchCheckpointMsg(&msg, pSocket.get());
-    }
-    else if (msg.m_msgId == Message_StatusQuery)
-    {
-        HandleStatusQueryMsg(&msg, pSocket.get());
-    }
-    else
+    LearnServerState state;
+    BuildLearnServerState(&state, msg.m_msgId);
+    LearnFileMetrics metrics;
+    if (ServeLearnRequest(msg, pSocket.get(), state, &metrics) == ERROR_INVALID_DATA)
     {
         RSLError("Invalid message", LogTag_RSLMsg, &msg);
     }
+    RecordLearnFileMetrics(metrics);
     return;
 }
 
@@ -5492,95 +5412,43 @@ Legislator::SaveCheckpoint(Vote *vote, bool saveState)
 bool
 Legislator::CopyCheckpoint(UInt32 ip, UInt16 port, UInt64 checkpointedDecree, UInt64 size, void *cookie, bool notifyStateMachine)
 {
-    MarshalData marshal;
-    StandardMarshalMemoryManager memory(APSEQWRITE::c_writeBufSizeDefault);
-    std::unique_ptr<StreamSocket> pSock(StreamSocket::CreateStreamSocket());
-
-    SocketStreamReader reader(pSock.get());
-    auto_ptr<APSEQWRITE> seqWrite(new APSEQWRITE());
-    CheckpointHeader header;
-
     char file[MAX_PATH+1];
     DynString destFileName;
 
     LogAssert(GetTempFileNameA(m_tempDir, "Codex", 0, file),
               "Failed to create temp file for checkpoint at %I64u (ErrorCode: %d)",
               checkpointedDecree, GetLastError());
-    LogAssert(seqWrite->DoInit(file) == NO_ERROR);
-
     RSLInfo("Copying checkpoint",
             LogTag_RSLDecree, checkpointedDecree, LogTag_Filename, file,
             LogTag_NumericIP, ip, LogTag_Port, port);
 
-    Message req(
-        m_version,
-        Message_FetchCheckpoint,
-        m_memberId,
-        checkpointedDecree,
-        1, // dummy Configuration number
-        BallotNumber());
-
-    req.Marshal(&marshal);
-
-    int ec = pSock->Connect(ip, port, m_cfg.ReceiveTimeout(), m_cfg.SendTimeout());
-    if (ec != NO_ERROR)
+    LearnCheckpointCopyResult copyResult;
+    if (!CopyLearnCheckpointFile(
+            ip,
+            port,
+            m_version,
+            m_memberId,
+            checkpointedDecree,
+            size,
+            &Legislator::GetLearnMaxBallot,
+            this,
+            m_cfg.ReceiveTimeout(),
+            m_cfg.SendTimeout(),
+            file,
+            &copyResult))
     {
-        RSLInfo("Failed to connect", LogTag_ErrorCode, ec);
-        goto lError;
-    }
-
-    ec = pSock->Write(marshal.GetMarshaled(), marshal.GetMarshaledLength());
-    if (ec != NO_ERROR)
-    {
-        RSLInfo("Failed to send request", LogTag_ErrorCode, ec);
-        goto lError;
-    }
-
-    if (!header.UnMarshal(&reader))
-    {
-        RSLInfo("Failed to read checkpoint header", LogTag_ErrorCode, ec);
-        goto lError;
-    }
-
-    m_lock.Enter();
-    // reset the maxballot in the header
-    if (header.m_maxBallot < m_maxBallot)
-    {
-        header.m_maxBallot = m_maxBallot;
-    }
-    m_lock.Leave();
-
-    // Marshal header
-    marshal.Clear(false);
-    header.Marshal(&marshal);
-    LogAssert(seqWrite->Write(marshal.GetMarshaled(), marshal.GetMarshaledLength()) == NO_ERROR);
-
-    // Marshall body
-    while (reader.BytesRead() < size)
-    {
-        UInt32 bytesRead;
-        ec = reader.Read(memory.GetBuffer(), memory.GetBufferLength(), &bytesRead);
-        if (ec == NO_ERROR)
+        if (copyResult.outcome == LearnCheckpointCopyResult::VerificationFailed)
         {
-            LogAssert(seqWrite->Write(memory.GetBuffer(), bytesRead) == NO_ERROR);
+            RSLError(
+                "Failed to verify the checkpoint, terminating the process to prevent codex corruption.",
+                LogTag_Filename,
+                file);
+            LogAssert(false);
         }
-        else
-        {
-            RSLInfo("Failed to read complete checkpoint",
-                    LogTag_ErrorCode, ec,
-                    LogTag_UInt641, seqWrite->BytesIssued(),
-                    LogTag_UInt642, size);
-            goto lError;
-        }
-    }
-    LogAssert(seqWrite->Flush() == NO_ERROR);
-    seqWrite->DoDispose();
 
-    // Verify checkpoint
-    if (!VerifyCheckpoint(file))
-    {
-        RSLError("Failed to verify the checkpoint, terminating the process to prevent codex corruption.", LogTag_Filename, file);
-        LogAssert(false);
+        RSLInfo("Failed to copy checkpoint", LogTag_Filename, file);
+        DeleteFileA(file);
+        return false;
     }
 
     GetCheckpointFileName(destFileName, checkpointedDecree);
@@ -5613,11 +5481,14 @@ Legislator::CopyCheckpoint(UInt32 ip, UInt16 port, UInt64 checkpointedDecree, UI
     }
 
     return true;
+}
 
-  lError:
-    seqWrite->DoDispose();
-    DeleteFileA(file);
-    return false;
+BallotNumber
+Legislator::GetLearnMaxBallot(void *context)
+{
+    Legislator *legislator = static_cast<Legislator *>(context);
+    AutoCriticalSection lock(&legislator->m_lock);
+    return legislator->m_maxBallot;
 }
 
 void

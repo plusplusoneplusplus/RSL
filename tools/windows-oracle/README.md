@@ -39,6 +39,29 @@ is accepted or reaches a production-tolerated recovery stop, `3` when any file
 is rejected, and `2` for invocation or I/O errors. A reported rejection is
 therefore never success-shaped.
 
+Production packet endpoints use `Packet`, `NetCxn`, `NetPacketSvc`, callbacks,
+connection tables, and the shipping IOCP threads:
+
+```powershell
+RSLWindowsOracle.exe --net-server 0 --mode echo --count 3
+RSLWindowsOracle.exe --net-client 127.0.0.1 <port> --payload 001122 --count 3
+```
+
+Production learn endpoints share request dispatch, log/checkpoint file transfer,
+message parsing, and checkpoint copy/max-ballot rewriting with `Legislator`:
+
+```powershell
+RSLWindowsOracle.exe --learn-server 0 --dir <data-dir> --connections 3 --version 6
+RSLWindowsOracle.exe --learn-client 127.0.0.1 <port> --mode votes --decree 100
+RSLWindowsOracle.exe --learn-client 127.0.0.1 <port> --mode checkpoint `
+  --decree 500 --size <bytes> --out copy.codex --max-ballot 99
+```
+
+Port `0` selects a loopback port and prints `PORT <n>` before accepting.
+Connection scheduling and callback timing are not part of the protocol
+contract; tests assert payload bytes and lifecycle states rather than callback
+thread order.
+
 ## Artifact policy
 
 Every manifest has a schema version, generator identity, source revision when

@@ -36,6 +36,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="learn_oracle.cpp" />
+    <ClCompile Include="network_oracle.cpp" />
   </ItemGroup>
   <Import Project="$(ExtendedTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

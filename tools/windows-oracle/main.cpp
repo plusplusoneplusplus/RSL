@@ -1,7 +1,9 @@
 #include "fingerprint.h"
 #include "interop_test_facade.h"
 #include "legislator.h"
+#include "learn_oracle.h"
 #include "message.h"
+#include "network_oracle.h"
 #include "rsl.h"
 #include "utils.h"
 
@@ -978,13 +980,117 @@ int main(int argc, char **argv)
     {
         result = VerifyStorage(argv[2]);
     }
+    else if (argc >= 3 && strcmp(argv[1], "--net-server") == 0)
+    {
+        const char *mode = "echo";
+        int count = 1;
+        bool waitForDisconnect = false;
+        for (int i = 3; i + 1 < argc; i += 2)
+        {
+            if (strcmp(argv[i], "--mode") == 0) { mode = argv[i + 1]; }
+            else if (strcmp(argv[i], "--count") == 0) { count = atoi(argv[i + 1]); }
+            else if (strcmp(argv[i], "--wait-disconnect") == 0)
+            {
+                waitForDisconnect = strcmp(argv[i + 1], "yes") == 0;
+            }
+        }
+        result = rsl_oracle::RunNetworkServer(atoi(argv[2]), mode, count, waitForDisconnect);
+    }
+    else if (argc >= 4 && strcmp(argv[1], "--net-client") == 0)
+    {
+        const char *payload = "";
+        const char *expect = "echo";
+        int count = 1;
+        bool reconnectEach = false;
+        for (int i = 4; i + 1 < argc; i += 2)
+        {
+            if (strcmp(argv[i], "--payload") == 0) { payload = argv[i + 1]; }
+            else if (strcmp(argv[i], "--count") == 0) { count = atoi(argv[i + 1]); }
+            else if (strcmp(argv[i], "--expect") == 0) { expect = argv[i + 1]; }
+            else if (strcmp(argv[i], "--reconnect-each") == 0)
+            {
+                reconnectEach = strcmp(argv[i + 1], "yes") == 0;
+            }
+        }
+        result = rsl_oracle::RunNetworkClient(
+            argv[2],
+            atoi(argv[3]),
+            payload,
+            count,
+            expect,
+            reconnectEach);
+    }
+    else if (argc >= 3 && strcmp(argv[1], "--learn-server") == 0)
+    {
+        const char *directory = NULL;
+        int connections = 1;
+        int version = 6;
+        for (int i = 3; i + 1 < argc; i += 2)
+        {
+            if (strcmp(argv[i], "--dir") == 0) { directory = argv[i + 1]; }
+            else if (strcmp(argv[i], "--connections") == 0) { connections = atoi(argv[i + 1]); }
+            else if (strcmp(argv[i], "--version") == 0) { version = atoi(argv[i + 1]); }
+        }
+        if (directory == NULL)
+        {
+            fprintf(stderr, "--learn-server needs --dir\n");
+            result = 2;
+        }
+        else
+        {
+            result = rsl_oracle::RunLearnServer(
+                atoi(argv[2]),
+                directory,
+                connections,
+                version);
+        }
+    }
+    else if (argc >= 4 && strcmp(argv[1], "--learn-client") == 0)
+    {
+        const char *mode = "status";
+        const char *outputFile = "";
+        int version = 6;
+        unsigned long long decree = 0;
+        unsigned long long size = 0;
+        unsigned int maxBallot = 99;
+        for (int i = 4; i + 1 < argc; i += 2)
+        {
+            if (strcmp(argv[i], "--mode") == 0) { mode = argv[i + 1]; }
+            else if (strcmp(argv[i], "--version") == 0) { version = atoi(argv[i + 1]); }
+            else if (strcmp(argv[i], "--decree") == 0) { decree = _strtoui64(argv[i + 1], NULL, 10); }
+            else if (strcmp(argv[i], "--size") == 0) { size = _strtoui64(argv[i + 1], NULL, 10); }
+            else if (strcmp(argv[i], "--out") == 0) { outputFile = argv[i + 1]; }
+            else if (strcmp(argv[i], "--max-ballot") == 0)
+            {
+                maxBallot = static_cast<unsigned int>(strtoul(argv[i + 1], NULL, 10));
+            }
+        }
+        result = rsl_oracle::RunLearnClient(
+            argv[2],
+            atoi(argv[3]),
+            mode,
+            version,
+            decree,
+            size,
+            outputFile,
+            maxBallot);
+    }
     else
     {
         fprintf(
             stderr,
             "usage: RSLWindowsOracle "
             "--identity | --self-test | --wire <file> | "
-            "--storage <directory> | --verify-storage <directory>\n");
+            "--storage <directory> | --verify-storage <directory> | "
+            "--net-server <port> [--mode echo|log] [--count n] "
+            "[--wait-disconnect yes|no] | "
+            "--net-client <ip> <port> [--payload hex] [--count n] "
+            "[--expect echo|disconnect] [--reconnect-each yes|no] | "
+            "--learn-server <port> --dir <directory> [--connections n] "
+            "[--version 1..6] | "
+            "--learn-client <ip> <port> --mode status|votes|checkpoint "
+            "[--version 1..6] [--decree n] [--size n] [--out file] "
+            "[--max-ballot n]\n");
     }
 
     RSLUnload();

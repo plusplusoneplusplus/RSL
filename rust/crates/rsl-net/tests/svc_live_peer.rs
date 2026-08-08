@@ -1,10 +1,9 @@
-//! The transport against the real C++, over a real socket.
+//! Portable transport proxy coverage over a real socket.
 //!
 //! `tests/live_peer.rs` (Phase 4a) proved the *bytes* agree by driving the
-//! extracted C++ receive path from a hand-written socket. This proves the
-//! *service* agrees: a `PacketSvc` client, with its connection table, send
-//! queue and callbacks, holding a conversation with the original code — and
-//! reacting correctly when that code closes the connection under it.
+//! extracted C++ receive proxy from a hand-written socket. Authoritative
+//! production Windows service/IOCP coverage lives in
+//! `windows_network_oracle.rs`.
 //!
 //! The peer binary needs cmake + g++, so these skip (with a message) when it
 //! has not been built. CI builds it.

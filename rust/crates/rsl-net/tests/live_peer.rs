@@ -1,10 +1,10 @@
-//! Live interop against the real C++ code: `golden-gen --packet-peer` runs the
-//! extracted `Packet`/`NetCxn`/`ReadFromSocket` paths over a real TCP socket,
-//! and this crate talks to it.
+//! Portable proxy interop: `golden-gen --packet-peer` runs the extracted packet
+//! receive model over a TCP socket. Production Windows coverage lives in
+//! `windows_network_oracle.rs`.
 //!
 //! The golden vectors prove the bytes agree; this proves the *conversation*
-//! does — that a Rust sender's frames are accepted by the original receive loop,
-//! that frames the original produces are accepted here, and that a corrupt frame
+//! does — that a Rust sender's frames are accepted by the proxy receive loop,
+//! that frames the proxy produces are accepted here, and that a corrupt frame
 //! really does kill the connection rather than resynchronize.
 //!
 //! The peer binary needs cmake + g++, so these tests skip (with a message) when

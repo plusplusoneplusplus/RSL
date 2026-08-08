@@ -1,4 +1,4 @@
-//! Live learn-port interop against the real C++ code, in **both** directions.
+//! Portable learn-port proxy interop in both directions.
 //!
 //! `golden-gen --learn-server` runs the extracted `HandleFetchRequest` /
 //! `SendFile` paths over a real socket, serving a data directory this test
@@ -6,6 +6,8 @@
 //! `ReadNextMessage` / checkpoint-copy loops against the Rust server. Between
 //! them, every byte of every one of the three protocols crosses the boundary in
 //! both directions and is checked against what the files on disk actually say.
+//! Production Windows Legislator/file paths are covered by
+//! `windows_learn_oracle.rs`.
 //!
 //! The peer binary needs cmake + g++, so these tests skip (with a message) when
 //! it has not been built. CI builds it.

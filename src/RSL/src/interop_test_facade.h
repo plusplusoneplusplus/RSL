@@ -1,6 +1,7 @@
 #pragma once
 
 #include "basic_types.h"
+#include "message.h"
 
 #include <string>
 #include <vector>
@@ -14,6 +15,7 @@ namespace RSLibImpl
 {
     class CheckpointHeader;
     class Message;
+    class StatusResponse;
 
     enum InteropStorageOutcome
     {
@@ -25,6 +27,7 @@ namespace RSLibImpl
     struct InteropLogRecord
     {
         UInt64 offset;
+        UInt16 version;
         UInt16 msgId;
         UInt64 decree;
         UInt32 unMarshalLen;
@@ -73,5 +76,35 @@ namespace RSLibImpl
         static bool VerifyCheckpoint(
             const char *fileName,
             InteropCheckpointVerdict *verdict);
+
+        static int RunLearnServer(
+            UInt16 port,
+            const char *directory,
+            int connections,
+            RSLProtocolVersion version);
+
+        static bool QueryLearnStatus(
+            UInt32 ip,
+            UInt16 port,
+            RSLProtocolVersion version,
+            StatusResponse *response);
+
+        static bool FetchLearnVotes(
+            UInt32 ip,
+            UInt16 port,
+            RSLProtocolVersion version,
+            UInt64 decree,
+            std::vector<InteropLogRecord> *records);
+
+        static bool CopyLearnCheckpoint(
+            UInt32 ip,
+            UInt16 port,
+            RSLProtocolVersion version,
+            UInt64 decree,
+            UInt64 size,
+            const BallotNumber& localMaxBallot,
+            const char *outputFile,
+            BallotNumber *sourceMaxBallot,
+            BallotNumber *writtenMaxBallot);
     };
 }

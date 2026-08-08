@@ -142,6 +142,10 @@ jobs:
           cargo test -p rsl-wire --test windows_oracle --all-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p rsl-storage --test windows_oracle --all-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p rsl-net --test windows_network_oracle --all-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p rsl-net --test windows_learn_oracle --all-features
 
       - uses: actions/upload-artifact@v4
         with:
