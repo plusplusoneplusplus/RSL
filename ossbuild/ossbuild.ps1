@@ -32,6 +32,14 @@ if (($env:PATH -split ";" -notcontains $vswhereDirectory)) {
 }
 
 Import-Module $devShellModule
-Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -Arch $Platform -HostArch x64 | Out-Null
+
+# The DevShell module's -Arch/-HostArch parameters expect MSVC arch names
+# (amd64/arm64), not MSBuild platform names (x64/arm64). Map accordingly.
+$devShellArch = switch ($Platform) {
+    "x64"   { "amd64" }
+    "arm64" { "arm64" }
+    default { throw "Unsupported platform '$Platform'." }
+}
+Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -Arch $devShellArch -HostArch amd64 | Out-Null
 
 . (Join-Path $PSScriptRoot "ossbuildenv.ps1")
