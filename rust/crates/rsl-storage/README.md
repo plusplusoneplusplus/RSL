@@ -198,8 +198,8 @@ if let Some(mut records) = log.replay_from(1042)? {
    is all-or-nothing.
 
 Linux proxy corpus samples are generated test data and not committed. Tests locate them
-via `$RSL_STORAGE_CORPUS`, then `tools/linux-proxy/corpus/storage`, and finally by
-running `rsl-linux-proxy --storage` if the binary is built; with none of those
+via `$RSL_STORAGE_CORPUS` and otherwise regenerate them by running
+`rsl-linux-proxy --storage` if the binary is built; with neither of those
 available the corpus/interop tests print a skip instead of failing.
 
 Production Windows storage fixtures are likewise generated rather than committed

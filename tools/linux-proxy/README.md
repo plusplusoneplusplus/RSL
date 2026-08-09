@@ -78,9 +78,10 @@ rejected, and `1` for I/O failure.
 packet-model, and learn-model vectors. Wire message bytes come from production
 marshaling translation units; packet and learn outcomes come from proxy models.
 
-`corpus/storage/MANIFEST.json` records Linux storage-model file hashes and
-outcomes. The generated binaries are ignored because large Windows authority
-corpora are published separately as workflow artifacts.
+`--storage <dir>` writes Linux storage-model samples plus a `MANIFEST.json`
+recording their hashes and outcomes. Nothing under `corpus/storage/` is
+committed: the corpus is regenerated on demand, and the authoritative Windows
+storage corpora are published separately as workflow artifacts.
 
 ## Limitations
 

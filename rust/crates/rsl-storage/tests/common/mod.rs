@@ -70,10 +70,10 @@ pub fn linux_proxy() -> Option<PathBuf> {
 
 /// The optional Linux-model storage corpus directory.
 ///
-/// The sample files are generated test data and deliberately not committed (see
-/// `tools/linux-proxy/.gitignore`), so this looks, in order, at
-/// `$RSL_STORAGE_CORPUS`, the in-repo corpus directory, and finally regenerates
-/// the corpus with `rsl-linux-proxy --storage` into this test run's temp directory.
+/// The samples are generated test data and deliberately not committed (see
+/// `tools/linux-proxy/.gitignore`), so this looks at `$RSL_STORAGE_CORPUS`
+/// first and otherwise regenerates the corpus with `rsl-linux-proxy --storage`
+/// into this test run's temp directory.
 pub fn storage_corpus() -> Option<&'static Path> {
     static CORPUS: OnceLock<Option<PathBuf>> = OnceLock::new();
     CORPUS
@@ -85,11 +85,6 @@ pub fn storage_corpus() -> Option<&'static Path> {
                     dir.display()
                 );
                 return Some(dir);
-            }
-
-            let in_repo = repo_root().join("tools/linux-proxy/corpus/storage");
-            if in_repo.join("cp-small.codex").is_file() {
-                return Some(in_repo);
             }
 
             // Regenerate from the Linux proxy if it is available.
@@ -137,7 +132,7 @@ pub struct ManifestRecord {
     pub checksum: u64,
 }
 
-/// One `kind: "log"` entry of `corpus/storage/MANIFEST.json`.
+/// One `kind: "log"` entry of the proxy storage corpus `MANIFEST.json`.
 #[derive(Debug)]
 pub struct LogSample {
     pub name: String,
@@ -188,7 +183,7 @@ pub fn log_samples(corpus: &Path) -> Vec<LogSample> {
         .collect()
 }
 
-/// One `kind: "checkpoint"` entry of `corpus/storage/MANIFEST.json`.
+/// One `kind: "checkpoint"` entry of the proxy storage corpus `MANIFEST.json`.
 #[derive(Debug)]
 pub struct CheckpointSample {
     pub name: String,

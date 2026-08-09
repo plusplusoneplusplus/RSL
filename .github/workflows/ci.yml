@@ -19,59 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux-proxy:
-    name: Linux proxy and OpenSSL build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install proxy dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake g++ libssl-dev
-
-      - name: Build Linux proxy
-        run: |
-          cmake -S tools/linux-proxy -B tools/linux-proxy/build
-          cmake --build tools/linux-proxy/build -j "$(nproc)"
-
-      - name: Verify portable proxy corpora
-        run: |
-          ./tools/linux-proxy/build/rsl-linux-proxy > "$RUNNER_TEMP/golden-proxy.txt"
-          diff -u tools/linux-proxy/corpus/proxy-vectors.txt "$RUNNER_TEMP/golden-proxy.txt"
-
-          out="$RUNNER_TEMP/storage-proxy"
-          ./tools/linux-proxy/build/rsl-linux-proxy --storage "$out"
-          diff -u tools/linux-proxy/corpus/storage/MANIFEST.json "$out/MANIFEST.json"
-
-          set +e
-          ./tools/linux-proxy/build/rsl-linux-proxy --verify-storage "$out"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 3 ]; then
-            echo "::error::Expected proxy storage verifier rejection status 3; got $rc."
-            exit 1
-          fi
-
-      - name: Require OpenSSL supplemental peer
-        run: |
-          set +e
-          ./tools/linux-proxy/build/rsl-linux-proxy --tls-peer 0
-          rc=$?
-          set -e
-          if [ "$rc" -ne 2 ]; then
-            echo "::error::OpenSSL peer is unavailable; expected argument error 2, got $rc."
-            exit 1
-          fi
-
-      - name: Publish Linux proxy
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-proxy-${{ github.sha }}
-          path: tools/linux-proxy/build/rsl-linux-proxy
-          if-no-files-found: error
-          retention-days: 3
-
   windows-authority:
     name: Windows authority (${{ matrix.configuration }})
     runs-on: windows-2022
@@ -193,15 +140,61 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  linux-rust:
-    name: Linux Rust and authoritative corpora
+  linux:
+    name: Linux proxy, Rust, and authoritative corpora
     runs-on: ubuntu-latest
-    needs: [windows-authority, linux-proxy]
+    needs: windows-authority
     env:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install proxy dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libssl-dev
+
+      - name: Build Linux proxy
+        run: |
+          cmake -S tools/linux-proxy -B tools/linux-proxy/build
+          cmake --build tools/linux-proxy/build -j "$(nproc)"
+
+      - name: Verify portable proxy corpora
+        run: |
+          proxy="$PWD/tools/linux-proxy/build/rsl-linux-proxy"
+          "$proxy" > "$RUNNER_TEMP/golden-proxy.txt"
+          diff -u tools/linux-proxy/corpus/proxy-vectors.txt "$RUNNER_TEMP/golden-proxy.txt"
+
+          # Generated once here and reused as $RSL_STORAGE_CORPUS below, so the
+          # Rust suite checks this exact corpus against the Rust implementation.
+          storage="$RUNNER_TEMP/storage-proxy"
+          "$proxy" --storage "$storage"
+
+          set +e
+          "$proxy" --verify-storage "$storage"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 3 ]; then
+            echo "::error::Expected proxy storage verifier rejection status 3; got $rc."
+            exit 1
+          fi
+
+          {
+            echo "RSL_LINUX_PROXY=$proxy"
+            echo "RSL_STORAGE_CORPUS=$storage"
+          } >> "$GITHUB_ENV"
+
+      - name: Require OpenSSL supplemental peer
+        run: |
+          set +e
+          ./tools/linux-proxy/build/rsl-linux-proxy --tls-peer 0
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "::error::OpenSSL peer is unavailable; expected argument error 2, got $rc."
+            exit 1
+          fi
 
       - name: Download Windows authority
         uses: actions/download-artifact@v4
@@ -209,30 +202,16 @@ jobs:
           name: windows-authority-${{ github.sha }}
           path: ${{ runner.temp }}/rsl-authority
 
-      - name: Download Linux proxy
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-proxy-${{ github.sha }}
-          path: ${{ runner.temp }}/linux-proxy
-
-      - name: Validate and configure downloaded artifacts
+      - name: Validate and configure Windows authority
         run: |
           python tools/windows-oracle/validate_artifact.py \
             "$RUNNER_TEMP/rsl-authority" \
             --expected-revision "${{ github.sha }}" \
             --expected-configuration Release
-          chmod +x "$RUNNER_TEMP/linux-proxy/rsl-linux-proxy"
           {
             echo "RSL_WINDOWS_WIRE=$RUNNER_TEMP/rsl-authority/wire/wire.txt"
             echo "RSL_WINDOWS_STORAGE=$RUNNER_TEMP/rsl-authority/storage"
-            echo "RSL_LINUX_PROXY=$RUNNER_TEMP/linux-proxy/rsl-linux-proxy"
           } >> "$GITHUB_ENV"
-
-      - name: Prepare supplemental proxy storage corpus
-        run: |
-          proxy_storage="$RUNNER_TEMP/storage-proxy-rust"
-          "$RUNNER_TEMP/linux-proxy/rsl-linux-proxy" --storage "$proxy_storage"
-          echo "RSL_STORAGE_CORPUS=$proxy_storage" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         run: |
@@ -260,31 +239,47 @@ jobs:
           cargo clippy --all-targets --all-features --locked -- -D warnings
           cargo build --workspace --all-targets --all-features --locked
 
-      - name: Consume authoritative Windows corpora
-        working-directory: rust
-        run: |
-          cargo test -p rsl-wire --test windows_oracle \
-            committed_production_windows_wire_artifacts_parse_and_verify \
-            --all-features --locked
-          cargo test -p rsl-storage --test windows_oracle \
-            production_windows_storage_artifacts_match_rust \
-            --all-features --locked
-
-      - name: Run portable Rust and proxy tests
+      - name: Run Rust tests against authoritative and proxy corpora
         working-directory: rust
         run: cargo test --workspace --all-features --locked
 
-      - name: Fuzz smoke
+      - name: Detect fuzz crates
+        id: fuzz
         working-directory: rust
         run: |
-          fuzz_manifests="$(git ls-files '**/fuzz/Cargo.toml')"
-          if [ -z "$fuzz_manifests" ]; then
+          if [ -n "$(git ls-files '**/fuzz/Cargo.toml')" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
             echo "No fuzz crate found."
-            exit 0
+            echo "found=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Install nightly toolchain
+        if: steps.fuzz.outputs.found == 'true'
+        id: nightly
+        run: |
           rustup toolchain install nightly --profile minimal
-          cargo install cargo-fuzz --locked
-          for manifest in $fuzz_manifests; do
+          echo "version=$(rustc +nightly --version | tr ' ()' '---')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo-fuzz
+        if: steps.fuzz.outputs.found == 'true'
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: ubuntu-cargo-fuzz-${{ steps.nightly.outputs.version }}
+
+      - name: Install cargo-fuzz
+        if: >-
+          steps.fuzz.outputs.found == 'true' &&
+          steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz smoke
+        if: steps.fuzz.outputs.found == 'true'
+        working-directory: rust
+        run: |
+          for manifest in $(git ls-files '**/fuzz/Cargo.toml'); do
             crate="$(dirname "$(dirname "$manifest")")"
             crate="${crate#rust/}"
             echo "::group::Fuzzing $crate"
