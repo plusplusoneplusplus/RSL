@@ -41,6 +41,7 @@
     <ClCompile Include="$(SRCROOT)\RSL\src\interop_test_facade.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\learn_protocol.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\legislator.cpp" />
+    <ClCompile Include="$(SRCROOT)\RSL\src\logfile.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\rsl.cpp" />
     <ClCompile Include="$(SRCROOT)\RSL\src\rslutil.cpp" />
   </ItemGroup>
