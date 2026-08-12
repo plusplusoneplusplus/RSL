@@ -115,6 +115,12 @@ that journals every operation — for the crash harness. Reads and recovery stay
 on the real filesystem; the harness materializes a crashed directory to disk and
 runs the real code against it.
 
+The trait also supplies the `seqwrite::BlockDevice` that `CheckpointWriter`'s
+ring issues its blocks through, so the crash harness journals the same writer
+production runs. See [`WRITEPATH.md`](WRITEPATH.md) and
+[`READPATH.md`](READPATH.md) for the ring on either side of the checkpoint and
+what it measures against the C++ `APSEQWRITE`/`APSEQREAD`.
+
 ## Example
 
 ```rust

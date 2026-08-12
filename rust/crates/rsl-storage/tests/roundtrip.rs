@@ -14,6 +14,7 @@ use rsl_storage::checkpoint::{
     reject_reason, CheckpointHeader, CheckpointReader, CheckpointWriter, RejectReason, WriteError,
 };
 use rsl_storage::durability::NoSync;
+use rsl_storage::seqread::{SeqReaderConfig, SECTOR};
 use rsl_storage::{round_up_to_page, CHECKSUM_BLOCK_SIZE, CHECKSUM_SIZE, PAGE_SIZE};
 use rsl_wire::messages::MSG_VOTE;
 use rsl_wire::{
@@ -105,6 +106,49 @@ fn round_trips_across_the_4_mib_block_boundary() {
         assert_eq!(reader.user_data_size(), len);
         assert_eq!(reader.read_all().expect("read"), state, "state for {len}");
         std::fs::remove_file(&path).unwrap();
+    }
+}
+
+/// The reader's ring shape is a performance knob, never a correctness one.
+///
+/// Worth pinning separately from the default because the state does not start
+/// on a sector boundary: `SeqReader::open_at` begins its reads below the
+/// header's end and discards the prefix, so every combination of ring block and
+/// header length exercises a different skip.
+#[test]
+fn checkpoints_read_back_at_any_ring_shape() {
+    let dir = common::TempDir::new("ringshapes");
+    let block = 4 * PAGE_SIZE;
+    let state = common::ramp_state(3 * (block - CHECKSUM_SIZE) as usize + 991);
+
+    let path = dir.join("shapes.codex");
+    let mut writer =
+        CheckpointWriter::create_with(&path, header(ProtocolVersion::V6, Some(block)), NoSync)
+            .expect("create");
+    writer.write_all(&state).expect("write");
+    writer.finish().expect("finish");
+
+    for (threads, slots, ring) in [
+        (1, 2, SECTOR),
+        (2, 4, SECTOR),
+        (3, 3, SECTOR * 2),
+        (8, 8, 1 << 20),
+    ] {
+        let mut reader = CheckpointReader::open_with(
+            &path,
+            SeqReaderConfig {
+                threads,
+                slots,
+                block: ring,
+            },
+        )
+        .expect("open");
+        assert_eq!(reader.user_data_size(), state.len() as u64);
+        assert_eq!(
+            reader.read_all().expect("read"),
+            state,
+            "state at {threads}x{slots}x{ring}"
+        );
     }
 }
 

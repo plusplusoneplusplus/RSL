@@ -252,18 +252,22 @@ touching anything on disk. The open questions are the worst-case latency gap
 remove, at the cost of `unsafe` or a wrapper crate) and whether the learn port
 wants a shared reader pool.
 
-## Follow-up: migrating the call sites (open)
+## Follow-up: migrating the call sites
 
-`SeqReader` exists and is tested but nothing uses it yet. Deliberately: the
-measurement and the type are one change, and rewiring four call sites is
-another, so that a regression in either is bisectable on its own.
-
-| Path | Today | Should become |
+| Path | Was | Is now |
 | --- | --- | --- |
-| Log replay (log.rs:522, :737) | `BufReader::new` — 8 KiB | `SeqReader`, default config |
-| Log scan (log.rs:319) | bare `File::open` | `SeqReader`, default config |
-| Checkpoint read (checkpoint.rs:694) | `File` + `read_exact` per block | `SeqReader`, default config |
-| Learner streaming (server.rs:405-421) | `tokio::fs` + one `stream_chunk` buffer | **decide separately** — thread-per-reader is the wrong shape for many concurrent peers |
+| Log replay (log.rs:522, :737) | `BufReader::new` — 8 KiB | **still open** |
+| Log scan (log.rs:319) | bare `File::open` | **still open** |
+| Checkpoint read (checkpoint.rs) | `File` + `read_exact` per block | `SeqReader`, default config |
+| Learner streaming (server.rs:405-421) | `tokio::fs` + one `stream_chunk` buffer | **still open** — thread-per-reader is the wrong shape for many concurrent peers |
 
-The first three are the easy ones and are where the measured win is. The fourth
-needs a decision about threads before it needs any code.
+`CheckpointReader::open` and `checkpoint::verify_file` now read the header off
+an ordinary handle — it is a page or two, and a ring of read-ahead over that is
+pure setup cost — and stream the user state through a `SeqReader` opened at the
+header's end. `open_at` is the reader's whole notion of seeking, which is why
+the position is chosen at open time rather than sought to afterwards; the
+non-seeking half of `CheckpointReader::new` is factored out as `assemble` so
+both constructors share the same validation.
+
+The log paths are still open, and the learner one needs a decision about
+threads before it needs any code.

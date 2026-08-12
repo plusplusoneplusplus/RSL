@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::durability::{parent_or_dot, Durability, OpenMode, StorageFile};
+use crate::seqwrite::{BlockDevice, BlockWriter, SeqWriterConfig};
 use crate::PAGE_SIZE;
 
 /// The tear granularity, matching the format's `s_PageSize` sector assumption.
@@ -631,8 +632,93 @@ impl StorageFile for SimFile {
     }
 }
 
+/// A [`BlockDevice`] onto the shadow filesystem, so
+/// [`crate::seqwrite::SeqWriter`] — and therefore
+/// [`crate::checkpoint::CheckpointWriter`] — runs its real ring here and every
+/// block it issues lands in the journal.
+#[derive(Clone, Debug)]
+pub struct SimDevice {
+    sim: SimCrash,
+}
+
+/// One writer's handle on a shadow file. Positional, like the real one.
+#[derive(Clone, Debug)]
+pub struct SimBlock {
+    sim: SimCrash,
+    path: PathBuf,
+}
+
+impl BlockWriter for SimBlock {
+    fn write_block_at(&self, data: &[u8], offset: u64) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.sim
+            .with(|state| match state.live.get_mut(&self.path) {
+                Some(bytes) => {
+                    write_at(bytes, offset, data);
+                    Ok(())
+                }
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} does not exist", self.path.display()),
+                )),
+            })?;
+        self.sim.record(Op::Write {
+            path: self.path.clone(),
+            offset,
+            data: data.to_vec(),
+        });
+        Ok(())
+    }
+}
+
+impl BlockDevice for SimDevice {
+    type Handle = SimBlock;
+
+    fn create(&self, path: &Path, handles: usize) -> io::Result<Vec<SimBlock>> {
+        // Goes through `open` so the create/truncate is journalled exactly as it
+        // is for any other file this policy touches.
+        self.sim.open(path, OpenMode::Create)?;
+        Ok((0..handles)
+            .map(|_| SimBlock {
+                sim: self.sim.clone(),
+                path: path.to_path_buf(),
+            })
+            .collect())
+    }
+
+    fn set_len_durable(&self, path: &Path, len: u64) -> io::Result<()> {
+        let mut file = self.sim.open(path, OpenMode::Append)?;
+        file.set_size(len)?;
+        self.sim.sync_file(&file)
+    }
+
+    /// One slot pair of the smallest legal block.
+    ///
+    /// None of the sizing means anything without a device to overlap against,
+    /// and the production default would allocate 16 MiB per writer in a harness
+    /// that builds one per crash point. The bytes on disk are unchanged: the
+    /// blocks tile the same file at the same offsets, and the tail is padded to
+    /// the device sector either way.
+    fn tune(&self, _config: SeqWriterConfig) -> SeqWriterConfig {
+        SeqWriterConfig {
+            threads: 1,
+            slots: 2,
+            // The writer's sector, not this module's torn-write granularity.
+            block: crate::seqread::SECTOR,
+        }
+    }
+
+    /// Always. A journal replayed at every prefix has to be deterministic.
+    fn inline(&self) -> bool {
+        true
+    }
+}
+
 impl Durability for SimCrash {
     type File = SimFile;
+    type Bulk = SimDevice;
 
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<SimFile> {
         let existed = self.with(|state| state.live.contains_key(path));
@@ -665,6 +751,10 @@ impl Durability for SimCrash {
             path: path.to_path_buf(),
             pos: 0,
         })
+    }
+
+    fn bulk(&self) -> SimDevice {
+        SimDevice { sim: self.clone() }
     }
 
     fn exists(&self, path: &Path) -> bool {

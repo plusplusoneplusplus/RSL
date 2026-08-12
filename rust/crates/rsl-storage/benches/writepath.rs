@@ -13,15 +13,16 @@
 //! at a time.
 //!
 //! `bufwriter/8192` is not an arbitrary point on the sweep. It is what
-//! `CheckpointWriter::create_with` (checkpoint.rs:846) uses today, because
+//! `CheckpointWriter` used before it moved onto `SeqWriter`, because
 //! `BufWriter::new` is the 8 KiB default — the exact mirror of the read side's
-//! `BufReader::new` finding.
+//! `BufReader::new` finding. It stays here as the baseline the migration is
+//! measured against.
 //!
 //! The `checkpoint/today` row is the real `CheckpointWriter` (blocks,
-//! Rabin-64, header rewrite, rename) with `NoSync`, so the gap between it and
-//! the raw `bufwriter/8192` row is the format work, and the gap to the larger
-//! capacities is what a capacity bump could recover without touching the
-//! format.
+//! Rabin-64, header rewrite, rename) with `NoSync`. Since the migration that
+//! row writes *unbuffered*, so it is no longer a page-cache number and no
+//! longer commensurable with the `bufwriter/*` rows beside it: read it against
+//! the cross-language `SeqIoBench` sweep, not against this file's own sweep.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};

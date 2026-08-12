@@ -555,9 +555,13 @@ struct NoDirSync(SimCrash);
 
 impl Durability for NoDirSync {
     type File = SimFile;
+    type Bulk = rsl_storage::sim::SimDevice;
 
     fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<SimFile> {
         self.0.open(path, mode)
+    }
+    fn bulk(&self) -> rsl_storage::sim::SimDevice {
+        self.0.bulk()
     }
     fn exists(&self, path: &Path) -> bool {
         self.0.exists(path)

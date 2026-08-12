@@ -71,6 +71,15 @@
 //! One OS thread per configured writer, right for checkpointing, which runs one
 //! at a time. Size [`SeqWriterConfig::threads`] accordingly for anything that
 //! runs many at once.
+//!
+//! # Where the blocks land
+//!
+//! The ring does not open files. It issues whole blocks at explicit offsets
+//! through a [`BlockDevice`], so it can sit *behind*
+//! [`crate::durability::Durability`] rather than beside it: production writes
+//! through [`RealDevice`]'s unbuffered handles, and
+//! [`crate::sim::SimCrash`] hands out shadow-filesystem handles, so
+//! `tests/crash.rs` cuts power on the same writer the engine runs.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -146,6 +155,115 @@ impl SeqWriterConfig {
     }
 }
 
+/// One writer thread's exclusive handle on the file being filled.
+///
+/// Positional, so the order writers happen to finish in does not matter.
+pub trait BlockWriter: Send + 'static {
+    /// Write all of `data` at `offset`.
+    fn write_block_at(&self, data: &[u8], offset: u64) -> io::Result<()>;
+}
+
+/// Where a [`SeqWriter`]'s blocks land.
+///
+/// The seam that lets the same ring serve production and the crash simulator.
+/// See the [module docs](self).
+pub trait BlockDevice {
+    /// A handle one writer thread owns exclusively.
+    type Handle: BlockWriter;
+
+    /// Create `path`, truncating any existing file, and hand out `handles`
+    /// independent handles — one per writer thread, because a shared
+    /// synchronous handle serializes in the kernel and would give back the
+    /// queue depth this design exists to get.
+    fn create(&self, path: &Path, handles: usize) -> io::Result<Vec<Self::Handle>>;
+
+    /// Establish the file's final length.
+    ///
+    /// This is what `APSEQWRITE::Flush`'s `SetEndOfFile` (apdiskio.cpp:1075) is
+    /// for: writes must be sector multiples, so a length that is not one cannot
+    /// be expressed by the writes alone.
+    fn set_len_durable(&self, path: &Path, len: u64) -> io::Result<()>;
+
+    /// Narrow `config` to what this device can actually use.
+    ///
+    /// The default changes nothing. A shadow filesystem overrides it because
+    /// none of the sizing means anything without a device to overlap against.
+    fn tune(&self, config: SeqWriterConfig) -> SeqWriterConfig {
+        config
+    }
+
+    /// Issue every block on the caller's thread instead of on a pool.
+    ///
+    /// [`crate::sim::SimCrash`] takes this path: a journal that is replayed at
+    /// every prefix has to record its writes in a deterministic order, which a
+    /// pool cannot promise. Everything else — block boundaries, the zeroed pad,
+    /// the final length — is unchanged, which is what keeps the crash harness
+    /// on the production writer rather than a stand-in for it.
+    fn inline(&self) -> bool {
+        false
+    }
+}
+
+/// The real filesystem: unbuffered positional writes, one handle per thread.
+#[derive(Clone, Copy, Debug)]
+pub struct RealDevice {
+    sync: bool,
+}
+
+impl RealDevice {
+    /// Establish the length and `fsync`. What the engine runs.
+    pub const fn syncing() -> RealDevice {
+        RealDevice { sync: true }
+    }
+
+    /// Establish the length and stop there — [`crate::durability::NoSync`]'s
+    /// half of the bargain, for benchmarks and tests that do not need the file
+    /// to survive power loss.
+    pub const fn unsynced() -> RealDevice {
+        RealDevice { sync: false }
+    }
+}
+
+impl Default for RealDevice {
+    fn default() -> RealDevice {
+        RealDevice::syncing()
+    }
+}
+
+impl BlockWriter for File {
+    fn write_block_at(&self, data: &[u8], offset: u64) -> io::Result<()> {
+        write_at(self, data, offset)
+    }
+}
+
+impl BlockDevice for RealDevice {
+    type Handle = File;
+
+    fn create(&self, path: &Path, handles: usize) -> io::Result<Vec<File>> {
+        // Truncate first, through an ordinary handle: an unbuffered handle can
+        // set a length but is a clumsy way to ask for one.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        (0..handles).map(|_| open_unbuffered(path)).collect()
+    }
+
+    fn set_len_durable(&self, path: &Path, len: u64) -> io::Result<()> {
+        // `APSEQWRITE` needs a second, buffered handle open for the writer's
+        // whole lifetime for this (`m_hfileSetEof`, apdiskio.cpp:711); an
+        // ordinary handle opened here does the same job.
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(len)?;
+        if self.sync {
+            file.sync_all()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct Ring {
     inner: Mutex<RingInner>,
     cv: Condvar,
@@ -167,9 +285,13 @@ struct RingInner {
 ///
 /// See the [module docs](self) for the design and for what it deliberately does
 /// not inherit from `APSEQWRITE`.
-pub struct SeqWriter {
+pub struct SeqWriter<Dev: BlockDevice = RealDevice> {
     ring: Arc<Ring>,
     workers: Vec<JoinHandle<()>>,
+    device: Dev,
+    /// The single handle used on the caller's thread when the device asked for
+    /// inline issue; `None` when a pool is doing the writing.
+    inline: Option<Dev::Handle>,
     path: PathBuf,
     slots: usize,
     block: usize,
@@ -183,7 +305,7 @@ pub struct SeqWriter {
     finished: bool,
 }
 
-impl SeqWriter {
+impl SeqWriter<RealDevice> {
     /// Create `path`, truncating any existing file, with the default sizing.
     ///
     /// Truncating is deliberate and is *not* what `APSEQWRITE` does
@@ -197,15 +319,26 @@ impl SeqWriter {
 
     /// [`create`](Self::create) with explicit sizing.
     pub fn create_with(path: &Path, config: SeqWriterConfig) -> io::Result<SeqWriter> {
+        SeqWriter::create_on(RealDevice::syncing(), path, config)
+    }
+}
+
+impl<Dev: BlockDevice> SeqWriter<Dev> {
+    /// [`create_with`](SeqWriter::create_with) onto an explicit device.
+    ///
+    /// `config` is passed through [`BlockDevice::tune`] first, so a device that
+    /// cannot use the caller's sizing gets to say so.
+    pub fn create_on(
+        device: Dev,
+        path: &Path,
+        config: SeqWriterConfig,
+    ) -> io::Result<SeqWriter<Dev>> {
+        let config = device.tune(config);
         config.validate()?;
 
-        // Truncate first, through an ordinary handle: an unbuffered handle can
-        // set a length but is a clumsy way to ask for one.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let inline_issue = device.inline();
+        let threads = if inline_issue { 1 } else { config.threads };
+        let mut handles = device.create(path, threads)?;
 
         let slots = config.slots;
         let block = config.block;
@@ -219,21 +352,25 @@ impl SeqWriter {
             cv: Condvar::new(),
         });
 
-        let mut workers = Vec::with_capacity(config.threads);
-        for _ in 0..config.threads {
-            // Each writer needs its own handle: a shared synchronous handle
-            // serializes in the kernel, which would give back the queue depth
-            // this design exists to get.
-            let file = open_unbuffered(path)?;
-            let ring = Arc::clone(&ring);
-            workers.push(std::thread::spawn(move || {
-                drain_loop(&file, &ring, slots, block);
-            }));
+        let mut workers = Vec::new();
+        let mut inline = None;
+        if inline_issue {
+            inline = Some(handles.pop().expect("one handle was requested"));
+        } else {
+            workers.reserve(threads);
+            for handle in handles {
+                let ring = Arc::clone(&ring);
+                workers.push(std::thread::spawn(move || {
+                    drain_loop(&handle, &ring, slots, block);
+                }));
+            }
         }
 
         let mut w = SeqWriter {
             ring,
             workers,
+            device,
+            inline,
             path: path.to_path_buf(),
             slots,
             block,
@@ -346,12 +483,10 @@ impl SeqWriter {
         self.check_err()?;
 
         // The logical length, which the sector-multiple writes could not
-        // express. `APSEQWRITE` needs a second, buffered handle for this
-        // (`m_hfileSetEof`, apdiskio.cpp:711); an ordinary handle opened here
-        // does the same job without holding one open for the writer's lifetime.
-        let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
-        file.set_len(self.written)?;
-        file.sync_all()
+        // express. Dropping the handles first matters on Windows, where an open
+        // unbuffered handle is not a spectator.
+        self.inline = None;
+        self.device.set_len_durable(&self.path, self.written)
     }
 
     /// Hand the current buffer to the writers and take the next free slot.
@@ -367,6 +502,21 @@ impl SeqWriter {
     /// Publish a filled buffer for the writer that will issue it.
     fn publish(&mut self, index: u64, buf: AlignedBuf) -> io::Result<()> {
         let slot = (index % self.slots as u64) as usize;
+
+        // Inline device: issue here, in order, and hand the slot straight back.
+        if let Some(handle) = &self.inline {
+            let result = handle.write_block_at(buf.data(), index * self.block as u64);
+            let mut g = self.ring.inner.lock().expect("ring mutex");
+            g.bufs[slot] = Some(buf);
+            g.pending[slot] = None;
+            if let Err(e) = &result {
+                if g.err.is_none() {
+                    g.err = Some(io::Error::new(e.kind(), e.to_string()));
+                }
+            }
+            return result;
+        }
+
         let mut g = self.ring.inner.lock().expect("ring mutex");
         if let Some(e) = g.err.take() {
             return Err(e);
@@ -408,7 +558,7 @@ impl SeqWriter {
 }
 
 /// One writer thread: claim a filled slot, issue it, free the slot.
-fn drain_loop(file: &File, ring: &Ring, slots: usize, block: usize) {
+fn drain_loop<W: BlockWriter>(handle: &W, ring: &Ring, slots: usize, block: usize) {
     loop {
         let (slot, index, buf) = {
             let mut g = ring.inner.lock().expect("ring mutex");
@@ -430,7 +580,7 @@ fn drain_loop(file: &File, ring: &Ring, slots: usize, block: usize) {
         };
 
         // Positional, so the order writers happen to finish in does not matter.
-        let result = write_at(file, buf.data(), index * block as u64);
+        let result = handle.write_block_at(buf.data(), index * block as u64);
 
         let mut g = ring.inner.lock().expect("ring mutex");
         g.bufs[slot] = Some(buf);
@@ -444,7 +594,7 @@ fn drain_loop(file: &File, ring: &Ring, slots: usize, block: usize) {
     }
 }
 
-impl Write for SeqWriter {
+impl<Dev: BlockDevice> Write for SeqWriter<Dev> {
     fn write(&mut self, mut data: &[u8]) -> io::Result<usize> {
         let total = data.len();
         while !data.is_empty() {
@@ -468,11 +618,12 @@ impl Write for SeqWriter {
     }
 }
 
-impl std::fmt::Debug for SeqWriter {
+impl<Dev: BlockDevice> std::fmt::Debug for SeqWriter<Dev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SeqWriter")
             .field("path", &self.path)
             .field("threads", &self.workers.len())
+            .field("inline", &self.inline.is_some())
             .field("slots", &self.slots)
             .field("block", &self.block)
             .field("bytes_written", &self.written)
@@ -480,7 +631,7 @@ impl std::fmt::Debug for SeqWriter {
     }
 }
 
-impl Drop for SeqWriter {
+impl<Dev: BlockDevice> Drop for SeqWriter<Dev> {
     /// Stop the writers and wait for them.
     ///
     /// Detaching them would be a real bug rather than untidiness: a writer

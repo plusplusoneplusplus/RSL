@@ -43,6 +43,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 
+use crate::seqwrite::{BlockDevice, RealDevice};
+
 /// How a file is opened. Deliberately only the three shapes this crate needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMode {
@@ -93,8 +95,20 @@ pub trait Durability {
     /// The handle [`open`](Durability::open) hands back.
     type File: StorageFile;
 
+    /// Where bulk sequential writes land — [`crate::seqwrite::SeqWriter`]'s ring
+    /// of blocks, which the checkpoint writer streams state through.
+    ///
+    /// The ring opens its own handles, so without this it could only ever write
+    /// to the real filesystem and the crash harness would be exercising a
+    /// different writer from production. Routing it through the policy keeps
+    /// the two the same code.
+    type Bulk: BlockDevice;
+
     /// Open `path` in `mode`, creating it where the mode says so.
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Self::File>;
+
+    /// The device a [`crate::seqwrite::SeqWriter`] under this policy writes to.
+    fn bulk(&self) -> Self::Bulk;
 
     /// Does `path` name an existing file?
     fn exists(&self, path: &Path) -> bool;
@@ -162,9 +176,14 @@ pub struct SyncAll;
 
 impl Durability for SyncAll {
     type File = File;
+    type Bulk = RealDevice;
 
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<File> {
         mode.options().open(path)
+    }
+
+    fn bulk(&self) -> RealDevice {
+        RealDevice::syncing()
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -222,9 +241,18 @@ pub struct NoSync;
 
 impl Durability for NoSync {
     type File = File;
+    type Bulk = RealDevice;
 
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<File> {
         mode.options().open(path)
+    }
+
+    /// The same ring production uses, minus the `fsync` that establishes the
+    /// length durably. The writes themselves are still unbuffered, so a
+    /// benchmark on this policy measures the real write path rather than the
+    /// page cache.
+    fn bulk(&self) -> RealDevice {
+        RealDevice::unsynced()
     }
 
     fn exists(&self, path: &Path) -> bool {

@@ -27,7 +27,7 @@
 //! vote — and at `v == 3` the user state follows raw, with no block checksums.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rsl_wire::marshal::{Reader, Writer};
@@ -35,6 +35,8 @@ use rsl_wire::messages::verify_checksum;
 use rsl_wire::{BallotNumber, ConfigurationInfo, MarshalError, MemberId, ProtocolVersion, Vote};
 
 use crate::durability::{Durability, OpenMode, SyncAll};
+use crate::seqread::{SeqReader, SeqReaderConfig};
+use crate::seqwrite::{SeqWriter, SeqWriterConfig};
 use crate::{round_up_to_page, CHECKSUM_BLOCK_SIZE, CHECKSUM_SIZE, PAGE_SIZE};
 
 /// Why a checkpoint file was rejected.
@@ -511,22 +513,26 @@ pub fn verify_file(path: &Path) -> io::Result<Verification> {
         state_saved: false,
         reject: None,
     };
-    match read_header(&mut file, file_size) {
+    let header = match read_header(&mut file, file_size) {
         Ok(header) => {
             verification.version = Some(header.version.raw());
             verification.header_len = header.marshal_len().unwrap_or(0);
             verification.checksum_block_size = header.checksum_block_size;
             verification.state_saved = header.state_saved;
+            header
         }
         Err(CheckpointError::Reject(reason)) => {
             verification.reject = Some(reason);
             return Ok(verification);
         }
         Err(e) => return Err(e.into()),
-    }
+    };
+    drop(file);
 
-    file.seek(SeekFrom::Start(0))?;
-    let mut reader = match CheckpointReader::new(file, file_size) {
+    // Every block is about to be read and fingerprinted, so this is the one
+    // caller that most wants the ring: verification is bounded by how fast the
+    // file arrives, not by what is done with it.
+    let mut reader = match CheckpointReader::open_at_state(path, header, file_size) {
         Ok(r) => r,
         Err(CheckpointError::Reject(reason)) => {
             verification.reject = Some(reason);
@@ -550,8 +556,8 @@ pub fn verify_file(path: &Path) -> io::Result<Verification> {
 /// the verified stream; [`CheckpointReader::next_block`] exposes the same data
 /// a block at a time.
 ///
-/// At most one block (`checksum_block_size`, normally 4 MiB) is held in memory,
-/// regardless of the checkpoint's size.
+/// At most one block (`checksum_block_size`, normally 4 MiB) is held in memory
+/// on top of the reader's own ring, regardless of the checkpoint's size.
 pub struct CheckpointReader<R> {
     inner: R,
     header: CheckpointHeader,
@@ -569,12 +575,57 @@ pub struct CheckpointReader<R> {
     user_data_size: u64,
 }
 
-impl CheckpointReader<File> {
+impl CheckpointReader<SeqReader> {
     /// Open a checkpoint file and parse (and validate) its header.
-    pub fn open(path: &Path) -> Result<CheckpointReader<File>, CheckpointError> {
-        let file = File::open(path)?;
+    ///
+    /// The header comes off an ordinary handle — it is a page or two, and a ring
+    /// of read-ahead over that is pure setup cost — and the user state then
+    /// streams through a [`SeqReader`] opened at the header's end. That is the
+    /// read `READPATH.md` measures at 6x the `BufReader` this used to be.
+    pub fn open(path: &Path) -> Result<CheckpointReader<SeqReader>, CheckpointError> {
+        CheckpointReader::open_with(path, SeqReaderConfig::default())
+    }
+
+    /// [`open`](Self::open) with explicit reader sizing.
+    pub fn open_with(
+        path: &Path,
+        config: SeqReaderConfig,
+    ) -> Result<CheckpointReader<SeqReader>, CheckpointError> {
+        let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
-        CheckpointReader::new(file, file_size)
+        let header = read_header(&mut file, file_size)?;
+        drop(file);
+        CheckpointReader::open_at_state_with(path, header, file_size, config)
+    }
+
+    /// Stream the user state of `path`, whose header has already been parsed.
+    ///
+    /// Saves [`verify_file`] a second header read; the header must be the one
+    /// [`read_header`] returned for this file.
+    fn open_at_state(
+        path: &Path,
+        header: CheckpointHeader,
+        file_size: u64,
+    ) -> Result<CheckpointReader<SeqReader>, CheckpointError> {
+        CheckpointReader::open_at_state_with(path, header, file_size, SeqReaderConfig::default())
+    }
+
+    fn open_at_state_with(
+        path: &Path,
+        header: CheckpointHeader,
+        file_size: u64,
+        config: SeqReaderConfig,
+    ) -> Result<CheckpointReader<SeqReader>, CheckpointError> {
+        let header_len = header
+            .marshal_len()
+            .expect("a parsed v>=3 header always carries a configuration");
+        // The user state starts at the header's *recomputed* length, which is
+        // what the C++ seeks to (`m_offset = header->GetMarshalLen()` then
+        // `m_reader->Reset(m_offset)`, rsl.cpp:193/265) — not at the length the
+        // file declared. For any well-formed file the two are equal. `open_at`
+        // is the reader's whole notion of seeking, so it is expressed here.
+        let inner = SeqReader::open_at(path, u64::from(header_len), config)?;
+        CheckpointReader::assemble(inner, header, header_len, file_size)
     }
 }
 
@@ -627,10 +678,31 @@ impl<R: Read + Seek> CheckpointReader<R> {
     /// header cross-checks (`rsl.cpp:211`).
     pub fn new(mut inner: R, file_size: u64) -> Result<CheckpointReader<R>, CheckpointError> {
         let header = read_header(&mut inner, file_size)?;
-
         let header_len = header
             .marshal_len()
             .expect("a parsed v>=3 header always carries a configuration");
+        let mut reader = CheckpointReader::assemble(inner, header, header_len, file_size)?;
+
+        // The user state starts at the header's *recomputed* length, which is
+        // what the C++ seeks to (`m_offset = header->GetMarshalLen()` then
+        // `m_reader->Reset(m_offset)`, rsl.cpp:193/265) — not at the length the
+        // file declared. For any well-formed file the two are equal.
+        reader.inner.seek(SeekFrom::Start(u64::from(header_len)))?;
+        Ok(reader)
+    }
+}
+
+impl<R: Read> CheckpointReader<R> {
+    /// Build a reader over `inner`, which must already be positioned at the end
+    /// of the header. Everything [`CheckpointReader::new`] does except the seek,
+    /// so a [`SeqReader`] — which has no `Seek` and does its seeking at open
+    /// time — can share the validation.
+    fn assemble(
+        inner: R,
+        header: CheckpointHeader,
+        header_len: u32,
+        file_size: u64,
+    ) -> Result<CheckpointReader<R>, CheckpointError> {
         let mut reader = CheckpointReader {
             inner,
             header_len,
@@ -655,17 +727,9 @@ impl<R: Read + Seek> CheckpointReader<R> {
             // with no integrity check (`Size()`, rsl.cpp:437).
             reader.user_data_size = reader.remaining;
         }
-
-        // The user state starts at the header's *recomputed* length, which is
-        // what the C++ seeks to (`m_offset = header->GetMarshalLen()` then
-        // `m_reader->Reset(m_offset)`, rsl.cpp:193/265) — not at the length the
-        // file declared. For any well-formed file the two are equal.
-        reader.inner.seek(SeekFrom::Start(u64::from(header_len)))?;
         Ok(reader)
     }
-}
 
-impl<R: Read> CheckpointReader<R> {
     /// The parsed header.
     pub fn header(&self) -> &CheckpointHeader {
         &self.header
@@ -779,15 +843,18 @@ impl<R: Read> Read for CheckpointReader<R> {
 /// destination. On Linux that needs an explicit `fsync` of the file before the
 /// rename and of the directory after it — see [`Durability`].
 ///
-/// Memory use is constant: user bytes stream straight to the file while being
-/// folded into the running block checksum, so nothing larger than the caller's
-/// own buffer is held.
+/// Memory use is constant and independent of the checkpoint's size: user bytes
+/// are copied once, straight into the ring buffer that goes to the device
+/// ([`SeqWriter::available`]/[`SeqWriter::commit`], the pair
+/// `RSLCheckpointStreamWriter` marshals through at rsl.cpp:478), while being
+/// folded into the running block checksum. Nothing beyond the ring is held.
 pub struct CheckpointWriter<D: Durability = SyncAll> {
     header: CheckpointHeader,
     header_len: u32,
     tmp_path: PathBuf,
     final_path: PathBuf,
-    file: Option<BufWriter<D::File>>,
+    /// The ring the state streams through, staged under `tmp_path`.
+    file: Option<SeqWriter<D::Bulk>>,
     durability: D,
     /// `None` for the unblocked pre-v4 layout.
     block_size: Option<u32>,
@@ -842,8 +909,10 @@ impl<D: Durability> CheckpointWriter<D> {
         };
 
         let tmp_path = tmp_path_for(path);
-        let file = durability.open(&tmp_path, OpenMode::Create)?;
-        let mut file = BufWriter::new(file);
+        // The ring's default block is `s_ChecksumBlockSize`, so a checkpoint's
+        // block boundaries and its write boundaries coincide.
+        let mut file =
+            SeqWriter::create_on(durability.bulk(), &tmp_path, SeqWriterConfig::default())?;
         // Reserve the header region (`Init`, rsl.cpp:473 commits `GetMarshalLen`
         // bytes before any user data). It is overwritten in `finish`.
         write_zeros(&mut file, u64::from(header_len))?;
@@ -888,40 +957,65 @@ impl<D: Durability> CheckpointWriter<D> {
         }
     }
 
-    fn out(&mut self) -> &mut BufWriter<D::File> {
+    fn out(&mut self) -> &mut SeqWriter<D::Bulk> {
         self.file.as_mut().expect("writer used after finish")
+    }
+
+    /// Copy as much of `data` as the ring's current buffer will take, and report
+    /// how much.
+    ///
+    /// The zero-copy pair (`GetAvailable`/`CommitAvailable`, rsl.cpp:478): the
+    /// bytes land directly in the buffer that goes to the device rather than in
+    /// an intermediate on the way there, which is what the C++ marshals through
+    /// and what `WRITEPATH.md` measures at 15–18% over handing over a slice.
+    fn issue(&mut self, data: &[u8]) -> io::Result<usize> {
+        let sink = self.file.as_mut().expect("writer used after finish");
+        let dst = sink.available()?;
+        let n = dst.len().min(data.len());
+        dst[..n].copy_from_slice(&data[..n]);
+        sink.commit(n)?;
+        self.bytes_issued += n as u64;
+        Ok(n)
+    }
+
+    /// Close the current block with its checksum token.
+    fn seal_block(&mut self) -> io::Result<()> {
+        let token = self.checksum.to_le_bytes();
+        let mut done = 0;
+        while done < token.len() {
+            done += self.issue(&token[done..])?;
+        }
+        self.data_offset = 0;
+        Ok(())
     }
 
     /// Append user state. Port of `RSLCheckpointStreamWriter::Write`
     /// (`rsl.cpp:500`).
     fn write_state(&mut self, mut data: &[u8]) -> io::Result<()> {
         let Some(block_size) = self.block_size else {
-            self.out().write_all(data)?;
-            self.bytes_issued += data.len() as u64;
-            self.user_bytes += data.len() as u64;
+            while !data.is_empty() {
+                let n = self.issue(data)?;
+                self.user_bytes += n as u64;
+                data = &data[n..];
+            }
             return Ok(());
         };
 
         let data_only = block_size - CHECKSUM_SIZE;
         while !data.is_empty() {
             if self.data_offset == data_only {
-                // Block full: seal it with its checksum.
-                let checksum = self.checksum;
-                self.out().write_all(&checksum.to_le_bytes())?;
-                self.bytes_issued += u64::from(CHECKSUM_SIZE);
-                self.data_offset = 0;
+                self.seal_block()?;
             }
-            let take = data.len().min((data_only - self.data_offset) as usize);
-            let (chunk, rest) = data.split_at(take);
+            let room = (data_only - self.data_offset) as usize;
+            let n = self.issue(&data[..room.min(data.len())])?;
+            let (chunk, rest) = data.split_at(n);
             self.checksum = if self.data_offset == 0 {
                 rsl_wire::fingerprint(chunk)
             } else {
                 rsl_wire::fingerprint_with(self.checksum, chunk)
             };
-            self.out().write_all(chunk)?;
-            self.bytes_issued += take as u64;
-            self.user_bytes += take as u64;
-            self.data_offset += take as u32;
+            self.user_bytes += n as u64;
+            self.data_offset += n as u32;
             data = rest;
         }
         Ok(())
@@ -933,10 +1027,7 @@ impl<D: Durability> CheckpointWriter<D> {
     pub fn finish(mut self) -> Result<CheckpointHeader, CheckpointError> {
         // `Close()` (rsl.cpp:576): flush a partial trailing block.
         if self.block_size.is_some() && self.data_offset > 0 {
-            let checksum = self.checksum;
-            self.out().write_all(&checksum.to_le_bytes())?;
-            self.bytes_issued += u64::from(CHECKSUM_SIZE);
-            self.data_offset = 0;
+            self.seal_block()?;
         }
 
         // `header.SetBytesIssued(&writer)` then `header.Marshal(file)`
@@ -946,11 +1037,20 @@ impl<D: Durability> CheckpointWriter<D> {
         debug_assert_eq!(blob.len(), self.header_len as usize);
         self.header.un_marshal_len = self.header_len;
 
-        let mut file = self.file.take().expect("writer used after finish");
+        // Drain the ring and establish the file's length before the header goes
+        // in. The ring issues whole sectors at block offsets and cannot be
+        // rewound; rewriting the header is a plain positional write on our own
+        // handle once the writers are done, which is the arrangement
+        // `seqwrite`'s module docs describe in place of `RandomWrite`.
+        self.file
+            .take()
+            .expect("writer used after finish")
+            .finish()?;
+
+        let mut file = self.durability.open(&self.tmp_path, OpenMode::Append)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&blob)?;
         file.flush()?;
-        let file = file.into_inner().map_err(|e| e.into_error())?;
 
         // Publish: fsync the contents, rename, fsync the directory entry — the
         // Linux spelling of the C++ `MOVEFILE_WRITE_THROUGH`. A crash anywhere
@@ -993,8 +1093,11 @@ impl<D: Durability> Write for CheckpointWriter<D> {
 impl<D: Durability> Drop for CheckpointWriter<D> {
     fn drop(&mut self) {
         // Dropped without `finish`: the temporary file holds a half-written
-        // checkpoint under a name nothing reads, so remove it.
-        if self.file.take().is_some() {
+        // checkpoint under a name nothing reads, so remove it. The ring goes
+        // first and is waited for — on Windows a writer still holding its handle
+        // would block the unlink.
+        if let Some(sink) = self.file.take() {
+            drop(sink);
             let _ = self.durability.remove_file(&self.tmp_path);
         }
     }

@@ -56,8 +56,12 @@ durable to the device (`--fsync` on the C++, `--sync all` on the Rust).
 Six 4 GiB rewrites back to back with no idle: the *last* row collapses to
 765–828 MiB/s regardless of which configuration is last, reproducibly, across
 two independent runs. Rows measured in that position are contaminated and are
-dropped below rather than reported with a caveat. The sweep leaves 20 s of idle
-after every row for this reason.
+dropped below rather than reported with a caveat. The sweep used to leave 20 s
+of idle after every row for this reason; it no longer does. The shape is wrong
+for a draining cache — that decays progressively rather than cliffing at one
+position — and confound 4's homogeneous gapless batch shows nothing like it, so
+padding every row was buying nothing measurable. It stays on the record below as
+an open question, not as a constant to design around.
 
 **3. LBA position is removable here, unlike on the read side.** `APSEQWRITE` is
 `OPEN_ALWAYS` and never truncates (deliberately, to avoid fragmentation — see
@@ -334,24 +338,47 @@ io_uring would, at the cost of `unsafe` or a wrapper crate), where the SLC cliff
 actually is for runs larger than 32 GiB, and whether the learner copy path wants
 a ring at all.
 
-## Follow-up: migrating the call sites (open)
+## Follow-up: migrating the call sites
 
-`SeqWriter` exists and is tested but nothing uses it yet — the same deliberate
-split the read side made, so that a regression in the type and a regression in
-the rewiring stay bisectable apart.
-
-| Path | Today | Should become |
+| Path | Was | Is now |
 | --- | --- | --- |
-| Checkpoint write (checkpoint.rs:846) | `BufWriter::new` — 8 KiB | `SeqWriter`, default config, ideally via `available`/`commit` |
-| Learner checkpoint copy (rsl-net `learnport/client.rs:351`) | `tokio::fs::File` + `write_all` | **decide separately** — thread-per-writer is wrong for many concurrent copies |
-| Defunct config (`dir::write_defunct`) | small buffered write | leave alone — 4 bytes, and a ring would be pure overhead |
+| Checkpoint write (checkpoint.rs) | `BufWriter::new` — 8 KiB | `SeqWriter`, default config, through `available`/`commit` |
+| Learner checkpoint copy (rsl-net `learnport/client.rs:351`) | `tokio::fs::File` + `write_all` | **still open** — thread-per-writer is wrong for many concurrent copies |
+| Defunct config (`dir::write_defunct`) | small buffered write | unchanged — 4 bytes, and a ring would be pure overhead |
 
-The checkpoint one is where the measured win is (27% → parity), and it has a
-real obstacle that is not visible from the numbers: `CheckpointWriter` writes
-through the [`Durability`](src/durability.rs) trait so that
-[`sim::SimCrash`](src/sim.rs) can substitute a shadow filesystem and
-`tests/crash.rs` can cut power at every prefix of a workload. `SeqWriter` opens
-its own real handles and so cannot sit behind that seam as it stands. Migrating
-means either teaching the trait to hand out a ring writer, or accepting that the
-crash harness exercises a different writer from production — and the second is
-not acceptable. That decision belongs to the migration change, not this one.
+### How the ring got behind the durability seam
+
+The obstacle was never in the numbers. `CheckpointWriter` writes through the
+[`Durability`](src/durability.rs) trait so that [`sim::SimCrash`](src/sim.rs)
+can substitute a shadow filesystem and `tests/crash.rs` can cut power at every
+prefix of a workload, while `SeqWriter` opened its own real handles. The two
+ways out were to teach the trait to hand out a ring writer, or to let the crash
+harness exercise a different writer from production. The second was not
+acceptable, so the first is what happened:
+
+* `SeqWriter` no longer opens files. It issues whole blocks at explicit offsets
+  through a `BlockDevice`, which hands out one `BlockWriter` handle per writer
+  thread and, at the end, establishes the file's length.
+* `Durability` gained a `Bulk: BlockDevice` associated type. `SyncAll` and
+  `NoSync` supply `RealDevice` (unbuffered handles, differing only in whether
+  the final `set_len` is followed by an `fsync`); `SimCrash` supplies
+  `SimDevice`, whose handles write into the shadow filesystem and journal every
+  block.
+* `SimDevice` asks for `inline` issue — every block written on the caller's
+  thread — because a journal replayed at every prefix has to be deterministic,
+  which a pool cannot promise. It also tunes the ring down to 1 thread x 2
+  slots x one sector, since none of the sizing means anything without a device
+  to overlap against and the production default would allocate 16 MiB per
+  writer in a harness that builds one per crash point.
+
+The bytes on disk are identical either way: the blocks tile the same file at
+the same offsets and the tail is padded to the sector before `set_len` cuts it
+back. `tests/corpus.rs` still reproduces the C++ samples byte for byte.
+
+### The header rewrite
+
+The ring cannot be rewound, so `finish` drains it and establishes the length
+*first*, then reopens the staging `.tmp` through `Durability::open` and writes
+the marshaled header over the region reserved at offset 0. That is the plain
+positional write this document's `RandomWrite` note calls for, in place of
+`APSEQWRITE`'s bounds-broken version (apdiskio.cpp:979).

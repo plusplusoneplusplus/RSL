@@ -32,7 +32,7 @@
 //! [`seqread::SeqReader`] is the read-side counterpart to all of that: the port
 //! of `APSEQREAD` (`src/common/src/apdiskio.cpp`), a ring of unbuffered reads
 //! kept in flight by a pool of reader threads. It exists because a `BufReader`
-//! does not get close: today's 8 KiB default measures 17% of `APSEQREAD` on
+//! does not get close: the 8 KiB default measures 17% of `APSEQREAD` on
 //! identical LBAs, and raising capacity is worth about 3.7x but no more — a
 //! read-then-consume loop leaves the device idle while the caller drains, and
 //! one read at a time gives an NVMe a queue depth of one. `READPATH.md` records
@@ -45,10 +45,17 @@
 //! measured 17% at the checkpoint's block size. It exists because the read
 //! side's fix does not transfer: raising a `BufWriter`'s capacity is worth only
 //! 1.3x and then the page cache is the ceiling at ~1.6 GB/s, where the
-//! unbuffered ring reaches 4.4. Today's checkpoint writer, `BufWriter::new` at
-//! the 8 KiB default, runs at 27% of the C++. `WRITEPATH.md` records the
-//! measurements, the four `APSEQWRITE` defects demonstrated by execution, and
-//! the two candidates that did not survive.
+//! unbuffered ring reaches 4.4. `WRITEPATH.md` records the measurements, the
+//! four `APSEQWRITE` defects demonstrated by execution, and the two candidates
+//! that did not survive.
+//!
+//! The checkpoint engine runs on both: [`checkpoint::CheckpointWriter`] streams
+//! state into the write ring through `available`/`commit`, and
+//! [`checkpoint::CheckpointReader`] streams it back out of the read ring. The
+//! write ring reaches the crash harness too — it issues its blocks through a
+//! [`seqwrite::BlockDevice`] supplied by the durability policy, so
+//! [`sim::SimCrash`] journals the same writer production runs rather than a
+//! stand-in for it.
 //!
 //! ## Design
 //! * **Blocking `std::fs`**, no async: checkpoint I/O is a background activity in
