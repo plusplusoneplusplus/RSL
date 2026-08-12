@@ -29,6 +29,16 @@
 //! wreckage. `DURABILITY.md` states the guarantee each public API offers; that
 //! is the contract the Phase-5 engine acknowledges decrees against.
 //!
+//! [`seqread::SeqReader`] is the read-side counterpart to all of that: the port
+//! of `APSEQREAD` (`src/common/src/apdiskio.cpp`), a ring of unbuffered reads
+//! kept in flight by a pool of reader threads. It exists because a `BufReader`
+//! does not get close: today's 8 KiB default measures 17% of `APSEQREAD` on
+//! identical LBAs, and raising capacity is worth about 3.7x but no more — a
+//! read-then-consume loop leaves the device idle while the caller drains, and
+//! one read at a time gives an NVMe a queue depth of one. `READPATH.md` records
+//! the measurements, and the three confounds that make most of the obvious
+//! comparisons untrustworthy on real hardware.
+//!
 //! ## Design
 //! * **Blocking `std::fs`**, no async: checkpoint I/O is a background activity in
 //!   the C++ engine model, so a plain blocking API is the faithful shape.
@@ -91,6 +101,7 @@ pub mod dir;
 pub mod durability;
 pub mod gc;
 pub mod log;
+pub mod seqread;
 pub mod sim;
 
 /// `s_PageSize` (`legislator.h:16`) — every on-disk record is padded to a

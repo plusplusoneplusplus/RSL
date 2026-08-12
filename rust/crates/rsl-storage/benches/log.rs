@@ -5,20 +5,14 @@
 //! isolates the encode/`writev` path, while `SyncAll` adds one `fsync` per
 //! commit — the difference is the disk's latency, not this crate's.
 
-use std::path::PathBuf;
-
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rsl_storage::durability::{NoSync, SyncAll};
 use rsl_storage::log::{self, LogWriter};
 use rsl_wire::messages::{MSG_PREPARE, MSG_VOTE};
 use rsl_wire::{BallotNumber, Header, MemberId, PrepareMsg, ProtocolVersion, Vote};
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rsl-log-bench-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
-}
+mod common;
+use common::scratch;
 
 /// A vote record carrying `request_len` bytes of payload.
 fn vote_record(decree: u64, request_len: usize) -> Vec<u8> {
@@ -70,7 +64,7 @@ fn on_disk_len(records: &[Vec<u8>]) -> u64 {
 /// Append 1024 records as one batch (group commit) versus one at a time, for a
 /// small and a large record size.
 fn append(c: &mut Criterion) {
-    let dir = scratch("append");
+    let dir = scratch("log", "append");
     let mut group = c.benchmark_group("log/append");
 
     for request_len in [0usize, 3500] {
@@ -120,7 +114,7 @@ fn append(c: &mut Criterion) {
 /// path. Dominated by the disk, and measured to keep that visible. The records
 /// are prepares so the same batch can be re-appended every iteration.
 fn group_commit(c: &mut Criterion) {
-    let dir = scratch("commit");
+    let dir = scratch("log", "commit");
     let mut group = c.benchmark_group("log/group-commit");
 
     for batch_size in [1u64, 4, 16, 64, 256] {
@@ -151,7 +145,7 @@ fn group_commit(c: &mut Criterion) {
 /// * `create+fsync-dir` — what publishing a *new* log's name costs, paid once
 ///   per log file rather than once per append.
 fn sync_cost(c: &mut Criterion) {
-    let dir = scratch("sync");
+    let dir = scratch("log", "sync");
     let mut group = c.benchmark_group("log/sync");
     let record = prepare_record(1);
 
@@ -197,7 +191,7 @@ fn sync_cost(c: &mut Criterion) {
 
 /// The startup recovery scan: parse and checksum every record in a log.
 fn recovery_scan(c: &mut Criterion) {
-    let dir = scratch("scan");
+    let dir = scratch("log", "scan");
     let mut group = c.benchmark_group("log/recovery-scan");
 
     for request_len in [0usize, 3500] {

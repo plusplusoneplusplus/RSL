@@ -919,9 +919,11 @@ name = "rsl-storage"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "proptest",
  "rsl-wire",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

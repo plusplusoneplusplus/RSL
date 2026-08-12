@@ -267,3 +267,24 @@ baseline. It does not: the cost is one device flush, and `LogWriter` adds nothin
 measurable over a bare `write` + `fsync` (4.90 ms vs 4.95 ms). It is
 format-invariant, so it can be revisited from a Phase-5/6 profile without
 touching anything on disk. Reasoning in [`DURABILITY.md`](DURABILITY.md).
+
+**`APSEQREAD` decision: ported, as [`seqread::SeqReader`].** A ring of
+unbuffered reads kept in flight by a pool of reader threads, reaching parity
+with the C++ — 99.5%–104.5% across two file regions and three measurement runs,
+at the same buffer memory — in safe Rust with no FFI and no `unsafe`. Today's
+log replay reader, `BufReader::new` at the 8 KiB default, measures 17% of
+`APSEQREAD` on identical LBAs; raising capacity to 1 MiB is worth about 3.7x but
+does not finish the job, because a read-then-consume loop leaves the device idle
+and issues one read at a time. Numbers, method and the cost side in
+[`READPATH.md`](READPATH.md); harnesses in `benches/readpath.rs`,
+`examples/seqio_bench.rs` and `src/RSL/UnitTest/SeqIoBench`.
+
+Read `READPATH.md`'s methodology section before running the sweep yourself.
+Three confounds make most of the obvious comparisons meaningless on real
+hardware — LBA position is worth 1.44x on this drive, it decays over hours, and
+buffered and unbuffered readers interfere with each other — and only some of the
+comparisons the harness emits can be quoted.
+
+One follow-up is open: `SeqReader` exists and is tested but nothing uses it yet.
+The migration of `log.rs`, `checkpoint.rs` and the learn port is a separate
+change, so a regression in the type or in the rewiring stays bisectable.

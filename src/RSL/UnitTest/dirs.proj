@@ -2,6 +2,7 @@
     <Import Project="$(EnvironmentConfig)" />
     <ItemGroup>
         <ProjectFile Include="RslStateMachine\rsltest.vcxproj" />
+        <ProjectFile Include="SeqIoBench\SeqIoBench.vcxproj" />
         <ProjectFile Include="RSLMigration\dirs.proj" />
         <ProjectFile Include="SslPlumbing\dirs.proj" />
     </ItemGroup>

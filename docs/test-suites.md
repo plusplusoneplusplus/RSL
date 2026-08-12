@@ -17,6 +17,14 @@ automated, self-checking test. Nothing in CI builds or runs any of them —
 | `src/RSL/UnitTest/RslMigration/TestHarness/TestHarness.vcxproj` | `TestHarness.exe` | 5-node cluster chaos test | No |
 | `src/RSL/UnitTest/SslPlumbing/Test/RSLSslTest.vcxproj` | `RSLSslTest.exe` | Manual TLS probe | No |
 
+`src/RSL/UnitTest/SeqIoBench/` sits alongside these but is not one of them: it
+is a benchmark for the sequential I/O classes in `apdiskio.cpp` — `APSEQREAD`
+today, `APSEQWRITE` when someone adds it — asserts nothing, and exists to give
+the Rust port a baseline to be compared against. See its
+[README](../src/RSL/UnitTest/SeqIoBench/README.md), and
+[`rust/crates/rsl-storage/READPATH.md`](../rust/crates/rsl-storage/READPATH.md)
+for the verdict it produced.
+
 ## Building and running
 
 ```powershell
