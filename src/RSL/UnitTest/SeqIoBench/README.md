@@ -79,7 +79,7 @@ cargo build --release -p rsl-storage --bin seqio_bench
 ## Running
 
 ```powershell
-.\src\RSL\UnitTest\SeqIoBench\run-sweep.ps1 -Root D:\rslbench -Out results.tsv
+.\tools\seqio-bench\run-sweep.ps1 -Root D:\rslbench -Out results.tsv
 ```
 
 Needs `WindowSizeGiB * 10` of free disk (60 GiB by default) and takes a few

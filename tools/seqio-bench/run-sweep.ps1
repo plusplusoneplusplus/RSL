@@ -3,6 +3,11 @@
     Drives the C++ APSEQREAD/APSEQWRITE harness and the Rust read and write
     paths over shared fixtures and emits a single tab-separated table.
 
+    The harness it drives is src\RSL\UnitTest\SeqIoBench (whose README covers
+    the subcommands and the output columns) plus the seqio_bench binary in
+    rust\crates\rsl-storage. This script lives here rather than beside either
+    one because it needs both built.
+
 .DESCRIPTION
     The comparison only means anything cold. APSEQREAD opens with
     FILE_FLAG_NO_BUFFERING and never consults the page cache; every buffered
@@ -87,20 +92,19 @@ param(
     [string] $Sweep = "both",
     [int]    $WriteGiB = 4,
     [int]    $WriteReps = 3,
-    [int]    $GapSeconds = 20,
     [switch] $SkipGen
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..\..")).Path
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $cpp = Join-Path $repo "out\retail-amd64\SeqIoBench\seqiobench.exe"
 $rust = Join-Path $repo "rust\target\release\seqio_bench.exe"
 
 foreach ($exe in @($cpp, $rust)) {
     if (-not (Test-Path -PathType Leaf $exe)) {
-        throw "missing $exe -- build it first (see README.md in this directory)."
+        throw "missing $exe -- build it first (see src\RSL\UnitTest\SeqIoBench\README.md)."
     }
 }
 
@@ -233,17 +237,25 @@ Invoke-Cpp -Offset $off8 -Depth 4  -Block 1048576  -Label "p3-sweep-4x1MiB"
 # The write sweep. Different confounds from the read side, so a different
 # structure:
 #
-#   1. SLC CACHE EXHAUSTION. The fixture drive is DRAM-less TLC with a
-#      pseudo-SLC region; a sustained write run drains it and throughput
-#      collapses mid-run. Phase W0 measures where, by rewriting the fixture
-#      back to back with no idle. Every later phase writes $WriteGiB per row
-#      -- sized to fit -- with $GapSeconds of idle after each row so the
-#      cache can fold back down.
+#   1. SLC CACHE EXHAUSTION, LOOKED FOR AND NOT FOUND AT THIS ROW SIZE. The
+#      fixture drive is DRAM-less TLC with a pseudo-SLC region, so a sustained
+#      run should eventually collapse. Phase W0 is the probe: eight 4 GiB
+#      rewrites back to back, 32 GiB with zero idle, stayed within
+#      3830-3972 MiB/s -- a 3.7% spread with no trend (WRITEPATH.md records
+#      it). At $WriteGiB per row every configuration here sits inside the
+#      cache, so the sweep runs gapless: the idle that used to follow every
+#      row was padding against a cliff W0 itself says is beyond 32 GiB. A
+#      sweep with LARGER rows would need W0 re-checked before trusting that.
 #
-#   2. DRIVE STATE IS HISTORY-DEPENDENT. A row inherits the drive the
-#      previous row left. The gap plus interleaved repetition (medians, not
-#      means) is the mitigation; it is not perfect and is why W1 quotes
-#      medians of alternating reps rather than any single pair.
+#   2. DRIVE STATE IS HISTORY-DEPENDENT. A row still inherits the drive the
+#      previous row left. Interleaved repetition (medians, not means) is the
+#      mitigation, and is why W1 quotes medians of alternating reps rather
+#      than any single pair. One shape remains unexplained: in an early
+#      heterogeneous gapless batch the LAST row collapsed to 765-828 MiB/s
+#      whatever it was, across two runs. It is on the record in WRITEPATH.md
+#      as an open question -- W0's homogeneous gapless batch shows nothing
+#      like it, and a cliff would decay progressively rather than fire at one
+#      position, so it is not a constant to pad around.
 #
 #   3. THE SYNC DISCIPLINE IS THE COMPARISON. APSEQWRITE is NO_BUFFERING but
 #      NOT WRITE_THROUGH: past the page cache, not past the device cache. A
@@ -279,13 +291,10 @@ function Invoke-RustWrite {
         "--record", "4096", "--sync", $Sync, "--label", $Label)
 }
 
-function Gap { Start-Sleep -Seconds $script:GapSeconds }
-
 if (-not (Test-Path $wfixture) -or (Get-Item $wfixture).Length -ne $wlen) {
     Write-Host "`nGenerating $WriteGiB GiB write fixture at $wfixture..."
     & $cpp gen $wfixture ([int64]($wlen / 1MB))
     if ($LASTEXITCODE -ne 0) { throw "write fixture generation failed" }
-    Start-Sleep -Seconds 30   # let the drive settle after laying it down
 }
 
 # ---------------------------------------------------------------------------
@@ -299,12 +308,11 @@ foreach ($rep in 1..($WriteReps + 5)) {
     Write-Host "  cliff rep $rep"
     Invoke-CppWrite -Depth 4 -Block 1048576 -Label "w0-cliff-4x1MiB-r$rep"
 }
-Write-Host "  (idle $($GapSeconds * 3) s to let the cache fold back)"
-Start-Sleep -Seconds ($GapSeconds * 3)
 
 # ---------------------------------------------------------------------------
 # Phase W1 -- the load-bearing pairs, at the same durability endpoint.
-# Alternating over the same fixture, $WriteReps reps, a gap after every row.
+# Alternating over the same fixture, $WriteReps reps, back to back -- W0 is
+# the evidence that idle between rows buys nothing at this row size.
 # The five rows: the two shapes the engine actually runs (checkpoint
 # 2 x 4 MiB zero-copy, learner/defunct 2 x 128 KiB), the Rust checkpoint
 # writer today (BufWriter::new = 8 KiB), the one-line fix (BufWriter at the
@@ -313,11 +321,11 @@ Start-Sleep -Seconds ($GapSeconds * 3)
 Write-Host "`n== Phase W1: matched durability (--fsync / --sync all), alternating =="
 foreach ($rep in 1..$WriteReps) {
     Write-Host "  rep $rep"
-    Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Fsync -Label "w1-APSEQWRITE-ckpt-2x4MiB-commit-fsync-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 131072  -Mode copy   -Fsync -Label "w1-APSEQWRITE-2x128KiB-copy-fsync-r$rep"; Gap
-    Invoke-RustWrite -Mode "bufwriter:8192"    -Sync all -Label "w1-ckpt-today-8KiB-syncall-r$rep"; Gap
-    Invoke-RustWrite -Mode "bufwriter:4194304" -Sync all -Label "w1-bufwriter-4MiB-syncall-r$rep"; Gap
-    Invoke-RustWrite -Mode "big:4194304"       -Sync all -Label "w1-big-4MiB-syncall-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Fsync -Label "w1-APSEQWRITE-ckpt-2x4MiB-commit-fsync-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 131072  -Mode copy   -Fsync -Label "w1-APSEQWRITE-2x128KiB-copy-fsync-r$rep"
+    Invoke-RustWrite -Mode "bufwriter:8192"    -Sync all -Label "w1-ckpt-today-8KiB-syncall-r$rep"
+    Invoke-RustWrite -Mode "bufwriter:4194304" -Sync all -Label "w1-bufwriter-4MiB-syncall-r$rep"
+    Invoke-RustWrite -Mode "big:4194304"       -Sync all -Label "w1-big-4MiB-syncall-r$rep"
 }
 
 # ---------------------------------------------------------------------------
@@ -325,10 +333,14 @@ foreach ($rep in 1..$WriteReps) {
 # is on the record. APSEQWRITE bare returns with data past the page cache but
 # maybe in the device cache; the bufwriter row returns with data merely in
 # the PAGE cache. Not an apples comparison -- that is the point of the row.
+# Neither row needs idle behind it to keep its writeback out of the next row:
+# seqio_bench already does an untimed sync_all after the clock stops when
+# --sync none (seqio_bench.rs:637), and the APSEQWRITE row is NO_BUFFERING, so
+# there is no page cache to drain -- only the device cache it is measuring.
 # ---------------------------------------------------------------------------
 Write-Host "`n== Phase W2: the undisciplined pair (no fsync / --sync none) =="
-Invoke-CppWrite -Depth 2 -Block 131072 -Mode copy -Label "w2-APSEQWRITE-2x128KiB-nosync"; Gap
-Invoke-RustWrite -Mode "bufwriter:4194304" -Sync none -Label "w2-bufwriter-4MiB-nosync"; Gap
+Invoke-CppWrite -Depth 2 -Block 131072 -Mode copy -Label "w2-APSEQWRITE-2x128KiB-nosync"
+Invoke-RustWrite -Mode "bufwriter:4194304" -Sync none -Label "w2-bufwriter-4MiB-nosync"
 
 # ---------------------------------------------------------------------------
 # Phase W3 -- the APSEQWRITE shape sweep, bare (its native discipline), all
@@ -340,17 +352,17 @@ Invoke-RustWrite -Mode "bufwriter:4194304" -Sync none -Label "w2-bufwriter-4MiB-
 Write-Host "`n== Phase W3: APSEQWRITE shape sweep (bare, compare to each other only) =="
 foreach ($rep in 1..2) {
     Write-Host "  rep $rep"
-    Invoke-CppWrite -Depth 1 -Block 131072   -Label "w3-1x128KiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 131072   -Label "w3-2x128KiB-inuse-r$rep"; Gap
-    Invoke-CppWrite -Depth 4 -Block 131072   -Label "w3-4x128KiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 8 -Block 131072   -Label "w3-8x128KiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 65536    -Label "w3-2x64KiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 1048576  -Label "w3-2x1MiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 4 -Block 1048576  -Label "w3-4x1MiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 4194304  -Label "w3-2x4MiB-inuse-r$rep"; Gap
-    Invoke-CppWrite -Depth 4 -Block 4194304  -Label "w3-4x4MiB-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 131072  -Mode commit -Label "w3-2x128KiB-commit-r$rep"; Gap
-    Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Label "w3-2x4MiB-commit-r$rep"; Gap
+    Invoke-CppWrite -Depth 1 -Block 131072   -Label "w3-1x128KiB-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 131072   -Label "w3-2x128KiB-inuse-r$rep"
+    Invoke-CppWrite -Depth 4 -Block 131072   -Label "w3-4x128KiB-r$rep"
+    Invoke-CppWrite -Depth 8 -Block 131072   -Label "w3-8x128KiB-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 65536    -Label "w3-2x64KiB-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 1048576  -Label "w3-2x1MiB-r$rep"
+    Invoke-CppWrite -Depth 4 -Block 1048576  -Label "w3-4x1MiB-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 4194304  -Label "w3-2x4MiB-inuse-r$rep"
+    Invoke-CppWrite -Depth 4 -Block 4194304  -Label "w3-4x4MiB-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 131072  -Mode commit -Label "w3-2x128KiB-commit-r$rep"
+    Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Label "w3-2x4MiB-commit-r$rep"
 }
 
 # ---------------------------------------------------------------------------
@@ -360,12 +372,12 @@ foreach ($rep in 1..2) {
 Write-Host "`n== Phase W4: Rust write capacity sweep (--sync all) =="
 foreach ($rep in 1..2) {
     Write-Host "  rep $rep"
-    Invoke-RustWrite -Mode "file"                -Label "w4-file-per-record-r$rep"; Gap
-    Invoke-RustWrite -Mode "bufwriter:8192"      -Label "w4-bufwriter-8KiB-r$rep"; Gap
-    Invoke-RustWrite -Mode "bufwriter:65536"     -Label "w4-bufwriter-64KiB-r$rep"; Gap
-    Invoke-RustWrite -Mode "bufwriter:1048576"   -Label "w4-bufwriter-1MiB-r$rep"; Gap
-    Invoke-RustWrite -Mode "bufwriter:10485760"  -Label "w4-bufwriter-10MiB-r$rep"; Gap
-    Invoke-RustWrite -Mode "big:1048576"         -Label "w4-big-1MiB-r$rep"; Gap
+    Invoke-RustWrite -Mode "file"                -Label "w4-file-per-record-r$rep"
+    Invoke-RustWrite -Mode "bufwriter:8192"      -Label "w4-bufwriter-8KiB-r$rep"
+    Invoke-RustWrite -Mode "bufwriter:65536"     -Label "w4-bufwriter-64KiB-r$rep"
+    Invoke-RustWrite -Mode "bufwriter:1048576"   -Label "w4-bufwriter-1MiB-r$rep"
+    Invoke-RustWrite -Mode "bufwriter:10485760"  -Label "w4-bufwriter-10MiB-r$rep"
+    Invoke-RustWrite -Mode "big:1048576"         -Label "w4-big-1MiB-r$rep"
 }
 
 } # end write sweep
