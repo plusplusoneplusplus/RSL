@@ -276,8 +276,8 @@ log replay reader, `BufReader::new` at the 8 KiB default, measures 17% of
 `APSEQREAD` on identical LBAs; raising capacity to 1 MiB is worth about 3.7x but
 does not finish the job, because a read-then-consume loop leaves the device idle
 and issues one read at a time. Numbers, method and the cost side in
-[`READPATH.md`](READPATH.md); harnesses in `benches/readpath.rs`,
-`examples/seqio_bench.rs` and `src/RSL/UnitTest/SeqIoBench`.
+[`READPATH.md`](READPATH.md); harnesses in `benches/readpath.rs`
+and `src/RSL/UnitTest/SeqIoBench`.
 
 Read `READPATH.md`'s methodology section before running the sweep yourself.
 Three confounds make most of the obvious comparisons meaningless on real
@@ -285,6 +285,26 @@ hardware — LBA position is worth 1.44x on this drive, it decays over hours, an
 buffered and unbuffered readers interfere with each other — and only some of the
 comparisons the harness emits can be quoted.
 
-One follow-up is open: `SeqReader` exists and is tested but nothing uses it yet.
-The migration of `log.rs`, `checkpoint.rs` and the learn port is a separate
-change, so a regression in the type or in the rewiring stays bisectable.
+**`APSEQWRITE` decision: ported, as [`seqwrite::SeqWriter`].** A ring of
+unbuffered writes drained by a pool of writer threads, reaching 96% of the C++
+at the checkpoint's own 4 MiB shape and 2.7x the best buffered writer, with the
+same durability work on both sides. The read side's fix does not transfer here:
+raising a `BufWriter`'s capacity is worth 1.3x and then the page cache is the
+ceiling at ~1.6 GB/s, against the device's 4.4. Today's checkpoint writer —
+`BufWriter::new`, the 8 KiB default — runs at **27%** of `APSEQWRITE`. The
+zero-copy `GetAvailable`/`CommitAvailable` pair is worth 17% at 4 MiB, so
+`SeqWriter` exposes `available`/`commit` too. Numbers, method, four
+execution-demonstrated `APSEQWRITE` defects and the two candidates that did not
+reproduce are in [`WRITEPATH.md`](WRITEPATH.md); harnesses in
+`benches/writepath.rs` and `src/RSL/UnitTest/SeqIoBench` (`write`).
+
+Note that neither document reopens [`DURABILITY.md`](DURABILITY.md)'s vote-log
+gate: `LogFile` uses `WriteFileGather` on a write-through handle and never
+touches `APSEQWRITE`.
+
+Two follow-ups are open. `SeqReader` and `SeqWriter` both exist and are tested
+but nothing uses either yet — migrating `log.rs`, `checkpoint.rs` and the learn
+port is a separate change, so a regression in a type or in the rewiring stays
+bisectable. The checkpoint write migration additionally has to decide how a
+ring writer sits behind the `Durability` seam that `SimCrash` substitutes for,
+which `WRITEPATH.md` spells out.

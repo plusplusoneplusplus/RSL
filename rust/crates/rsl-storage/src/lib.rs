@@ -39,6 +39,17 @@
 //! the measurements, and the three confounds that make most of the obvious
 //! comparisons untrustworthy on real hardware.
 //!
+//! [`seqwrite::SeqWriter`] is the same answer in the other direction, for
+//! `APSEQWRITE` — a ring of write buffers drained by a pool of writer threads,
+//! including the zero-copy `GetAvailable`/`CommitAvailable` pair, which
+//! measured 17% at the checkpoint's block size. It exists because the read
+//! side's fix does not transfer: raising a `BufWriter`'s capacity is worth only
+//! 1.3x and then the page cache is the ceiling at ~1.6 GB/s, where the
+//! unbuffered ring reaches 4.4. Today's checkpoint writer, `BufWriter::new` at
+//! the 8 KiB default, runs at 27% of the C++. `WRITEPATH.md` records the
+//! measurements, the four `APSEQWRITE` defects demonstrated by execution, and
+//! the two candidates that did not survive.
+//!
 //! ## Design
 //! * **Blocking `std::fs`**, no async: checkpoint I/O is a background activity in
 //!   the C++ engine model, so a plain blocking API is the faithful shape.
@@ -102,6 +113,7 @@ pub mod durability;
 pub mod gc;
 pub mod log;
 pub mod seqread;
+pub mod seqwrite;
 pub mod sim;
 
 /// `s_PageSize` (`legislator.h:16`) — every on-disk record is padded to a

@@ -61,7 +61,7 @@ two significant figures.
 
 Machine: Intel Core Ultra 7 265KF, 63.6 GiB RAM, Kingston SNV3S1000G NVMe, NTFS,
 Windows 11. Harnesses: `src/RSL/UnitTest/SeqIoBench` (C++) and
-`examples/seqio_bench.rs` (Rust), driven by `run-sweep.ps1`. 6 GiB windows,
+`benches/readpath.rs` (Rust), driven by `run-sweep.ps1`. 6 GiB windows,
 4 KiB logical reads.
 
 ### The result that matters: SeqReader against APSEQREAD

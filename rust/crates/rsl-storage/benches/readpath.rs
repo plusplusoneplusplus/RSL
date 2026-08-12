@@ -5,8 +5,8 @@
 //! **These are warm-cache numbers, and that is deliberate.** The comparison
 //! against the C++ `APSEQREAD` baseline has to be cold, because `APSEQREAD`
 //! opens with `FILE_FLAG_NO_BUFFERING` and never sees the page cache — that
-//! comparison lives in `examples/seqio_bench.rs`, driven over a
-//! larger-than-RAM fixture. What criterion is good at, and what this file is
+//! comparison needs a larger-than-RAM fixture driven outside
+//! criterion. What criterion is good at, and what this file is
 //! for, is the *relative* question: holding the cache constant, how much of the
 //! replay scan is buffer-capacity choice rather than disk? Every reader here
 //! parses the same records with the same `log::scan`, so the only variable is

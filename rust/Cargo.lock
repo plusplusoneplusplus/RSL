@@ -923,7 +923,6 @@ dependencies = [
  "proptest",
  "rsl-wire",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

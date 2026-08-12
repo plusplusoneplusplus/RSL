@@ -4,20 +4,46 @@ Measures the sequential I/O classes in `src/common/src/apdiskio.{h,cpp}`, so the
 Rust port has a baseline to be compared against. This is a benchmark, not a
 test — it asserts nothing and nothing gates on it.
 
-Today it covers `APSEQREAD`, the async sequential reader, under the `read`
-subcommand. `APSEQWRITE` belongs here too under a `write` subcommand: it is the
-same file, the same overlapped-queue design, and the fixture generator and
-result format are already shared, so adding it should not disturb `read`. The
-subcommand exists rather than a bare argument list precisely so that can happen
-without breaking callers.
+It covers `APSEQREAD`, the async sequential reader, under the `read`
+subcommand, and `APSEQWRITE`, the async sequential writer, under `write` —
+same file, same overlapped-queue design, shared fixture generator and result
+format.
 
 The verdict `read` was built to produce is recorded in
-[`rust/crates/rsl-storage/READPATH.md`](../../../../rust/crates/rsl-storage/READPATH.md).
-The write side already has its decision recorded separately, in
-[`DURABILITY.md`](../../../../rust/crates/rsl-storage/DURABILITY.md) — a
-`write` subcommand would be extending that argument, not opening a new one.
+[`rust/crates/rsl-storage/READPATH.md`](../../../../rust/crates/rsl-storage/READPATH.md);
+the verdict for `write` in
+[`WRITEPATH.md`](../../../../rust/crates/rsl-storage/WRITEPATH.md). Neither
+overlaps [`DURABILITY.md`](../../../../rust/crates/rsl-storage/DURABILITY.md),
+which closed the *vote log* gate — `LogFile` writes through
+`WriteFileGather` on a `WRITE_THROUGH` handle and never touches `APSEQWRITE`;
+`write` here measures the bulk writers (checkpoint, learner copy, defunct
+config), which is what `APSEQWRITE` actually serves.
 
-## Why it is shaped like this
+## Why the write side is shaped like this
+
+The read side's problem was the page cache; the write side's is *durability
+asymmetry*. `APSEQWRITE` opens `FILE_FLAG_NO_BUFFERING` but **not**
+`FILE_FLAG_WRITE_THROUGH` (apdiskio.cpp:698): when a run finishes, the data is
+past the page cache but possibly still in the device's write cache. A buffered
+Rust writer with no sync has done strictly less work at that point; with
+`sync_all`, strictly more. Neither default is a fair pairing, so `write` takes
+`--fsync` (a `FlushFileBuffers` after `Flush`), the Rust half takes
+`--sync none|all`, and `run-sweep.ps1` pairs rows only at equal endpoints,
+stating the discipline in every label.
+
+Two more write-side facts the sweep leans on. `APSEQWRITE` is `OPEN_ALWAYS`
+and never truncates (deliberately, to avoid fragmentation — see the comment in
+`Flush`), so rewriting one pre-generated fixture of exactly `--length` bytes in
+place keeps every row on the same LBAs. And the fixture drive's pseudo-SLC
+cache makes sustained writes history-dependent, so phase W0 probes for the
+cliff with back-to-back rewrites, and every later row is followed by idle time.
+
+`write` also exposes the zero-copy `GetAvailable`/`CommitAvailable` API as
+`--mode commit` (the shape `RSLCheckpointStreamWriter` actually uses,
+rsl.cpp:478) against `--mode copy` for plain `Write`, so the memcpy that API
+exists to avoid has a price tag.
+
+## Why the read side is shaped like this
 
 `APSEQREAD` opens with `FILE_FLAG_NO_BUFFERING` (apdiskio.cpp:134), so it never
 consults the OS page cache. Every Rust read path does. Measured warm, the Rust
@@ -44,11 +70,11 @@ msbuild src\RSL\UnitTest\SeqIoBench\SeqIoBench.vcxproj /m /nologo /v:minimal `
   /p:Configuration=Release /p:Platform=x64
 
 cd rust
-cargo build --release -p rsl-storage --example seqio_bench
+cargo build --release -p rsl-storage --bin seqio_bench
 ```
 
 `seqiobench.exe` lands in `out\retail-amd64\SeqIoBench\`; the Rust half in
-`rust\target\release\examples\`. Build Release — Debug measures the harness.
+`rust\target\release\`. Build Release — Debug measures the harness.
 
 ## Running
 
@@ -67,6 +93,9 @@ rows can be concatenated:
 ```powershell
 seqiobench.exe  read <file> --depth 4 --block 65536 --record 4096 --label X --header
 seqio_bench.exe read <file> --mode bufreader:65536 --record 4096 --label Y
+
+seqiobench.exe  write <file> --length 4294967296 --depth 2 --block 131072 --mode commit --fsync --label X
+seqio_bench.exe write <file> --length 4294967296 --mode bufwriter:4194304 --sync all --label Y
 ```
 
 `--offset`/`--length` select the window; `--record` is the logical read size the
@@ -125,3 +154,38 @@ below `block` take a different branch and are exact.
 
 `Skip` has one caller in the tree, the public `RSLCheckpointStreamReader::Skip`
 (rsl.cpp:404), so nothing inside the engine reaches it.
+
+## The write-side defect demos
+
+Four more subcommands demonstrate, by execution, what `APSEQWRITE` does on its
+edges. None is a benchmark; `WRITEPATH.md` records what each one showed.
+
+```powershell
+seqiobench.exe tailtest <scratch> --block 131072 --depth 2 --bytes 1000000 [--precreate 2000000]
+seqiobench.exe rwbound <scratch> --block 131072
+seqiobench.exe reflush <scratch> --block 131072 --append 4096 --appends 256
+seqiobench.exe accounting <scratch>
+```
+
+* `tailtest` — the on-disk state if the process dies before `Flush`
+  (simulated by leaking the writer). Fresh file: a clean prefix of *full*
+  buffers only — up to a whole buffer of accepted data is simply gone, because
+  partial buffers are issued nowhere but `Flush`. Rewriting a longer existing
+  file: the old length and the old tail survive past the new data, because
+  `OPEN_ALWAYS` never truncated and only `Flush`'s `SetEndOfFile` would have.
+* `rwbound` — `RandomWrite`'s `offset + cbWrite >= m_offsetNext` bound
+  (apdiskio.cpp:979): the `>=` makes the last byte of the issued region
+  unreachable, and because `m_offsetNext` only advances at issue time (and
+  `Flush` issues without advancing it), data that is already durable in the
+  file can still be rejected as "too close to the end".
+* `reflush` — prices the Flush/Write/Flush pattern with
+  `GetProcessIoCounters`: every incremental `Flush` re-writes the *entire*
+  current buffer (`IssueWrite` always writes `m_cbBufSize`, apdiskio.cpp:755),
+  so device bytes are `flushes x block` — linear, not quadratic, but a
+  `block / append` amplification. Content stays correct; no caller in the tree
+  does this today.
+* `accounting` — `DoInit` accepts a non-sector-multiple buffer size, which
+  makes the first buffer issue fail exactly the way a full disk would, and the
+  straddling path's unguarded `m_cbUsed += ...` (apdiskio.cpp:899) then leaves
+  public `BytesIssued()` counting bytes that were never copied anywhere —
+  1200 reported, 1000 accepted, 0 on disk.

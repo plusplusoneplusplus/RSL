@@ -135,15 +135,18 @@ impl SeqReaderConfig {
 /// one sector and slice at the first aligned offset. `as_ptr() as usize` only
 /// reads the address, and the `Vec` is never resized afterwards, so the window
 /// stays where it was found.
-struct AlignedBuf {
+///
+/// `pub(crate)` because [`crate::seqwrite`] rings the same buffers in the other
+/// direction.
+pub(crate) struct AlignedBuf {
     raw: Vec<u8>,
     off: usize,
     len: usize,
-    filled: usize,
+    pub(crate) filled: usize,
 }
 
 impl AlignedBuf {
-    fn new(len: usize) -> AlignedBuf {
+    pub(crate) fn new(len: usize) -> AlignedBuf {
         let raw = vec![0u8; len + SECTOR];
         let off = (SECTOR - (raw.as_ptr() as usize % SECTOR)) % SECTOR;
         AlignedBuf {
@@ -154,12 +157,12 @@ impl AlignedBuf {
         }
     }
 
-    fn window(&mut self) -> &mut [u8] {
+    pub(crate) fn window(&mut self) -> &mut [u8] {
         let (off, len) = (self.off, self.len);
         &mut self.raw[off..off + len]
     }
 
-    fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         &self.raw[self.off..self.off + self.filled]
     }
 }

@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Drives the C++ APSEQREAD harness and the Rust read paths over one shared
-    fixture and emits a single tab-separated table.
+    Drives the C++ APSEQREAD/APSEQWRITE harness and the Rust read and write
+    paths over shared fixtures and emits a single tab-separated table.
 
 .DESCRIPTION
     The comparison only means anything cold. APSEQREAD opens with
@@ -66,8 +66,16 @@
 .PARAMETER Reps
     Repetitions per configuration in phase 1.
 
+.PARAMETER Sweep
+    Which side to run: `read`, `write`, or `both`. The write sweep has its own
+    fixture and its own confounds -- see the W-phase comments below.
+
+.PARAMETER WriteGiB
+    Bytes each write configuration writes. Sized to sit inside the drive's
+    pseudo-SLC region (phase W0 measures where that gives out).
+
 .EXAMPLE
-    .\run-sweep.ps1 -Root D:\rslbench -Out D:\rslbench\results.tsv
+    .\run-sweep.ps1 -Root D:\rslbench -Out D:\rslbench\results.tsv -Sweep write
 #>
 [CmdletBinding()]
 param(
@@ -75,6 +83,11 @@ param(
     [string] $Out = "",
     [int]    $WindowSizeGiB = 6,
     [int]    $Reps = 3,
+    [ValidateSet("read", "write", "both")]
+    [string] $Sweep = "both",
+    [int]    $WriteGiB = 4,
+    [int]    $WriteReps = 3,
+    [int]    $GapSeconds = 20,
     [switch] $SkipGen
 )
 
@@ -83,7 +96,7 @@ $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..\..")).Path
 $cpp = Join-Path $repo "out\retail-amd64\SeqIoBench\seqiobench.exe"
-$rust = Join-Path $repo "rust\target\release\examples\seqio_bench.exe"
+$rust = Join-Path $repo "rust\target\release\seqio_bench.exe"
 
 foreach ($exe in @($cpp, $rust)) {
     if (-not (Test-Path -PathType Leaf $exe)) {
@@ -98,7 +111,7 @@ $fixture = Join-Path $Root "seqread-fixture.bin"
 if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Force $Root | Out-Null }
 
 $totalMiB = [int64]($window * $windows / 1MB)
-if (-not $SkipGen) {
+if (-not $SkipGen -and $Sweep -ne "write") {
     Write-Host "Generating $([int]($totalMiB/1024)) GiB fixture at $fixture (unbuffered; this does not warm it)..."
     & $cpp gen $fixture $totalMiB
     if ($LASTEXITCODE -ne 0) { throw "fixture generation failed" }
@@ -134,6 +147,8 @@ function Invoke-Rust {
         "read", $script:fixture, "--mode", $Mode, "--offset", "$Offset",
         "--length", "$script:window", "--record", "4096", "--label", $Label)
 }
+
+if ($Sweep -ne "write") {
 
 # Writing the fixture leaves the drive busy. Two unbuffered full passes settle
 # it without warming anything.
@@ -177,6 +192,8 @@ Invoke-Rust -Offset $off0 -Mode "bufreader:8192"  -Label "p2a-replay-today-8KiB"
 # contamination is irrelevant: every row here is affected the same way.
 # ---------------------------------------------------------------------------
 Write-Host "`n== Phase 2b: buffered capacity sweep (compare to each other only) =="
+# The former `tokio:65536` learner-streaming row is gone with the tokio
+# dev-dependency (commit 4f2fc24); READPATH.md keeps its one measured number.
 $buffered = @(
     @{ W = 1; Mode = "bufreader:65536";    Label = "p2b-replay-64KiB" }
     @{ W = 2; Mode = "bufreader:1048576";  Label = "p2b-replay-1MiB" }
@@ -184,7 +201,6 @@ $buffered = @(
     @{ W = 4; Mode = "file";               Label = "p2b-scan-unbuffered-4KiB" }
     @{ W = 5; Mode = "block:65536";        Label = "p2b-checkpoint-64KiB" }
     @{ W = 6; Mode = "block:10485760";     Label = "p2b-checkpoint-10MiB" }
-    @{ W = 7; Mode = "tokio:65536";        Label = "p2b-learner-stream-64KiB" }
 )
 foreach ($p in $buffered) {
     Write-Host "  window $($p.W): $($p.Label)"
@@ -211,6 +227,149 @@ Invoke-Cpp -Offset $off8 -Depth 8  -Block 1048576  -Label "p3-sweep-8x1MiB"
 Invoke-Cpp -Offset $off8 -Depth 64 -Block 65536    -Label "p3-sweep-64x64KiB"
 Invoke-Cpp -Offset $off8 -Depth 4  -Block 1048576  -Label "p3-sweep-4x1MiB"
 
+} # end read sweep
+
+# ===========================================================================
+# The write sweep. Different confounds from the read side, so a different
+# structure:
+#
+#   1. SLC CACHE EXHAUSTION. The fixture drive is DRAM-less TLC with a
+#      pseudo-SLC region; a sustained write run drains it and throughput
+#      collapses mid-run. Phase W0 measures where, by rewriting the fixture
+#      back to back with no idle. Every later phase writes $WriteGiB per row
+#      -- sized to fit -- with $GapSeconds of idle after each row so the
+#      cache can fold back down.
+#
+#   2. DRIVE STATE IS HISTORY-DEPENDENT. A row inherits the drive the
+#      previous row left. The gap plus interleaved repetition (medians, not
+#      means) is the mitigation; it is not perfect and is why W1 quotes
+#      medians of alternating reps rather than any single pair.
+#
+#   3. THE SYNC DISCIPLINE IS THE COMPARISON. APSEQWRITE is NO_BUFFERING but
+#      NOT WRITE_THROUGH: past the page cache, not past the device cache. A
+#      buffered Rust writer with no sync has done strictly less when it
+#      returns; with sync_all, strictly more. So W1 pairs both sides at the
+#      same endpoint -- everything durable to the device (--fsync / --sync
+#      all) -- and W2 shows the undisciplined pair once, labelled as such.
+#
+#   4. LBA POSITION. Both sides rewrite ONE fixture of exactly $WriteGiB in
+#      place -- APSEQWRITE's own OPEN_ALWAYS-never-truncate behaviour -- so
+#      every row lands on the same LBAs and NTFS allocation is out of the
+#      picture after the first write.
+# ===========================================================================
+if ($Sweep -ne "read") {
+
+$wlen = [int64]$WriteGiB * 1GB
+$wfixture = Join-Path $Root "seqwrite-fixture.bin"
+
+function Invoke-CppWrite {
+    param([int] $Depth, [int] $Block, [string] $Label, [string] $Mode = "copy",
+          [switch] $Fsync, [int] $Record = 4096)
+    $argv = @("write", $script:wfixture, "--length", "$script:wlen",
+              "--depth", "$Depth", "--block", "$Block", "--record", "$Record",
+              "--mode", $Mode, "--label", $Label)
+    if ($Fsync) { $argv += "--fsync" }
+    Invoke-Row -Exe $script:cpp -What $Label -Argv $argv
+}
+
+function Invoke-RustWrite {
+    param([string] $Mode, [string] $Label, [string] $Sync = "all")
+    Invoke-Row -Exe $script:rust -What $Label -Argv @(
+        "write", $script:wfixture, "--mode", $Mode, "--length", "$script:wlen",
+        "--record", "4096", "--sync", $Sync, "--label", $Label)
+}
+
+function Gap { Start-Sleep -Seconds $script:GapSeconds }
+
+if (-not (Test-Path $wfixture) -or (Get-Item $wfixture).Length -ne $wlen) {
+    Write-Host "`nGenerating $WriteGiB GiB write fixture at $wfixture..."
+    & $cpp gen $wfixture ([int64]($wlen / 1MB))
+    if ($LASTEXITCODE -ne 0) { throw "write fixture generation failed" }
+    Start-Sleep -Seconds 30   # let the drive settle after laying it down
+}
+
+# ---------------------------------------------------------------------------
+# Phase W0 -- SLC-cliff probe. The same configuration rewriting the same
+# LBAs back to back with no idle; if a cliff exists inside reps x $WriteGiB
+# of sustained writing, the reps stop agreeing. Rows are comparable only to
+# each other.
+# ---------------------------------------------------------------------------
+Write-Host "`n== Phase W0: SLC-cliff probe ($($WriteReps + 5) back-to-back rewrites, no idle) =="
+foreach ($rep in 1..($WriteReps + 5)) {
+    Write-Host "  cliff rep $rep"
+    Invoke-CppWrite -Depth 4 -Block 1048576 -Label "w0-cliff-4x1MiB-r$rep"
+}
+Write-Host "  (idle $($GapSeconds * 3) s to let the cache fold back)"
+Start-Sleep -Seconds ($GapSeconds * 3)
+
+# ---------------------------------------------------------------------------
+# Phase W1 -- the load-bearing pairs, at the same durability endpoint.
+# Alternating over the same fixture, $WriteReps reps, a gap after every row.
+# The five rows: the two shapes the engine actually runs (checkpoint
+# 2 x 4 MiB zero-copy, learner/defunct 2 x 128 KiB), the Rust checkpoint
+# writer today (BufWriter::new = 8 KiB), the one-line fix (BufWriter at the
+# 4 MiB block), and the block-writer shape.
+# ---------------------------------------------------------------------------
+Write-Host "`n== Phase W1: matched durability (--fsync / --sync all), alternating =="
+foreach ($rep in 1..$WriteReps) {
+    Write-Host "  rep $rep"
+    Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Fsync -Label "w1-APSEQWRITE-ckpt-2x4MiB-commit-fsync-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 131072  -Mode copy   -Fsync -Label "w1-APSEQWRITE-2x128KiB-copy-fsync-r$rep"; Gap
+    Invoke-RustWrite -Mode "bufwriter:8192"    -Sync all -Label "w1-ckpt-today-8KiB-syncall-r$rep"; Gap
+    Invoke-RustWrite -Mode "bufwriter:4194304" -Sync all -Label "w1-bufwriter-4MiB-syncall-r$rep"; Gap
+    Invoke-RustWrite -Mode "big:4194304"       -Sync all -Label "w1-big-4MiB-syncall-r$rep"; Gap
+}
+
+# ---------------------------------------------------------------------------
+# Phase W2 -- the undisciplined pair, once, so the difference the sync makes
+# is on the record. APSEQWRITE bare returns with data past the page cache but
+# maybe in the device cache; the bufwriter row returns with data merely in
+# the PAGE cache. Not an apples comparison -- that is the point of the row.
+# ---------------------------------------------------------------------------
+Write-Host "`n== Phase W2: the undisciplined pair (no fsync / --sync none) =="
+Invoke-CppWrite -Depth 2 -Block 131072 -Mode copy -Label "w2-APSEQWRITE-2x128KiB-nosync"; Gap
+Invoke-RustWrite -Mode "bufwriter:4194304" -Sync none -Label "w2-bufwriter-4MiB-nosync"; Gap
+
+# ---------------------------------------------------------------------------
+# Phase W3 -- the APSEQWRITE shape sweep, bare (its native discipline), all
+# on the same fixture so comparable to each other. Depth 1 is legal for the
+# writer (DoInit accepts >= 1, apdiskio.cpp:661, unlike the reader's > 1)
+# and so is a real point on this curve. copy-vs-commit at the two production
+# shapes prices the memcpy GetAvailable exists to avoid.
+# ---------------------------------------------------------------------------
+Write-Host "`n== Phase W3: APSEQWRITE shape sweep (bare, compare to each other only) =="
+foreach ($rep in 1..2) {
+    Write-Host "  rep $rep"
+    Invoke-CppWrite -Depth 1 -Block 131072   -Label "w3-1x128KiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 131072   -Label "w3-2x128KiB-inuse-r$rep"; Gap
+    Invoke-CppWrite -Depth 4 -Block 131072   -Label "w3-4x128KiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 8 -Block 131072   -Label "w3-8x128KiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 65536    -Label "w3-2x64KiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 1048576  -Label "w3-2x1MiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 4 -Block 1048576  -Label "w3-4x1MiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 4194304  -Label "w3-2x4MiB-inuse-r$rep"; Gap
+    Invoke-CppWrite -Depth 4 -Block 4194304  -Label "w3-4x4MiB-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 131072  -Mode commit -Label "w3-2x128KiB-commit-r$rep"; Gap
+    Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Label "w3-2x4MiB-commit-r$rep"; Gap
+}
+
+# ---------------------------------------------------------------------------
+# Phase W4 -- the Rust capacity sweep at the durable endpoint, comparable to
+# each other and to the W1 Rust rows.
+# ---------------------------------------------------------------------------
+Write-Host "`n== Phase W4: Rust write capacity sweep (--sync all) =="
+foreach ($rep in 1..2) {
+    Write-Host "  rep $rep"
+    Invoke-RustWrite -Mode "file"                -Label "w4-file-per-record-r$rep"; Gap
+    Invoke-RustWrite -Mode "bufwriter:8192"      -Label "w4-bufwriter-8KiB-r$rep"; Gap
+    Invoke-RustWrite -Mode "bufwriter:65536"     -Label "w4-bufwriter-64KiB-r$rep"; Gap
+    Invoke-RustWrite -Mode "bufwriter:1048576"   -Label "w4-bufwriter-1MiB-r$rep"; Gap
+    Invoke-RustWrite -Mode "bufwriter:10485760"  -Label "w4-bufwriter-10MiB-r$rep"; Gap
+    Invoke-RustWrite -Mode "big:1048576"         -Label "w4-big-1MiB-r$rep"; Gap
+}
+
+} # end write sweep
+
 $text = $lines -join "`r`n"
 Write-Host "`n$text"
 if ($Out) {
@@ -229,4 +388,12 @@ Reading the output:
 
   The first phase-1 repetition of each window tends to read low; it is a
   first-touch artifact. Take the median, not the mean.
+
+  w0-*   SLC-cliff probe: back-to-back rewrites, no idle. Divergence across
+         reps is the pseudo-SLC cache draining. Compare to each other only.
+  w1-*   the load-bearing write rows: both sides end with everything durable
+         to the device. Medians across reps; quotable against each other.
+  w2-*   the undisciplined pair, once, for the record. Not comparable to w1.
+  w3-*   APSEQWRITE shapes, bare, against each other only.
+  w4-*   Rust write capacities at --sync all, against each other and w1.
 "@
