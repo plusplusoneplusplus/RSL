@@ -285,10 +285,10 @@ function Invoke-CppWrite {
 }
 
 function Invoke-RustWrite {
-    param([string] $Mode, [string] $Label, [string] $Sync = "all")
+    param([string] $Mode, [string] $Label)
     Invoke-Row -Exe $script:rust -What $Label -Argv @(
         "write", $script:wfixture, "--mode", $Mode, "--length", "$script:wlen",
-        "--record", "4096", "--sync", $Sync, "--label", $Label)
+        "--record", "4096", "--label", $Label)
 }
 
 if (-not (Test-Path $wfixture) -or (Get-Item $wfixture).Length -ne $wlen) {
@@ -313,34 +313,17 @@ foreach ($rep in 1..($WriteReps + 5)) {
 # Phase W1 -- the load-bearing pairs, at the same durability endpoint.
 # Alternating over the same fixture, $WriteReps reps, back to back -- W0 is
 # the evidence that idle between rows buys nothing at this row size.
-# The five rows: the two shapes the engine actually runs (checkpoint
-# 2 x 4 MiB zero-copy, learner/defunct 2 x 128 KiB), the Rust checkpoint
-# writer today (BufWriter::new = 8 KiB), the one-line fix (BufWriter at the
-# 4 MiB block), and the block-writer shape.
+# The rows: the two C++ shapes the engine actually runs (checkpoint
+# 2 x 4 MiB zero-copy, learner/defunct 2 x 128 KiB), and the Rust
+# SeqWriter at the default 4 x 4 x 4 MiB shape.
 # ---------------------------------------------------------------------------
-Write-Host "`n== Phase W1: matched durability (--fsync / --sync all), alternating =="
+Write-Host "`n== Phase W1: matched durability (--fsync / SeqWriter finish), alternating =="
 foreach ($rep in 1..$WriteReps) {
     Write-Host "  rep $rep"
     Invoke-CppWrite -Depth 2 -Block 4194304 -Mode commit -Fsync -Label "w1-APSEQWRITE-ckpt-2x4MiB-commit-fsync-r$rep"
     Invoke-CppWrite -Depth 2 -Block 131072  -Mode copy   -Fsync -Label "w1-APSEQWRITE-2x128KiB-copy-fsync-r$rep"
-    Invoke-RustWrite -Mode "bufwriter:8192"    -Sync all -Label "w1-ckpt-today-8KiB-syncall-r$rep"
-    Invoke-RustWrite -Mode "bufwriter:4194304" -Sync all -Label "w1-bufwriter-4MiB-syncall-r$rep"
-    Invoke-RustWrite -Mode "big:4194304"       -Sync all -Label "w1-big-4MiB-syncall-r$rep"
+    Invoke-RustWrite -Mode "ring:4x4x4194304" -Label "w1-SeqWriter-4x4x4MiB-r$rep"
 }
-
-# ---------------------------------------------------------------------------
-# Phase W2 -- the undisciplined pair, once, so the difference the sync makes
-# is on the record. APSEQWRITE bare returns with data past the page cache but
-# maybe in the device cache; the bufwriter row returns with data merely in
-# the PAGE cache. Not an apples comparison -- that is the point of the row.
-# Neither row needs idle behind it to keep its writeback out of the next row:
-# seqio_bench already does an untimed sync_all after the clock stops when
-# --sync none (seqio_bench.rs:637), and the APSEQWRITE row is NO_BUFFERING, so
-# there is no page cache to drain -- only the device cache it is measuring.
-# ---------------------------------------------------------------------------
-Write-Host "`n== Phase W2: the undisciplined pair (no fsync / --sync none) =="
-Invoke-CppWrite -Depth 2 -Block 131072 -Mode copy -Label "w2-APSEQWRITE-2x128KiB-nosync"
-Invoke-RustWrite -Mode "bufwriter:4194304" -Sync none -Label "w2-bufwriter-4MiB-nosync"
 
 # ---------------------------------------------------------------------------
 # Phase W3 -- the APSEQWRITE shape sweep, bare (its native discipline), all
@@ -366,18 +349,16 @@ foreach ($rep in 1..2) {
 }
 
 # ---------------------------------------------------------------------------
-# Phase W4 -- the Rust capacity sweep at the durable endpoint, comparable to
-# each other and to the W1 Rust rows.
+# Phase W4 -- SeqWriter shape sweep, comparable to each other and to the W1
+# Rust rows. Durability is baked in: SeqWriter::finish always syncs.
 # ---------------------------------------------------------------------------
-Write-Host "`n== Phase W4: Rust write capacity sweep (--sync all) =="
+Write-Host "`n== Phase W4: SeqWriter shape sweep =="
 foreach ($rep in 1..2) {
     Write-Host "  rep $rep"
-    Invoke-RustWrite -Mode "file"                -Label "w4-file-per-record-r$rep"
-    Invoke-RustWrite -Mode "bufwriter:8192"      -Label "w4-bufwriter-8KiB-r$rep"
-    Invoke-RustWrite -Mode "bufwriter:65536"     -Label "w4-bufwriter-64KiB-r$rep"
-    Invoke-RustWrite -Mode "bufwriter:1048576"   -Label "w4-bufwriter-1MiB-r$rep"
-    Invoke-RustWrite -Mode "bufwriter:10485760"  -Label "w4-bufwriter-10MiB-r$rep"
-    Invoke-RustWrite -Mode "big:1048576"         -Label "w4-big-1MiB-r$rep"
+    Invoke-RustWrite -Mode "ring:2x2x4194304"  -Label "w4-SeqWriter-2x2x4MiB-r$rep"
+    Invoke-RustWrite -Mode "ring:4x4x4194304"  -Label "w4-SeqWriter-4x4x4MiB-r$rep"
+    Invoke-RustWrite -Mode "ring:4x4x1048576"  -Label "w4-SeqWriter-4x4x1MiB-r$rep"
+    Invoke-RustWrite -Mode "ring:8x8x1048576"  -Label "w4-SeqWriter-8x8x1MiB-r$rep"
 }
 
 } # end write sweep
@@ -405,7 +386,6 @@ Reading the output:
          reps is the pseudo-SLC cache draining. Compare to each other only.
   w1-*   the load-bearing write rows: both sides end with everything durable
          to the device. Medians across reps; quotable against each other.
-  w2-*   the undisciplined pair, once, for the record. Not comparable to w1.
   w3-*   APSEQWRITE shapes, bare, against each other only.
-  w4-*   Rust write capacities at --sync all, against each other and w1.
+  w4-*   SeqWriter shape sweep, against each other and w1.
 "@

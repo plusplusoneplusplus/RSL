@@ -9,14 +9,13 @@
 //! `read` compares against `APSEQREAD` (verdict in `READPATH.md`), `write`
 //! against `APSEQWRITE` (verdict in `WRITEPATH.md`). The C++ side of both is
 //! cache-independent by construction — `FILE_FLAG_NO_BUFFERING` — while every
-//! buffered path here is not, which is why the sweeps are driven cold and why
-//! the write rows carry an explicit `--sync` discipline in their labels.
+//! buffered read path here is not, which is why the read sweeps are driven cold.
 //!
 //! ```text
 //! cargo run --release -p rsl-storage --bin seqio_bench -- \
 //!     read <path> --mode bufreader:65536 --offset 0 --length 10737418240 --record 4096
 //! cargo run --release -p rsl-storage --bin seqio_bench -- \
-//!     write <path> --mode bufwriter:8192 --length 6442450944 --record 4096 --sync all
+//!     write <path> --mode ring:4x4x4194304 --length 6442450944 --record 4096
 //! ```
 //!
 //! Read modes:
@@ -31,25 +30,16 @@
 //! (The former `tokio:<chunk>` learner-streaming mode is gone with the tokio
 //! dev-dependency; `READPATH.md` keeps its one measured number.)
 //!
-//! Write modes:
-//!
-//! | Mode | Models |
-//! | --- | --- |
-//! | `file` | `write_all` per record on a bare `File` — no user buffering |
-//! | `bufwriter:<cap>` | checkpoint write — `BufWriter` (checkpoint.rs:846); `cap` 8192 is today's default |
-//! | `big:<block>` | accumulate records into one block, `write_all` per block |
-//!
-//! Every write mode opens without truncating — `APSEQWRITE` is `OPEN_ALWAYS`
-//! (apdiskio.cpp:697) — so rewriting a pre-generated fixture of exactly
-//! `--length` bytes keeps every run of a sweep on the same LBAs, and finishes
-//! with `set_len(length)`, the `SetEndOfFile` in `APSEQWRITE::Flush`.
-//! `--sync all` puts a timed `sync_all` (device-cache flush included) inside
-//! the wall clock; `--sync none` does not, but still syncs *untimed* before
-//! exiting so one row's writeback cannot drain into the next row's timeline.
+//! The `write` subcommand goes through [`SeqWriter`] — the shipped unbuffered
+//! ring writer, the port's `APSEQWRITE`. Records are fed via `write_all`.
+//! The ring shape is specified as `--mode ring:<threads>x<slots>x<block>`.
+//! `SeqWriter::finish` drains the ring, sets the file length, and syncs, so
+//! durability is baked into the writer.
 
 use rsl_storage::seqread::{SeqReader, SeqReaderConfig, SECTOR};
+use rsl_storage::seqwrite::{SeqWriter, SeqWriterConfig};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
 /// What the read harness measures. Each variant is one of the port's real read
@@ -278,10 +268,12 @@ fn fill_pattern(buf: &mut [u8], offset: u64) {
     }
 }
 
-/// Drive any `Write` a record at a time, timing fill + write per record — the
-/// same timed region as the C++ `write` loop, which fills its scratch buffer
-/// inside the clock too.
-fn measure_writes<W: Write>(w: &mut W, want: u64, record: usize) -> io::Result<Sample> {
+/// Feed records into the [`SeqWriter`] via `write_all`, timing fill + write
+/// per record — the same timed region as the C++ `write` loop, which fills its
+/// scratch buffer inside the clock too. `SeqWriter::finish` is called
+/// separately in the caller so its `set_len` + `sync_all` lands in the
+/// finish-time accounting.
+fn measure_writes(w: &mut SeqWriter, want: u64, record: usize) -> io::Result<Sample> {
     let mut buf = vec![0u8; record];
     let mut rec = Recorder::new(want / record as u64);
 
@@ -296,35 +288,6 @@ fn measure_writes<W: Write>(w: &mut W, want: u64, record: usize) -> io::Result<S
     Ok(rec.finish())
 }
 
-/// The `big` shape: records accumulate in one block-sized buffer and the file
-/// sees only block-sized `write_all`s. Per-record timing, so the block write's
-/// cost lands on one record in every `block / record`, as everywhere else.
-fn measure_big(f: &mut File, want: u64, record: usize, block: usize) -> io::Result<Sample> {
-    let mut blk = vec![0u8; block];
-    let mut rec = Recorder::new(want / record as u64);
-
-    let mut written = 0u64;
-    let mut pos = 0usize;
-    while written + record as u64 <= want {
-        let call = Instant::now();
-        fill_pattern(&mut blk[pos..pos + record], written);
-        let end = pos + record;
-        // Drain when the next record would not fit — the write's cost lands on
-        // this record's latency.
-        let drain = end + record > block;
-        if drain {
-            f.write_all(&blk[..end])?;
-        }
-        rec.delivered(call, &blk[pos..end]);
-        pos = if drain { 0 } else { end };
-        written += record as u64;
-    }
-    if pos > 0 {
-        f.write_all(&blk[..pos])?;
-    }
-    Ok(rec.finish())
-}
-
 fn percentile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -333,68 +296,43 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[i.min(sorted.len() - 1)]
 }
 
-/// What the write harness measures. Named after the call site each one models.
-enum WriteMode {
-    /// `write_all` per record on a bare `File`.
-    Bare,
-    /// `BufWriter` with an explicit capacity — `checkpoint.rs:846` is
-    /// `BufWriter::new`, the 8 KiB default.
-    Buffered(usize),
-    /// Records accumulated into one block, written block-at-a-time.
-    Big(usize),
-}
-
-impl WriteMode {
-    fn parse(s: &str) -> Result<WriteMode, String> {
-        let (kind, arg) = match s.split_once(':') {
-            Some((k, a)) => (k, Some(a)),
-            None => (s, None),
-        };
-        let size = || -> Result<usize, String> {
-            arg.ok_or_else(|| format!("mode `{kind}` needs a size, e.g. `{kind}:65536`"))?
-                .parse::<usize>()
-                .map_err(|e| format!("bad size in `{s}`: {e}"))
-        };
-        match kind {
-            "file" => Ok(WriteMode::Bare),
-            "bufwriter" => Ok(WriteMode::Buffered(size()?)),
-            "big" => Ok(WriteMode::Big(size()?)),
-            _ => Err(format!("unknown write mode `{kind}`")),
-        }
+/// Parse a `<threads>x<slots>x<block>` ring spec from a `--mode ring:...`
+/// argument.
+fn parse_ring_spec(s: &str) -> Result<SeqWriterConfig, String> {
+    let mut parts = s.split('x');
+    let mut term = |what: &str| -> Result<usize, String> {
+        parts
+            .next()
+            .ok_or_else(|| format!("bad ring spec `{s}`, want `<threads>x<slots>x<block>`"))?
+            .parse::<usize>()
+            .map_err(|e| format!("bad {what} in `{s}`: {e}"))
+    };
+    let threads = term("thread count")?;
+    let slots = term("slot count")?;
+    let block = term("block")?;
+    if parts.next().is_some() {
+        return Err(format!(
+            "bad ring spec `{s}`, want `<threads>x<slots>x<block>`"
+        ));
     }
-
-    fn block(&self, record: usize) -> usize {
-        match *self {
-            WriteMode::Bare => record,
-            WriteMode::Buffered(n) | WriteMode::Big(n) => n,
-        }
+    if !block.is_multiple_of(SECTOR) {
+        return Err(format!(
+            "ring block {block} must be a multiple of {SECTOR}: unbuffered \
+             writes are rejected outright if length is not sector-aligned"
+        ));
     }
-
-    fn label(&self) -> &'static str {
-        match *self {
-            WriteMode::Bare => "file",
-            WriteMode::Buffered(_) => "bufwriter",
-            WriteMode::Big(_) => "big",
-        }
-    }
-}
-
-/// How much durability work sits inside the wall clock. `APSEQWRITE` bare is
-/// past the page cache but not the device cache; `all` is the write-side
-/// `sync_all`, comparable to the C++ `--fsync` rows and to what the checkpoint
-/// path actually pays before its rename.
-#[derive(PartialEq, Clone, Copy)]
-enum SyncKind {
-    None,
-    All,
+    Ok(SeqWriterConfig {
+        threads,
+        slots,
+        block,
+    })
 }
 
 struct Args {
     write: bool,
     path: String,
     mode: Option<Mode>,
-    wmode: Option<WriteMode>,
-    sync: SyncKind,
+    wconfig: Option<SeqWriterConfig>,
     label: String,
     offset: u64,
     length: u64,
@@ -404,8 +342,8 @@ struct Args {
 
 const USAGE: &str = "usage: seqio_bench read  <path> [--mode M] [--offset B] [--length B] \
                      [--record B] [--label S] [--header]\n\
-                     \x20      seqio_bench write <path> [--mode M] [--length B] [--record B] \
-                     [--sync none|all] [--label S] [--header]";
+                     \x20      seqio_bench write <path> --mode ring:TxSxB [--length B] [--record B] \
+                     [--label S] [--header]";
 
 fn parse_args() -> Result<Args, String> {
     let mut argv = std::env::args().skip(1);
@@ -421,8 +359,7 @@ fn parse_args() -> Result<Args, String> {
         write,
         path,
         mode: None,
-        wmode: None,
-        sync: SyncKind::None,
+        wconfig: None,
         label: String::new(),
         offset: 0,
         length: 0,
@@ -439,15 +376,16 @@ fn parse_args() -> Result<Args, String> {
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
-            "--mode" if write => a.wmode = Some(WriteMode::parse(&value)?),
-            "--mode" => a.mode = Some(Mode::parse(&value)?),
-            "--sync" => {
-                a.sync = match value.as_str() {
-                    "none" => SyncKind::None,
-                    "all" => SyncKind::All,
-                    _ => return Err(format!("--sync wants none|all, got `{value}`")),
+            "--mode" if write => {
+                let (kind, arg) = value.split_once(':').ok_or_else(|| {
+                    "write --mode requires ring:<threads>x<slots>x<block>".to_string()
+                })?;
+                if kind != "ring" {
+                    return Err(format!("unknown write mode `{kind}`, expected `ring`"));
                 }
+                a.wconfig = Some(parse_ring_spec(arg)?);
             }
+            "--mode" => a.mode = Some(Mode::parse(&value)?),
             "--label" => a.label = value,
             "--offset" => a.offset = value.parse().map_err(|e| format!("--offset: {e}"))?,
             "--length" => a.length = value.parse().map_err(|e| format!("--length: {e}"))?,
@@ -460,8 +398,8 @@ fn parse_args() -> Result<Args, String> {
         return Err("--record must be a multiple of 8 (the fold reads 8-byte words)".into());
     }
     if a.write {
-        if a.wmode.is_none() {
-            a.wmode = Some(WriteMode::Buffered(8192));
+        if a.wconfig.is_none() {
+            a.wconfig = Some(SeqWriterConfig::default());
         }
         if a.length == 0 {
             return Err("--length is required for write".into());
@@ -588,63 +526,28 @@ fn run_read(a: &Args) -> io::Result<()> {
 }
 
 fn run_write(a: &Args) -> io::Result<()> {
-    let wmode = a.wmode.as_ref().expect("write mode defaulted");
+    let config = a.wconfig.expect("write config defaulted");
+    let path = std::path::Path::new(&a.path);
 
-    // No truncate — `APSEQWRITE` is `OPEN_ALWAYS` (apdiskio.cpp:697). A
-    // pre-generated fixture of exactly `--length` bytes is rewritten in place,
-    // pinning the LBAs across every row of a sweep.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&a.path)?;
+    let mut w = SeqWriter::create_with(path, config)?;
+    let mut sample = measure_writes(&mut w, a.length, a.record)?;
 
-    let mut sample;
-    let finish_start;
-    match *wmode {
-        WriteMode::Bare => {
-            sample = measure_writes(&mut f, a.length, a.record)?;
-            finish_start = Instant::now();
-        }
-        WriteMode::Buffered(cap) => {
-            let mut w = BufWriter::with_capacity(cap, &mut f);
-            sample = measure_writes(&mut w, a.length, a.record)?;
-            // The drain of the last partial buffer is finish-time work, like
-            // APSEQWRITE's Flush; it lands in `seconds` but not in a record.
-            finish_start = Instant::now();
-            w.flush()?;
-            drop(w);
-        }
-        WriteMode::Big(block) => {
-            sample = measure_big(&mut f, a.length, a.record, block)?;
-            finish_start = Instant::now();
-        }
-    }
-
-    // SetEndOfFile, in APSEQWRITE::Flush's position. With an exact-length
-    // fixture this is a no-op that still pins the semantics: a shorter rewrite
-    // would truncate here, which is exactly what the C++ only does on Flush.
-    f.set_len(a.length)?;
-    if a.sync == SyncKind::All {
-        f.sync_all()?;
-    }
+    // `finish` drains the ring, sets the file length, and syncs —
+    // the same endpoint as `APSEQWRITE::Flush` + `SetEndOfFile`.
+    let finish_start = Instant::now();
+    w.finish()?;
     let finish = finish_start.elapsed();
     sample.seconds += finish.as_secs_f64();
     eprintln!(
-        "write: finish (flush{}) took {:.1} ms",
-        if a.sync == SyncKind::All { "+sync_all" } else { "" },
+        "write: finish (ring drain+sync) took {:.1} ms",
         finish.as_secs_f64() * 1e3
     );
-    // An unsynced row must not leave its writeback draining into the next
-    // row's timeline. Outside the clock, deliberately.
-    if a.sync == SyncKind::None {
-        f.sync_all()?;
-    }
 
     print_row(
-        wmode.label(),
+        "seqwriter",
         &a.label,
-        1,
-        wmode.block(a.record),
+        config.threads,
+        config.block,
         a.record,
         sample,
         a.header,
