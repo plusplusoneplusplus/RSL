@@ -299,3 +299,4 @@ CMakeUserPresets.json
 # Claude Code local settings (keep the shared skills symlink)
 /.claude/*
 !/.claude/skills
+!/.claude/CLAUDE.md
