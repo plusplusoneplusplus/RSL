@@ -6,21 +6,17 @@
 //! ```text
 //! client                                        server
 //!   |-- connect ------------------------------------>|
-//!   |-- one marshaled Message (learn framing) ------>|   Message::ReadFromSocket
-//!   |<------------------------------- response bytes-|   no envelope, no length
+//!   |-- one marshaled Message (learn framing) ------>|
+//!   |<------------------------------- response bytes-|
 //!   |<------------------------------------------ FIN-|   FIN *is* the terminator
 //! ```
 //!
 //! * **`StatusQuery`** (id 6) → one marshaled [`StatusResponse`].
-//!   `Legislator::HandleStatusQueryMsg`, `legislator.cpp:3300`.
 //! * **`FetchVotes`** (id 8) → the raw, page-aligned bytes of the log from the
 //!   requested decree's record to the end of the log set.
-//!   `HandleFetchVotesMsg`, `legislator.cpp:3633`.
 //! * **`FetchCheckpoint`** (id 9) → the whole `<decree>.codex` file.
-//!   `HandleFetchCheckpointMsg`, `legislator.cpp:3681`.
 //!
-//! Anything else on the port is dropped and the connection closed
-//! (`HandleFetchRequest`, `legislator.cpp:5330`).
+//! Anything else on the port is dropped and the connection closed.
 //!
 //! ## Failure is silence
 //!
@@ -28,7 +24,6 @@
 //! checkpoint decree that is not *its* checkpointed decree, a primary that is
 //! relinquishing — every one of them closes the connection with nothing written.
 //! The client sees a short or empty stream and moves on to another replica.
-//! That is the whole error protocol, in both directions, and this port keeps it:
 //! [`server`] never writes a diagnostic, and [`client`] turns a short stream
 //! into [`TransferError::Closed`] or [`TransferError::Truncated`].
 //!
@@ -36,27 +31,22 @@
 //!
 //! The *request* uses the learn-port framing ([`crate::framing::learn`]): a bare
 //! marshaled message whose own first six bytes size the read. The `FetchVotes`
-//! *response* uses neither that nor the 4b packet framing — it is the raw log
-//! file, so records are page-aligned and the reader walks 512 bytes at a time
-//! ([`client::VoteStream`]). They share `rsl-wire` and nothing else; keeping
-//! them separate is what keeps each faithful.
+//! *response* is the raw log file, so records are page-aligned and the reader
+//! walks 512 bytes at a time ([`client::VoteStream`]).
 //!
 //! ## Timeouts
 //!
 //! Every socket operation gets [`LearnConfig::recv_timeout`] /
-//! [`LearnConfig::send_timeout`] (5 s each, from `RSLConfig`'s
-//! `m_receiveTimeoutSec`/`m_sendTimeoutSec` defaults, `rsl.cpp:1365-1366`).
-//! There is deliberately **no** overall deadline for a transfer: a slow but
-//! alive peer streaming a multi-gigabyte checkpoint is legal, and the only
-//! thing that matters is that bytes keep arriving. The inherited weakness is
-//! that a peer which keeps dribbling a byte every four seconds can hold a
-//! transfer open forever; that is the original's behaviour and it is not
-//! "fixed" here silently. See `README.md` for the measured stall budget.
+//! [`LearnConfig::send_timeout`] (5 s each by default). There is deliberately
+//! **no** overall deadline for a transfer: a slow but alive peer streaming a
+//! multi-gigabyte checkpoint is legal, and the only thing that matters is that
+//! bytes keep arriving. The inherited weakness is that a peer which keeps
+//! dribbling a byte every four seconds can hold a transfer open forever.
 //!
 //! ## Module name
 //!
 //! This is `learnport`, not `learn`, because [`crate::learn`] is already the
-//! *framing* (`Message::ReadFromSocket`) that this module's requests travel in.
+//! *framing* that this module's requests travel in.
 
 pub mod client;
 pub mod server;
@@ -77,20 +67,13 @@ use crate::svc::Stream;
 pub use client::{FetchedCheckpoint, LearnClient, TransferError, VoteStream};
 pub use server::{DirSource, LearnServer, LearnSource, StatusProvider};
 
-// ---------------------------------------------------------------------------
-// The stream seam
-// ---------------------------------------------------------------------------
-
-/// What a [`Connector`] or [`Acceptor`] produces: a byte stream, once whatever
-/// it takes to get one — a connect, a handshake, or nothing at all — is done.
+/// What a [`Connector`] or [`Acceptor`] produces once connect/handshake is done.
 pub type StreamFuture = Pin<Box<dyn Future<Output = io::Result<Box<dyn Stream>>> + Send + 'static>>;
 
 /// How the learn client opens a connection to a peer's learn port.
 ///
 /// Plaintext is [`PlainConnector`]; [`crate::tls::TlsConnector`] adds the
-/// handshake. This is the *only* thing TLS changes about this module — the
-/// C++'s equivalent seam is `StreamSocket::CreateStreamSocket` returning either
-/// a `StreamSocket` or an `SslSocket` (`StreamIO.cpp:37`).
+/// handshake.
 pub trait Connector: Send + Sync + 'static {
     fn connect(&self, addr: SocketAddr) -> StreamFuture;
 }
@@ -100,7 +83,7 @@ pub trait Acceptor: Send + Sync + 'static {
     fn accept(&self, stream: TcpStream) -> StreamFuture;
 }
 
-/// A plain TCP connect, with `TCP_NODELAY` set.
+/// Plain TCP connect with `TCP_NODELAY`.
 pub struct PlainConnector;
 
 impl Connector for PlainConnector {
@@ -113,7 +96,7 @@ impl Connector for PlainConnector {
     }
 }
 
-/// The accepted socket, as it is.
+/// Pass-through acceptor for plain TCP.
 pub struct PlainAcceptor;
 
 impl Acceptor for PlainAcceptor {
@@ -123,38 +106,31 @@ impl Acceptor for PlainAcceptor {
 }
 
 /// The learn port a replica listens on when its config leaves it unset:
-/// `m_node.m_rslLearnPort = m_node.m_rslPort + 1` (`message.cpp:36-41`).
+/// `rslPort + 1`.
 pub fn default_learn_port(rsl_port: u16) -> u16 {
     rsl_port.wrapping_add(1)
 }
 
-/// `m_pFetchSocket->BindAndListen(port, 1024, 120, 1)` — the learn listener's
-/// backlog (`legislator.cpp:6395`).
+/// The learn listener's backlog (1024, matching the C++).
 pub const LISTEN_BACKLOG: u32 = 1024;
 
 /// Knobs shared by both sides of the learn port.
 #[derive(Clone, Debug)]
 pub struct LearnConfig {
-    /// Per-operation receive timeout — `RSLConfig::ReceiveTimeout()`.
+    /// Per-operation receive timeout.
     pub recv_timeout: Duration,
-    /// Per-operation send timeout — `RSLConfig::SendTimeout()`.
+    /// Per-operation send timeout.
     pub send_timeout: Duration,
-    /// The cap on a *request* message, `RSLConfig::MaxMessageSize()`
-    /// (`legislator.cpp:5342`). Responses are file streams and are not capped.
+    /// Cap on a *request* message. Responses are file streams and are not capped.
     pub limits: Limits,
-    /// How many bytes move per read/write while streaming a file. The C++ uses
-    /// `APSEQREAD::c_readBufSize` on the server side and
-    /// `APSEQWRITE::c_writeBufSizeDefault` on the client side; both are
-    /// buffer-pool constants with no format meaning, so this is one knob.
+    /// Bytes per read/write while streaming a file.
     pub stream_chunk: usize,
 }
 
-/// `APSEQREAD::c_readBufSize` (`apdiskio.h`) — the streaming chunk both sides
-/// default to.
+/// Default streaming chunk (256 KiB).
 pub const DEFAULT_STREAM_CHUNK: usize = 256 * 1024;
 
 impl Default for LearnConfig {
-    /// The C++ defaults: 5 s each way, the configured 100 MB message cap.
     fn default() -> LearnConfig {
         LearnConfig {
             recv_timeout: Duration::from_secs(5),
@@ -166,25 +142,17 @@ impl Default for LearnConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Request builders
-// ---------------------------------------------------------------------------
-
 /// The fields every learn-port request carries. The three request kinds differ
-/// only in their message id and in which of these the server reads.
+/// only in their message id and in which fields the server reads.
 #[derive(Clone, Debug)]
 pub struct Requester {
-    /// The protocol version to speak — `Legislator::m_version`.
     pub version: ProtocolVersion,
-    /// Who is asking (`m_memberId`).
     pub member_id: MemberId,
-    /// `PaxosConfiguration()`. `FetchVotes` responses from a *different*
-    /// configuration are rejected by the client (`legislator.cpp:3765`).
+    /// `FetchVotes` responses from a different configuration are rejected.
     pub configuration_number: u32,
 }
 
 impl Requester {
-    /// A requester with the given identity.
     pub fn new(version: ProtocolVersion, member_id: MemberId, configuration_number: u32) -> Self {
         Requester {
             version,
@@ -193,8 +161,7 @@ impl Requester {
         }
     }
 
-    /// `Message(m_version, Message_StatusQuery, m_memberId, 0, 1, BallotNumber())`
-    /// — decree and configuration are dummies here (`legislator.cpp:1370-1376`).
+    /// Build a `StatusQuery` header. Decree and configuration are dummies.
     pub fn status_query(&self) -> Header {
         Header::new(
             self.version,
@@ -207,8 +174,7 @@ impl Requester {
         )
     }
 
-    /// `Message(m_version, Message_FetchVotes, m_memberId, decree, config, ballot)`
-    /// (`legislator.cpp:3727-3733`). The server ignores the ballot.
+    /// Build a `FetchVotes` header. The server ignores the ballot.
     pub fn fetch_votes(&self, decree: u64, ballot: BallotNumber) -> Header {
         Header::new(
             self.version,
@@ -221,9 +187,8 @@ impl Requester {
         )
     }
 
-    /// `Message(m_version, Message_FetchCheckpoint, m_memberId, decree, 1,
-    /// BallotNumber())` — the configuration number is a literal dummy `1` here
-    /// and the ballot is ignored (`legislator.cpp:5506-5512`).
+    /// Build a `FetchCheckpoint` header. Configuration number is hard-coded to
+    /// `1` and the ballot is ignored.
     pub fn fetch_checkpoint(&self, decree: u64) -> Header {
         Header::new(
             self.version,
@@ -237,19 +202,8 @@ impl Requester {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Async learn framing
-// ---------------------------------------------------------------------------
-
 /// Read one learn-framed message from an async stream, applying `timeout` to
-/// each individual read.
-///
-/// The decisions are [`crate::framing::learn::parse_header`]'s — this is only
-/// the async plumbing around them, with the same bounded growth: the body is
-/// never allocated before the size cap has passed.
-///
-/// `Ok(None)` is a clean close *between* messages, the peer simply having
-/// nothing to say.
+/// each individual read. `Ok(None)` is a clean close between messages.
 pub(crate) async fn read_message<R>(
     r: &mut R,
     kind: MsgKind,
@@ -266,8 +220,6 @@ where
 
     let hdr = learn::parse_header(&buf, limits.effective_max()).map_err(TransferError::Framing)?;
     let body = hdr.len as usize - HDR_LEN;
-    // Grow as the bytes arrive rather than trusting the length field, exactly
-    // as the sync reader does (see the crate-level divergence note).
     let mut filled = HDR_LEN;
     while filled < hdr.len as usize {
         let want = (hdr.len as usize - filled).min(64 * 1024);
@@ -287,8 +239,8 @@ where
         .ok_or(TransferError::Framing(LearnError::Unmarshal))
 }
 
-/// Fill `buf`, or report a clean EOF *before its first byte*. An EOF partway
-/// through is [`TransferError::Truncated`].
+/// Fill `buf` or report a clean EOF before its first byte. A mid-read EOF is
+/// [`TransferError::Truncated`].
 pub(crate) async fn read_exact_or_eof<R>(
     r: &mut R,
     buf: &mut [u8],
@@ -317,7 +269,7 @@ where
     Ok(true)
 }
 
-/// Write every byte, applying `timeout` to each write.
+/// Write every byte, applying `timeout` per write call.
 pub(crate) async fn write_all<W>(
     w: &mut W,
     mut buf: &[u8],
@@ -341,7 +293,7 @@ where
     Ok(())
 }
 
-/// `tokio::time::timeout` with the elapsed case mapped to our own error.
+/// Timeout wrapper that maps elapsed to [`TransferError::Timeout`].
 pub(crate) async fn with_timeout<F: std::future::Future>(
     timeout: Duration,
     f: F,
@@ -361,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_config_is_the_cpp_five_second_pair() {
+    fn default_config_uses_five_second_timeouts() {
         let config = LearnConfig::default();
         assert_eq!(config.recv_timeout, Duration::from_secs(5));
         assert_eq!(config.send_timeout, Duration::from_secs(5));
@@ -375,7 +327,6 @@ mod tests {
             who.status_query().msg_id,
             rsl_wire::messages::MSG_STATUS_QUERY
         );
-        // The status query's decree and configuration are dummies.
         assert_eq!(who.status_query().decree, 0);
         assert_eq!(who.status_query().configuration_number, 1);
 
@@ -384,7 +335,6 @@ mod tests {
         assert_eq!(votes.decree, 42);
         assert_eq!(votes.configuration_number, 7);
 
-        // FetchCheckpoint hard-codes configuration 1 (legislator.cpp:5510).
         let checkpoint = who.fetch_checkpoint(9);
         assert_eq!(checkpoint.msg_id, rsl_wire::messages::MSG_FETCH_CHECKPOINT);
         assert_eq!(checkpoint.decree, 9);

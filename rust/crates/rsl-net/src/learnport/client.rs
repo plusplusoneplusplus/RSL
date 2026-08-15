@@ -1,7 +1,5 @@
 //! The learn-port client: the three "go and get it" paths a lagging replica
-//! runs — `SendStatusRequestMessage`/`CopyCheckpointFromReplica`
-//! (`legislator.cpp:1367`), `LearnVotes` (`legislator.cpp:3719`) and
-//! `CopyCheckpoint` (`legislator.cpp:5485`).
+//! runs — status query, vote fetch, and checkpoint fetch.
 //!
 //! Each one is: connect, write one request, read until the peer closes. There is
 //! no reply envelope and no error code — a peer that will not serve the request
@@ -30,69 +28,42 @@ use super::{read_exact_or_eof, write_all, Connector, LearnConfig, PlainConnector
 use crate::framing::learn::{self, LearnError};
 use crate::svc::Stream;
 
-/// Why a learn-port transfer failed.
-///
-/// Note what is *not* here: there is no "server said no". A refusal arrives as
-/// [`Closed`](TransferError::Closed) (nothing at all) or
-/// [`Truncated`](TransferError::Truncated) (a partial stream), because that is
-/// all the protocol can express.
+/// Why a learn-port transfer failed. There is no "server said no" variant — a
+/// refusal arrives as [`Closed`](TransferError::Closed) or
+/// [`Truncated`](TransferError::Truncated).
 #[derive(Debug)]
 pub enum TransferError {
-    /// Socket or file I/O failed.
     Io(io::Error),
-    /// One socket operation exceeded [`LearnConfig::recv_timeout`] /
-    /// [`LearnConfig::send_timeout`].
     Timeout,
-    /// The peer closed without writing anything: it refused the request.
+    /// The peer closed without writing anything — it refused the request.
     Closed,
-    /// The peer closed part-way through.
     Truncated { got: u64, expected: u64 },
-    /// The response's own learn framing was malformed.
     Framing(LearnError),
-    /// A record in a `FetchVotes` stream was malformed.
     Record(RecordError),
-    /// The copied checkpoint did not verify, or could not be published.
     Checkpoint(CheckpointFailure),
 }
 
-/// Why a `FetchVotes` stream was rejected. Every one of these is
-/// `Legislator::ReadNextMessage` returning `false` with `restore == false`
-/// (`legislator.cpp:3851`), which aborts the whole catch-up.
+/// Why a `FetchVotes` stream was rejected — each variant aborts catch-up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordError {
-    /// Fewer than [`PAGE_SIZE`] bytes arrived where a record header must start
-    /// (`legislator.cpp:3873`).
     ShortHeaderPage { got: usize },
-    /// The header page did not parse (`legislator.cpp:3882`). Unlike recovery,
-    /// an all-zero page is *not* tolerated here: `restore` is false in
-    /// `LearnVotes`, so the zero-stream escape at `legislator.cpp:3886` is
-    /// unreachable and a zero page is hard corruption.
+    /// Unlike recovery, an all-zero page is *not* tolerated here.
     HeaderUnmarshal,
-    /// A message id other than `Vote`, `Prepare` or `ReconfigurationDecision`
-    /// (`legislator.cpp:3897`).
+    /// Only `Vote`, `Prepare`, and `ReconfigurationDecision` are valid.
     UnknownMessageId(u16),
-    /// The record's body did not arrive in full (`legislator.cpp:3930`).
     ShortBody { got: u64, expected: u64 },
-    /// The record's own Rabin-64 did not match (`legislator.cpp:3951`). A
-    /// close, never a resynchronize.
     ChecksumMismatch,
-    /// The body failed to parse despite a good checksum
-    /// (`legislator.cpp:3973`).
     Unmarshal,
 }
 
 /// Why a fetched checkpoint was not published.
 #[derive(Debug)]
 pub enum CheckpointFailure {
-    /// The copied file failed [`checkpoint::verify_file`]. The temp file has
-    /// been deleted.
+    /// Verification failed. The temp file has been deleted.
     ///
-    /// **Divergence:** the C++ `LogAssert(false)`s here — "terminating the
-    /// process to prevent codex corruption" (`legislator.cpp:5573`). This port
-    /// deletes the temp file and returns, leaving the caller to try another
-    /// replica; nothing corrupt has been published either way.
+    /// **Divergence:** the C++ aborts here. This port deletes the temp file and
+    /// returns, letting the caller try another replica.
     Invalid(checkpoint::RejectReason),
-    /// The header could not be parsed while rewriting it.
     Header(String),
 }
 
@@ -148,12 +119,8 @@ impl From<io::Error> for TransferError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The client
-// ---------------------------------------------------------------------------
-
-/// A learn-port client. Stateless apart from its [`LearnConfig`] and its
-/// [`Connector`]; one instance can drive any number of concurrent transfers.
+/// A learn-port client. Stateless; one instance can drive any number of
+/// concurrent transfers.
 #[derive(Clone)]
 pub struct LearnClient {
     config: LearnConfig,
@@ -175,12 +142,10 @@ impl std::fmt::Debug for LearnClient {
 }
 
 impl LearnClient {
-    /// A client with the C++ default timeouts.
     pub fn new() -> LearnClient {
         LearnClient::default()
     }
 
-    /// A client with explicit configuration.
     pub fn with_config(config: LearnConfig) -> LearnClient {
         LearnClient {
             config,
@@ -188,21 +153,16 @@ impl LearnClient {
         }
     }
 
-    /// The same client, connecting through `connector` —
-    /// `tls.connector()` for a TLS deployment.
+    /// Use `connector` for connections (e.g. TLS).
     pub fn over(self, connector: Arc<dyn Connector>) -> LearnClient {
         LearnClient { connector, ..self }
     }
 
-    /// The configuration in force.
     pub fn config(&self) -> &LearnConfig {
         &self.config
     }
 
-    /// `StatusQuery` → one [`StatusResponse`] (`legislator.cpp:1367-1400`).
-    ///
-    /// [`TransferError::Closed`] is a peer that refused to answer — a primary
-    /// relinquishing, in the C++.
+    /// `StatusQuery` → one [`StatusResponse`].
     pub async fn query_status(
         &self,
         addr: SocketAddr,
@@ -223,15 +183,8 @@ impl LearnClient {
         }
     }
 
-    /// `FetchVotes` → a stream of logged messages (`LearnVotes`,
-    /// `legislator.cpp:3719`).
-    ///
-    /// The returned [`VoteStream`] parses the raw log bytes page-wise. An
-    /// *immediately* empty stream (the first
-    /// [`next`](VoteStream::next) returning `Ok(None)`) is the peer refusing:
-    /// it does not have the decree. The C++ makes no distinction — `LearnVotes`
-    /// simply falls out of its loop and returns `false` — so neither does this,
-    /// beyond letting the caller count what arrived.
+    /// `FetchVotes` → a [`VoteStream`] of logged messages. An immediately empty
+    /// stream means the peer does not have the requested decree.
     pub async fn fetch_votes(
         &self,
         addr: SocketAddr,
@@ -248,13 +201,9 @@ impl LearnClient {
     }
 
     /// `FetchCheckpoint` → a verified, durably renamed `<decree>.codex` in
-    /// `dest_dir` (`CopyCheckpoint`, `legislator.cpp:5485`).
-    ///
-    /// `expected_size` comes from a prior [`StatusResponse::checkpoint_size`]:
-    /// the protocol has no in-band length, so the client must already know how
-    /// many bytes to expect — that is the only reason this parameter exists.
-    ///
-    /// On any failure the temp file is deleted and nothing is published.
+    /// `dest_dir`. `expected_size` must come from a prior
+    /// [`StatusResponse::checkpoint_size`] since the protocol has no in-band
+    /// length. On failure the temp file is deleted.
     pub async fn fetch_checkpoint(
         &self,
         addr: SocketAddr,
@@ -266,20 +215,12 @@ impl LearnClient {
             .await
     }
 
-    /// [`fetch_checkpoint`](LearnClient::fetch_checkpoint) with the C++'s
-    /// header rewrite: "reset the maxballot in the header"
-    /// (`legislator.cpp:5535-5541`) raises the copied header's `max_ballot` to
-    /// `raise_max_ballot` when the incoming one is lower, and the header is
-    /// re-marshaled on the way to disk.
+    /// Like [`fetch_checkpoint`](LearnClient::fetch_checkpoint), but raises the
+    /// copied header's `max_ballot` to `raise_max_ballot` when the incoming one
+    /// is lower (re-marshaling the header on the way to disk).
     ///
-    /// **Divergence:** the C++ *always* takes that path, so a copied checkpoint
-    /// is always a re-marshal of the original header rather than a byte copy.
-    /// The default here is the byte copy (`raise_max_ballot = None`), which
-    /// keeps a fetched file bit-identical to its source and makes an interop
-    /// assertion possible; pass `Some(ballot)` for the C++ behaviour. The two
-    /// differ only in bytes no reader inspects — the header's own checksum
-    /// field is never computed or verified (see the `rsl-storage` whitelist) —
-    /// plus the ballot itself.
+    /// **Divergence:** the C++ always re-marshals; the default here
+    /// (`raise_max_ballot = None`) keeps the file bit-identical to its source.
     pub async fn fetch_checkpoint_with(
         &self,
         addr: SocketAddr,
@@ -298,8 +239,6 @@ impl LearnClient {
         match result {
             Ok(()) => {}
             Err(e) => {
-                // `lError: seqWrite->DoDispose(); DeleteFileA(file);`
-                // (legislator.cpp:5605).
                 let _ = std::fs::remove_file(&temp);
                 return Err(e);
             }
@@ -316,8 +255,6 @@ impl LearnClient {
         })
     }
 
-    /// Connect, write the request, and hand back the socket positioned at the
-    /// start of the response.
     async fn request(
         &self,
         addr: SocketAddr,
@@ -326,10 +263,6 @@ impl LearnClient {
         let bytes = learn::encode_message(&Msg::Base(request.clone()))
             .expect("a base-class message always marshals");
 
-        // The connect *and*, for TLS, the handshake are under the send timeout:
-        // the C++ sets `SO_SNDTIMEO`/`SO_RCVTIMEO` on the socket before
-        // `SslSocket::Connect` runs its SSPI loop, so the handshake inherits the
-        // same budget (`StreamIO.cpp:82-95`).
         let mut stream =
             super::with_timeout(self.config.send_timeout, self.connector.connect(addr))
                 .await?
@@ -339,16 +272,8 @@ impl LearnClient {
         Ok(stream)
     }
 
-    /// The `CopyCheckpoint` body: optionally rewrite the header, then copy
-    /// bytes until `expected_size` have been read *in total*
-    /// (`legislator.cpp:5551` counts `reader.BytesRead()`, the header
-    /// included).
-    ///
-    /// The bytes land through a [`SeqWriter`] ring, which is what the C++ does
-    /// — `CopyCheckpoint` writes through `APSEQWRITE` (`learn_protocol.cpp:234`)
-    /// and sizes its socket staging buffer to the ring's block so that each
-    /// socket read fills exactly one block. [`RingSink`] keeps that shape and
-    /// explains the sizing and the blocking/async bridge.
+    /// Optionally rewrite the header, then stream bytes through a [`RingSink`]
+    /// until `expected_size` have been read in total (header included).
     async fn copy_checkpoint<S: AsyncRead + Unpin>(
         &self,
         stream: &mut S,
@@ -390,16 +315,12 @@ impl LearnClient {
             read_so_far += want as u64;
         }
 
-        // `seqWrite->Flush()` then `DoDispose()` (`learn_protocol.cpp:307`),
-        // before the verify pass `publish` runs.
         sink.finish().await?;
         Ok(())
     }
 
-    /// Read exactly the page-rounded checkpoint header off the socket and parse
-    /// it, returning it with the number of bytes consumed. Mirrors
-    /// `CheckpointHeader::UnMarshal(StreamReader*)` (`legislator.cpp:1032`):
-    /// one page first, then the rest of the declared length.
+    /// Read the page-rounded checkpoint header off the socket and parse it,
+    /// returning it with the number of bytes consumed.
     async fn read_checkpoint_header<S: AsyncRead + Unpin>(
         &self,
         stream: &mut S,
@@ -432,7 +353,6 @@ impl LearnClient {
             }
         }
 
-        // The parse decisions themselves are `rsl-storage`'s, unchanged.
         let header = checkpoint::read_header(&mut &blob[..], file_size)
             .map_err(|e| TransferError::Checkpoint(CheckpointFailure::Header(e.to_string())))?;
         Ok((header, u64::from(write_size)))
@@ -440,64 +360,24 @@ impl LearnClient {
 }
 
 impl LearnConfig {
-    /// The streaming chunk, never below one page (a smaller one would make the
-    /// checkpoint copy issue absurdly many syscalls without changing a byte).
     fn chunk_size(&self) -> usize {
         self.stream_chunk.max(PAGE_SIZE as usize)
     }
 
-    /// [`chunk_size`](Self::chunk_size) rounded up to a [`SECTOR`] multiple,
-    /// which is what an unbuffered write requires of its length and therefore
-    /// what [`SeqWriterConfig::block`] demands.
-    ///
-    /// Deriving the ring block from the socket chunk rather than fixing it is
-    /// the C++'s own arrangement — `CopyCheckpoint` stages into a buffer sized
-    /// to `c_writeBufSizeDefault` precisely so one socket read fills one ring
-    /// block (`learn_protocol.cpp:234`). Keeping the two tied means
-    /// [`LearnConfig::stream_chunk`] stays the single knob its documentation
-    /// claims it is.
+    /// [`chunk_size`](Self::chunk_size) rounded up to a [`SECTOR`] multiple
+    /// for unbuffered writes.
     fn ring_block(&self) -> usize {
         self.chunk_size().next_multiple_of(SECTOR)
     }
 }
 
-// ---------------------------------------------------------------------------
-// The staging writer
-// ---------------------------------------------------------------------------
-
 /// A [`SeqWriter`] driven from async code, plus the socket staging buffer that
-/// feeds it.
+/// feeds it. Writes bypass the page cache so the verify pass that follows does
+/// not contend with writeback.
 ///
-/// # Why a ring here and not on the serving side
-///
-/// An inbound checkpoint copy is normally the only one in flight on a replica,
-/// and the file it produces is re-read *unbuffered* moments later by
-/// [`checkpoint::verify_file`]. Writing it through the page cache therefore
-/// buys nothing and costs twice: a checkpoint-sized eviction of everything else
-/// on the machine, and writeback contending with the verify pass that follows
-/// it. The ring writes straight past the cache, which is also what
-/// `APSEQWRITE` does.
-///
-/// # Sizing
-///
-/// `threads: 2` is `c_maxWritesDefault` — the C++ keeps two writes in flight
-/// (`apdiskio.h:98`) and `WRITEPATH.md` measures the depth curve as flat past
-/// two. `slots: 4` gives the caller two spare buffers so a socket read never
-/// waits for a slot; that slack is the price of a thread handoff, which
-/// `WRITEPATH.md` records as the reason the port's ring must be wider than the
-/// C++'s overlapped queue. At the default chunk that is 1 MiB of buffers and
-/// two OS threads per copy in progress — affordable at one copy at a time,
-/// which is the case the serving side does *not* have.
-///
-/// # The blocking/async bridge
-///
-/// [`SeqWriter`] is blocking `std::io`, so every call to it goes through
-/// [`spawn_blocking`](tokio::task::spawn_blocking), the writer travelling with
-/// the closure and coming back with the result. The overhead is one task
-/// handoff per block rather than per byte, and the call it wraps is normally
-/// just a `memcpy` into a free slot — the ring's own threads are what wait on
-/// the device. A dedicated thread per copy would remove the handoff and add a
-/// third thread to do it, which is a worse trade at this depth.
+/// Uses 2 write threads and 4 slots — 2 in flight, 2 spare so a socket read
+/// never waits for a free slot. Each blocking `SeqWriter` call is dispatched
+/// via `spawn_blocking`.
 struct RingSink {
     /// `None` only while a blocking call is in flight.
     inner: Option<(SeqWriter, Vec<u8>)>,
@@ -505,8 +385,7 @@ struct RingSink {
 }
 
 impl RingSink {
-    /// Create `path`, truncating any existing file, with a ring of `block`-sized
-    /// buffers.
+    /// Create `path` with a ring of `block`-sized buffers.
     async fn create(path: &Path, block: usize) -> io::Result<RingSink> {
         let config = SeqWriterConfig {
             threads: 2,
@@ -523,12 +402,10 @@ impl RingSink {
         })
     }
 
-    /// The staging buffer's size, which is also the ring's block.
     fn block(&self) -> usize {
         self.block
     }
 
-    /// The staging buffer, to read a socket chunk into.
     fn stage(&mut self) -> &mut [u8] {
         &mut self
             .inner
@@ -537,19 +414,15 @@ impl RingSink {
             .1
     }
 
-    /// Hand the first `n` staged bytes to the ring.
     async fn push(&mut self, n: usize) -> io::Result<()> {
         self.with(move |writer, stage| writer.write_all(&stage[..n]))
             .await
     }
 
-    /// Write `bytes` — the rewritten header, which does not come through the
-    /// staging buffer and may be any length.
     async fn write_all(&mut self, bytes: Vec<u8>) -> io::Result<()> {
         self.with(move |writer, _| writer.write_all(&bytes)).await
     }
 
-    /// Drain the ring, establish the file's length and sync it.
     async fn finish(mut self) -> io::Result<u64> {
         let (writer, _) = self.inner.take().expect("the sink is live until finished");
         tokio::task::spawn_blocking(move || writer.finish())
@@ -557,8 +430,6 @@ impl RingSink {
             .map_err(io::Error::other)?
     }
 
-    /// Run one blocking call against the writer, handing ownership across and
-    /// taking it back.
     async fn with<T, F>(&mut self, f: F) -> io::Result<T>
     where
         F: FnOnce(&mut SeqWriter, &mut Vec<u8>) -> io::Result<T> + Send + 'static,
@@ -577,10 +448,6 @@ impl RingSink {
 }
 
 /// Verify a copied checkpoint and publish it durably, or delete it.
-///
-/// `VerifyCheckpoint(file)` then `CheckpointDone` → `MoveFileEx(...,
-/// MOVEFILE_WRITE_THROUGH)` (`legislator.cpp:5570-5583`, `:5645`). The Linux
-/// spelling of that rename is [`Durability::rename_durable`].
 fn publish(temp: &Path, dest: &Path) -> Result<PathBuf, TransferError> {
     let verification = match checkpoint::verify_file(temp) {
         Ok(v) => v,
@@ -597,7 +464,6 @@ fn publish(temp: &Path, dest: &Path) -> Result<PathBuf, TransferError> {
     }
 
     let durability = SyncAll;
-    // Windows requires write access for FlushFileBuffers, which backs sync_all.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -606,9 +472,7 @@ fn publish(temp: &Path, dest: &Path) -> Result<PathBuf, TransferError> {
     Ok(dest.to_path_buf())
 }
 
-/// `GetTempFileNameA(m_tempDir, "Codex", 0, file)` (`legislator.cpp:5497`).
-/// Uniqueness comes from the process id plus a counter, so two concurrent
-/// fetches in one process cannot collide either.
+/// Generate a unique temp path using process id + counter.
 fn temp_path(dir: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -618,34 +482,17 @@ fn temp_path(dir: &Path) -> PathBuf {
 /// A checkpoint that has been fetched, verified and published.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchedCheckpoint {
-    /// Final path — `<dest_dir>/<decree>.codex`.
     pub path: PathBuf,
-    /// The decree it was fetched for.
     pub decree: u64,
-    /// Bytes transferred (the `expected_size` that was asked for).
     pub size: u64,
 }
 
-// ---------------------------------------------------------------------------
-// The vote stream
-// ---------------------------------------------------------------------------
-
 /// The `FetchVotes` response, parsed record by record.
 ///
-/// The response is raw log bytes, so it is read exactly the way a log file is:
-/// one 512-byte page for the header, then the rest of
-/// `RoundUpToPage(un_marshal_len)`, then the record's own Rabin-64
-/// (`Legislator::ReadNextMessage`, `legislator.cpp:3851`, with `restore =
-/// false`).
-///
-/// [`next`](VoteStream::next) yields `Ok(None)` at a clean end — EOF landing
-/// exactly on a page boundary. Anything else that ends the stream is an error:
-/// with `restore` false there is no tolerated tail, so a torn record, a zero
-/// page or a bad checksum all abort the catch-up rather than truncating it.
-///
-/// This is an inherent `async fn next`, not a `futures::Stream` impl: the crate
-/// has no futures-core dependency and this is the whole surface a caller needs.
-/// Wrapping it in a `Stream` is three lines in a consumer that wants one.
+/// Records are page-aligned: one 512-byte header page, then the rest of the
+/// padded body, then a Rabin-64 checksum. [`next`](VoteStream::next) yields
+/// `Ok(None)` at a clean end (EOF on a page boundary). A torn record, zero
+/// page, or bad checksum all abort catch-up.
 pub struct VoteStream {
     stream: Box<dyn Stream>,
     recv_timeout: Duration,
@@ -655,7 +502,7 @@ pub struct VoteStream {
 }
 
 impl VoteStream {
-    /// The next logged message, or `Ok(None)` at a clean end of stream.
+    /// The next logged message, or `None` at end of stream.
     pub async fn next(&mut self) -> Result<Option<Msg>, TransferError> {
         if self.done {
             return Ok(None);
@@ -674,19 +521,15 @@ impl VoteStream {
         }
     }
 
-    /// Bytes consumed by the records yielded so far — the stream's equivalent of
-    /// a log offset.
     pub fn bytes_read(&self) -> u64 {
         self.offset
     }
 
     async fn read_one(&mut self) -> Result<Option<Msg>, TransferError> {
-        // `stream->Read(buf, s_PageSize, &bytesRead)` (legislator.cpp:3865).
         self.buf.clear();
         self.buf.resize(PAGE_SIZE as usize, 0);
         let got = read_up_to(&mut self.stream, &mut self.buf, self.recv_timeout).await?;
         if got == 0 {
-            // `ERROR_HANDLE_EOF` — the clean end (legislator.cpp:3869).
             return Ok(None);
         }
         if got < PAGE_SIZE as usize {
@@ -702,8 +545,6 @@ impl VoteStream {
         }
 
         let padded_len = round_up_to_page(header.un_marshal_len);
-        // Bounded growth, as everywhere else in this crate: a corrupt length
-        // near 4 GiB costs one chunk, not a 4 GiB allocation.
         let mut filled = PAGE_SIZE as usize;
         while filled < padded_len as usize {
             let want = (padded_len as usize - filled).min(64 * 1024);
@@ -732,13 +573,12 @@ impl VoteStream {
     }
 }
 
-/// The three ids that are ever written to a log, and therefore the only three a
-/// `FetchVotes` stream may carry (`legislator.cpp:3897`).
+/// The three ids that are ever written to a log.
 fn is_loggable(msg_id: u16) -> bool {
     msg_id == MSG_VOTE || msg_id == MSG_PREPARE || msg_id == MSG_RECONFIGURATION_DECISION
 }
 
-/// Which parser a logged id selects (`Legislator::UnMarshalMessage`).
+/// Which parser a logged id selects.
 fn kind_of(msg_id: u16) -> Option<MsgKind> {
     match msg_id {
         MSG_VOTE => Some(MsgKind::Vote),
@@ -748,7 +588,7 @@ fn kind_of(msg_id: u16) -> Option<MsgKind> {
     }
 }
 
-/// Fill `buf` as far as the peer allows; a short return means the stream ended.
+/// Fill `buf` as far as the peer allows; short return means stream ended.
 async fn read_up_to<R>(r: &mut R, buf: &mut [u8], timeout: Duration) -> Result<usize, TransferError>
 where
     R: tokio::io::AsyncRead + Unpin,
