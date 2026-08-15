@@ -58,3 +58,9 @@ etc.), the Rust port may use cross-platform abstractions, but the resulting
 performance and correctness must remain equivalent. If a platform-specific
 feature cannot be replicated with the same guarantees through portable APIs,
 fall back to platform-specific Rust APIs or raw FFI to preserve the behavior.
+
+## Comments
+
+- Keep comments concise — explain *why*, not *what*.
+- When changing code, update or remove any comments that are no longer accurate.
+  Stale comments are worse than no comments.
