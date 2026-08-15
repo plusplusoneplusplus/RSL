@@ -21,6 +21,8 @@ Branch operations are fine when the user explicitly asks for them.
 
 ## Committing
 
+- After completing a change, commit it immediately without waiting for the user
+  to ask. Use a concise, descriptive commit message.
 - Stage only the files relevant to the change; leave unrelated edits alone.
 - Do not push unless the user asks.
 - Do not skip hooks (`--no-verify`) or bypass signing.
