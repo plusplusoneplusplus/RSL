@@ -1034,11 +1034,17 @@ impl std::error::Error for LogError {
 /// reused across appends — the vectored-write equivalent of the C++
 /// `WriteFileGather` group commit (`LogFile::Write`, `legislator.cpp:546`).
 ///
-/// Durability is the caller's call, as in the engine: [`append`](Self::append)
-/// only writes, [`append_durable`](Self::append_durable) writes and syncs, and
-/// [`sync`](Self::sync) flushes a batch of earlier appends. The engine's
-/// contract for Phase 5 is that a decree may only be acknowledged after an
-/// `append_durable` (or an `append` followed by a `sync`) has returned — see
+/// Durability is the default, as in the engine: [`append`](Self::append) and
+/// [`append_batch`](Self::append_batch) return only once the records are on
+/// stable storage, which is what the C++ gets for free from a
+/// `FILE_FLAG_WRITE_THROUGH` handle (`LogFile::Open`, `logfile.cpp:38`). A
+/// decree may be acknowledged as soon as one of them returns `Ok`.
+///
+/// Deferring the flush is possible but has to be asked for by name:
+/// [`append_unsynced`](Self::append_unsynced) writes without committing and
+/// hands back an [`Unsynced`] receipt, which only [`sync`](Self::sync) makes
+/// good. Until it does, [`durable_len`](Self::durable_len) — not
+/// [`data_len`](Self::data_len) — is what a crash would leave behind. See
 /// `DURABILITY.md`.
 ///
 /// Creating the file is itself made durable: `open` fsyncs the *directory* when
@@ -1049,6 +1055,9 @@ pub struct LogWriter<D: Durability = SyncAll> {
     path: PathBuf,
     file_decree: u64,
     index: DecreeIndex,
+    /// Bytes [`sync`](LogWriter::sync) has committed. Never advanced before
+    /// `sync_data` returns `Ok`, so it can only ever lag `index.data_len()`.
+    durable_len: u64,
     durability: D,
 }
 
@@ -1058,7 +1067,27 @@ impl<D: Durability> std::fmt::Debug for LogWriter<D> {
             .field("path", &self.path)
             .field("file_decree", &self.file_decree)
             .field("data_len", &self.data_len())
+            .field("durable_len", &self.durable_len)
             .finish_non_exhaustive()
+    }
+}
+
+/// Records written by [`LogWriter::append_unsynced`] but not yet committed.
+///
+/// Carries the offset the batch started at, so a caller that only wanted the
+/// old `append_batch` return value can keep using [`offset`](Unsynced::offset).
+/// It exists mostly to be `#[must_use]`: dropping it unexamined is the shape of
+/// the bug this type is here to make loud.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "these records are not durable until sync() returns; use append_batch to commit them"]
+pub struct Unsynced {
+    first_offset: u64,
+}
+
+impl Unsynced {
+    /// The offset of the first record in the batch.
+    pub fn offset(self) -> u64 {
+        self.first_offset
     }
 }
 
@@ -1126,11 +1155,16 @@ impl<D: Durability> LogWriter<D> {
         }
         file.seek(SeekFrom::Start(index.data_len()))?;
 
+        // Everything the scan kept came off the disk, so it is durable by
+        // definition — the watermark starts where recovery stopped.
+        let durable_len = index.data_len();
+
         Ok(LogWriter {
             file,
             path,
             file_decree: decree,
             index,
+            durable_len,
             durability,
         })
     }
@@ -1145,9 +1179,39 @@ impl<D: Durability> LogWriter<D> {
         self.file_decree
     }
 
-    /// Bytes written so far (`LogFile::m_dataLen`).
+    /// Bytes written so far (`LogFile::m_dataLen`). Under
+    /// [`append_unsynced`](Self::append_unsynced) this can run ahead of the
+    /// disk; [`durable_len`](Self::durable_len) is the part a crash would keep.
     pub fn data_len(&self) -> u64 {
         self.index.data_len()
+    }
+
+    /// Bytes a crash would leave behind: the prefix [`sync`](Self::sync) has
+    /// committed, or that the recovery scan found already on disk.
+    ///
+    /// This is a claim about what [`Durability::sync_data`] did, and is only as
+    /// honest as the policy in force — under
+    /// [`NoSync`](crate::durability::NoSync) it advances against a flush that
+    /// never happened.
+    pub fn durable_len(&self) -> u64 {
+        self.durable_len
+    }
+
+    /// The highest decree whose record lies wholly within
+    /// [`durable_len`](Self::durable_len), or 0 if no decree does — the decree
+    /// watermark it is safe to acknowledge up to.
+    pub fn durable_max_decree(&self) -> u64 {
+        if self.index.is_empty() {
+            return 0;
+        }
+        for decree in (self.index.min_decree()..=self.index.max_decree()).rev() {
+            let start = self.index.offset(decree).expect("indexed decree");
+            let len = self.index.length_of_decree(decree).expect("indexed decree");
+            if start + len <= self.durable_len {
+                return decree;
+            }
+        }
+        0
     }
 
     /// The decree→offset index.
@@ -1162,23 +1226,43 @@ impl<D: Durability> LogWriter<D> {
         self.data_len() > max_log_len
     }
 
-    /// Append one record. Returns its offset.
+    /// Append one record, durably. Returns its offset.
+    ///
+    /// **Contract:** once this returns `Ok`, the record survives power loss.
     pub fn append(&mut self, record: &[u8]) -> Result<u64, LogError> {
         self.append_batch(std::slice::from_ref(&record))
     }
 
     /// Append a batch of records in as few writes as possible, then make them
-    /// durable. This is the group-commit shape the engine's vote path uses.
+    /// durable. This is the group-commit shape the engine's vote path uses, and
+    /// the direct equivalent of one `WriteFileGather` on the C++'s
+    /// write-through handle: one device flush per batch, whatever its size.
     ///
     /// **Contract:** once this returns `Ok`, every record in the batch survives
     /// power loss. A decree must not be acknowledged before it does.
-    pub fn append_durable(&mut self, records: &[&[u8]]) -> Result<u64, LogError> {
-        let offset = self.append_batch(records)?;
+    ///
+    /// Returns the offset of the first record.
+    pub fn append_batch(&mut self, records: &[&[u8]]) -> Result<u64, LogError> {
+        let batch = self.append_unsynced(records)?;
         self.sync()?;
-        Ok(offset)
+        Ok(batch.offset())
     }
 
-    /// Append a batch of records. Returns the offset of the first one.
+    /// Deprecated alias for [`append_batch`](Self::append_batch), which is now
+    /// durable on its own.
+    #[deprecated(note = "append_batch is durable; this is an alias")]
+    pub fn append_durable(&mut self, records: &[&[u8]]) -> Result<u64, LogError> {
+        self.append_batch(records)
+    }
+
+    /// Append a batch of records **without** committing them. Nothing survives
+    /// power loss until [`sync`](Self::sync) returns; until then
+    /// [`durable_len`](Self::durable_len) is what the disk holds.
+    ///
+    /// For a caller that writes many records and wants one flush at the end —
+    /// log catch-up from a learn response, a bulk import, a benchmark measuring
+    /// the write path in isolation. The vote path wants
+    /// [`append_batch`](Self::append_batch).
     ///
     /// Every record is padded to its own page boundary — the C++ pads per
     /// message, not per batch (`LogFile::AddMessage` sizes each record at
@@ -1189,10 +1273,12 @@ impl<D: Durability> LogWriter<D> {
     /// batch leaves the file untouched. A failure *during* the write can still
     /// leave a partial record on disk; that is precisely the torn tail the
     /// recovery scan discards.
-    pub fn append_batch(&mut self, records: &[&[u8]]) -> Result<u64, LogError> {
+    pub fn append_unsynced(&mut self, records: &[&[u8]]) -> Result<Unsynced, LogError> {
         let start = self.data_len();
         if records.is_empty() {
-            return Ok(start);
+            return Ok(Unsynced {
+                first_offset: start,
+            });
         }
 
         // Validate everything first: parse each header, check the declared
@@ -1225,7 +1311,9 @@ impl<D: Durability> LogWriter<D> {
 
         self.write_records(records, &shapes)?;
         self.index = next;
-        Ok(start)
+        Ok(Unsynced {
+            first_offset: start,
+        })
     }
 
     /// Issue the vectored writes for a validated batch.
@@ -1262,15 +1350,28 @@ impl<D: Durability> LogWriter<D> {
         Ok(())
     }
 
-    /// Flush everything appended so far to stable storage.
+    /// Flush everything appended so far to stable storage, advancing
+    /// [`durable_len`](Self::durable_len) to [`data_len`](Self::data_len).
+    ///
+    /// A no-op when the two are already equal: nothing has been written since
+    /// the last flush, so a second `sync` would cost a device flush for a
+    /// promise already kept.
     ///
     /// `fdatasync`, not `fsync`: a log is only ever extended, and `fdatasync`
     /// already covers the one metadata field that matters for that — the file's
     /// length. What it does *not* cover is the directory entry, which is why
     /// [`open_with`](Self::open_with) fsyncs the directory when it creates the
     /// file.
-    pub fn sync(&self) -> io::Result<()> {
-        self.durability.sync_data(&self.file)
+    pub fn sync(&mut self) -> io::Result<()> {
+        let target = self.index.data_len();
+        if self.durable_len == target {
+            return Ok(());
+        }
+        self.durability.sync_data(&self.file)?;
+        // Only after the flush returned `Ok`. Advancing this line above the
+        // `?` is exactly the bug `crash.rs`'s invariant (e) exists to catch.
+        self.durable_len = target;
+        Ok(())
     }
 }
 

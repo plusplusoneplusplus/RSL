@@ -61,8 +61,9 @@ fn on_disk_len(records: &[Vec<u8>]) -> u64 {
         .sum()
 }
 
-/// Append 1024 records as one batch (group commit) versus one at a time, for a
-/// small and a large record size.
+/// Append 1024 records as one batch versus one at a time, for a small and a
+/// large record size. Both arms go through `append_unsynced`, so this measures
+/// the write path alone — the flush is `group_commit`'s subject.
 fn append(c: &mut Criterion) {
     let dir = scratch("log", "append");
     let mut group = c.benchmark_group("log/append");
@@ -81,7 +82,7 @@ fn append(c: &mut Criterion) {
                     decree += 1;
                     let path = dir.join(format!("{decree}.log"));
                     let mut writer = LogWriter::open_with(&dir, decree, NoSync).unwrap();
-                    writer.append_batch(refs).unwrap();
+                    let _ = writer.append_unsynced(refs).unwrap();
                     drop(writer);
                     std::fs::remove_file(path).unwrap();
                 });
@@ -98,7 +99,9 @@ fn append(c: &mut Criterion) {
                     let path = dir.join(format!("{decree}.log"));
                     let mut writer = LogWriter::open_with(&dir, decree, NoSync).unwrap();
                     for record in refs.iter() {
-                        writer.append(record).unwrap();
+                        let _ = writer
+                            .append_unsynced(std::slice::from_ref(record))
+                            .unwrap();
                     }
                     drop(writer);
                     std::fs::remove_file(path).unwrap();
@@ -122,12 +125,26 @@ fn group_commit(c: &mut Criterion) {
         let refs: Vec<&[u8]> = batch.iter().map(|r| r.as_slice()).collect();
         group.throughput(Throughput::Bytes(on_disk_len(&batch)));
         group.bench_with_input(
-            BenchmarkId::new("append_durable", batch_size),
+            BenchmarkId::new("append_batch", batch_size),
             &refs,
             |b, refs| {
                 let mut writer = LogWriter::open_with(&dir, 1, SyncAll).unwrap();
                 b.iter(|| {
-                    writer.append_durable(refs).unwrap();
+                    writer.append_batch(refs).unwrap();
+                });
+            },
+        );
+        let _ = std::fs::remove_file(dir.join("1.log"));
+
+        // The same batch without the flush, so the device cost stays visible as
+        // the difference between the two arms.
+        group.bench_with_input(
+            BenchmarkId::new("append_unsynced", batch_size),
+            &refs,
+            |b, refs| {
+                let mut writer = LogWriter::open_with(&dir, 1, SyncAll).unwrap();
+                b.iter(|| {
+                    let _ = writer.append_unsynced(refs).unwrap();
                 });
             },
         );
@@ -152,7 +169,9 @@ fn sync_cost(c: &mut Criterion) {
     let mut writer = LogWriter::open_with(&dir, 1, SyncAll).unwrap();
     group.bench_function("fdatasync", |b| {
         b.iter(|| {
-            writer.append(&record).unwrap();
+            // Unsynced, then flushed explicitly: `append` would flush itself
+            // and leave `sync` a no-op, measuring nothing.
+            let _ = writer.append_unsynced(&[&record[..]]).unwrap();
             writer.sync().unwrap();
         });
     });
@@ -200,7 +219,7 @@ fn recovery_scan(c: &mut Criterion) {
         let decree = request_len as u64;
         let path = dir.join(format!("{decree}.log"));
         let mut writer = LogWriter::open_with(&dir, decree, NoSync).unwrap();
-        writer.append_batch(&refs).unwrap();
+        let _ = writer.append_unsynced(&refs).unwrap();
         drop(writer);
 
         group.throughput(Throughput::Bytes(on_disk_len(&batch)));

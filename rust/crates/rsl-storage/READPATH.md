@@ -386,9 +386,10 @@ survive the port's different threading.
 
 There is a smaller correctness note in the same direction. `send_file` also
 serves live vote-log spans, and `LogWriter` writes those buffered and syncs
-(`log.rs`) — mixing buffered writes with unbuffered reads on one file is
-coherent only because the sync happens before a span can be served. That
-invariant holds today and nothing should be built on it needing to.
+before returning (`log.rs`) — mixing buffered writes with unbuffered reads on
+one file is coherent only because the sync happens before a span can be served.
+That invariant holds today (`append_unsynced` is the one way to defer the sync,
+and no serving path uses it) and nothing should be built on it needing to.
 
 The open question this leaves is not "ring or not" but whether `send_file`
 should double-buffer, which is a change inside `rsl-net` with no reader in it.

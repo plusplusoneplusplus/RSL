@@ -108,7 +108,7 @@ pub fn write_log(dir: &Path, file_decree: u64, decrees: &[u64], request_len: usi
 pub fn write_log_records(dir: &Path, file_decree: u64, records: &[Vec<u8>]) -> u64 {
     let mut writer = LogWriter::open_with(dir, file_decree, NoSync).expect("open log");
     let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
-    writer.append_batch(&refs).expect("append");
+    let _ = writer.append_unsynced(&refs).expect("append");
     writer.data_len()
 }
 

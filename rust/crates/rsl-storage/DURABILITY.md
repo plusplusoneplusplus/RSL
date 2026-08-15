@@ -16,9 +16,10 @@ implicit, so it is spelled out below and checked by `tests/crash.rs`.
 | API | After it returns `Ok` |
 | --- | --- |
 | `LogWriter::open` / `open_with` | The log file exists durably (a new file's directory entry is fsynced), and the writer sits past everything recovery kept. Any discarded tail has been truncated away. |
-| `LogWriter::append` / `append_batch` | Nothing. The bytes are in the page cache. A crash can lose them, tear them, or land them out of order. |
-| `LogWriter::sync` | Every record appended so far survives power loss. |
-| `LogWriter::append_durable` | Every record in the batch survives power loss. Do not acknowledge a decree before this returns. |
+| `LogWriter::append` / `append_batch` | Every record in the batch survives power loss. A decree may be acknowledged as soon as this returns. |
+| `LogWriter::append_unsynced` | Nothing. The bytes are in the page cache. A crash can lose them, tear them, or land them out of order. The `Unsynced` receipt it returns is `#[must_use]`. |
+| `LogWriter::sync` | Every record appended so far survives power loss. A no-op when nothing has been appended since the last flush. |
+| `LogWriter::durable_len` / `durable_max_decree` | Not a promise but a report: how far the writer's own flushes have got, which is what a crash would leave behind. |
 | `CheckpointWriter::finish` | The checkpoint is published. A reader sees the whole new file under its final name, or the whole previous file, never a mixture. |
 | `CheckpointWriter` dropped without `finish` | The staging `.tmp` is removed. A partial checkpoint is never published. |
 | `dir::write_defunct` | The new value survives power loss. The file is one 4-byte word, so an in-place overwrite cannot tear across a sector. |
@@ -29,6 +30,14 @@ each durable on their own; nothing promises what order a crash sees them in
 beyond what the sequences below establish.
 
 ## Why each sync is where it is
+
+**Appending is durable by default.** `FILE_FLAG_WRITE_THROUGH` gives the C++ a
+log where a write that returns is committed, and no API to accidentally get
+anything weaker. `append` and `append_batch` are that API here: they flush before
+returning, one device flush per batch, which is what a `WriteFileGather` on a
+write-through handle costs. Deferring the flush is still possible — bulk
+catch-up wants it — but it has to be spelled `append_unsynced`, and what comes
+back is a `#[must_use]` receipt rather than an offset that looks like success.
 
 **Appends use `fdatasync`, not `fsync`.** A log is only ever extended, and
 `fdatasync` covers the one inode field that matters for that, the file's length.
@@ -87,6 +96,13 @@ reader, which the Phase-3a corpus pins.
   covers the whole record either way, so a partially lost record is caught either
   way; the gap is in which states get enumerated, not in what the format can
   detect.
+- **The watermark is only as honest as the policy.** `durable_len` records that
+  `Durability::sync_data` returned `Ok`; it does not verify anything. Under
+  `NoSync` that call flushes nothing, so the watermark advances over bytes still
+  in the page cache — which is what `NoSync` is for. It also starts, on reopen,
+  at whatever the recovery scan read back: after a *process* crash (rather than
+  power loss) that can include bytes the page cache still holds and the platter
+  does not.
 - **Hardware that lies.** A drive whose write cache ignores `FLUSH` defeats all
   of the above, and no software can tell. It is a deployment requirement, as it
   was for the C++ on Windows.
@@ -116,10 +132,14 @@ prefix of the recorded operation sequence, under six crash policies:
 | `reordered-tail` | only the last write of each file landed |
 
 Each materialized directory goes through the real recovery code on a real
-filesystem, checking four things: nothing acknowledged is lost, recovery always
-reaches a decision, what survives is a prefix and never a hole, and a published
-checkpoint is whole. The append workload also checks that all three recovery
-outcomes (`accept`, `stop-at-offset`, `reject`) actually turn up somewhere in the
+filesystem, checking five things: nothing acknowledged is lost, recovery always
+reaches a decision, what survives is a prefix and never a hole, a published
+checkpoint is whole, and recovery keeps at least `durable_len` bytes of valid
+records. That last one holds the writer's own watermark to account —
+`a_failed_flush_never_advances_the_watermark` runs a workload whose `fdatasync`
+is refused, which is the one moment the *order* of the watermark update is
+visible from outside, and the invariant catches a watermark advanced before the
+flush. The append workload also checks that all three recovery outcomes (`accept`, `stop-at-offset`, `reject`) actually turn up somewhere in the
 enumeration, so the harness cannot pass by never damaging anything.
 
 `a_killed_writer_leaves_a_recoverable_log` adds a real-filesystem sanity check: a
@@ -135,13 +155,17 @@ Phase 3d had a decision gate: open an `O_DIRECT`/`io_uring` work item only if
 Measured with `cargo bench -p rsl-storage` on the development machine, files in
 `/tmp`:
 
-| Batch | `append_durable` latency | Throughput |
+| Batch | `append_batch` latency | Throughput |
 | --- | --- | --- |
 | 1 record | 4.79 ms | 0.1 MiB/s |
 | 4 records | 4.59 ms | 0.4 MiB/s |
 | 16 records | 3.86 ms | 2.0 MiB/s |
 | 64 records | 3.82 ms | 8.2 MiB/s |
 | 256 records | 3.80 ms | 32.9 MiB/s |
+
+(These were measured under the name `append_durable`, which `append_batch` now
+is; the `append_unsynced` arm of the same benchmark keeps the no-flush number
+alongside it.)
 
 Latency is flat in batch size. The cost is one device flush, which is also what
 the C++ pays for `WriteFileGather` plus a write-through commit, and batching buys

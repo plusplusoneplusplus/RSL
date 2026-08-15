@@ -8,7 +8,10 @@
 
 mod common;
 
-use rsl_storage::durability::NoSync;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
+
+use rsl_storage::durability::{Durability, NoSync, OpenMode, SyncAll};
 use rsl_storage::log::{
     self, LogError, LogReader, LogWriter, Outcome, RejectReason, ScanEnd, StopReason,
 };
@@ -276,6 +279,102 @@ fn the_index_mirrors_the_cpp_decree_map() {
     assert_eq!(reader.index().offset(702), Some(before));
     assert_eq!(reader.index().max_decree(), 702);
     assert_eq!(reader.index().data_len(), before + 512);
+}
+
+// ---------------------------------------------------------------------------
+// The durability watermark
+// ---------------------------------------------------------------------------
+
+/// `SyncAll`, counting the flushes — so a test can say how many device flushes
+/// a sequence of appends cost, not merely that it survived.
+#[derive(Clone, Default)]
+struct CountingSync {
+    flushes: Arc<AtomicUsize>,
+}
+
+impl Durability for CountingSync {
+    type File = std::fs::File;
+    type Bulk = rsl_storage::seqwrite::RealDevice;
+
+    fn open(&self, path: &std::path::Path, mode: OpenMode) -> std::io::Result<std::fs::File> {
+        SyncAll.open(path, mode)
+    }
+    fn bulk(&self) -> rsl_storage::seqwrite::RealDevice {
+        SyncAll.bulk()
+    }
+    fn exists(&self, path: &std::path::Path) -> bool {
+        SyncAll.exists(path)
+    }
+    fn read_dir(&self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+        SyncAll.read_dir(dir)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        SyncAll.remove_file(path)
+    }
+    fn sync_data(&self, file: &std::fs::File) -> std::io::Result<()> {
+        self.flushes.fetch_add(1, AtomicOrdering::SeqCst);
+        SyncAll.sync_data(file)
+    }
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        SyncAll.sync_file(file)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        SyncAll.rename(from, to)
+    }
+    fn sync_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        SyncAll.sync_dir(dir)
+    }
+}
+
+#[test]
+fn the_watermark_tracks_what_has_been_flushed() {
+    let dir = common::TempDir::new("log-watermark");
+    let counter = CountingSync::default();
+    let flushes = Arc::clone(&counter.flushes);
+    let mut writer = LogWriter::open_with(dir.path(), 900, counter).expect("open");
+
+    assert_eq!(writer.durable_len(), 0);
+    assert_eq!(writer.durable_max_decree(), 0);
+
+    // A plain append is durable when it returns.
+    writer.append(&vote_record(900, 0)).expect("append");
+    assert_eq!(writer.durable_len(), writer.data_len());
+    assert_eq!(writer.durable_max_decree(), 900);
+    assert_eq!(flushes.load(AtomicOrdering::SeqCst), 1);
+
+    // An unsynced batch runs the writer's state ahead of the disk.
+    let committed = writer.durable_len();
+    let batch = [vote_record(901, 0), vote_record(902, 3000)];
+    let refs: Vec<&[u8]> = batch.iter().map(|r| r.as_slice()).collect();
+    let unsynced = writer.append_unsynced(&refs).expect("append unsynced");
+    assert_eq!(unsynced.offset(), committed);
+    assert!(writer.durable_len() < writer.data_len());
+    assert_eq!(writer.durable_len(), committed);
+    assert_eq!(writer.durable_max_decree(), 900);
+    assert_eq!(
+        flushes.load(AtomicOrdering::SeqCst),
+        1,
+        "no flush was asked for"
+    );
+
+    // ...and `sync` closes the gap.
+    writer.sync().expect("sync");
+    assert_eq!(writer.durable_len(), writer.data_len());
+    assert_eq!(writer.durable_max_decree(), 902);
+    assert_eq!(flushes.load(AtomicOrdering::SeqCst), 2);
+
+    // A second `sync` with nothing new to commit costs no device flush, and
+    // neither does an empty batch.
+    writer.sync().expect("sync again");
+    writer.append_batch(&[]).expect("empty batch");
+    assert_eq!(flushes.load(AtomicOrdering::SeqCst), 2);
+
+    // Reopening starts from what recovery found on disk.
+    let total = writer.data_len();
+    drop(writer);
+    let reopened = LogWriter::open_with(dir.path(), 900, NoSync).expect("reopen");
+    assert_eq!(reopened.durable_len(), total);
+    assert_eq!(reopened.durable_max_decree(), 902);
 }
 
 #[test]

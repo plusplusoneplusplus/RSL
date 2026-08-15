@@ -3,9 +3,9 @@
 //! sequence, under every [`CrashPolicy`], and check what recovery makes of the
 //! wreckage.
 //!
-//! The four properties every case must satisfy (Phase 3d work item 3):
+//! The properties every case must satisfy (Phase 3d work item 3, plus (e)):
 //!
-//! * **(a) Nothing acknowledged is ever lost.** Once `append_durable` or
+//! * **(a) Nothing acknowledged is ever lost.** Once `append_batch` or
 //!   `CheckpointWriter::finish` has returned, no crash may take it back.
 //! * **(b) Recovery is total.** It either accepts, stops cleanly at an offset,
 //!   or rejects per the C++ decision table — it never panics, hangs, or
@@ -15,6 +15,10 @@
 //! * **(d) A checkpoint is old or new, never hybrid.** Any published `.codex`
 //!   verifies completely, with exactly the state that was written under that
 //!   name.
+//! * **(e) `LogWriter::durable_len` is not a boast.** Recovery always keeps at
+//!   least that many bytes of valid records. Where (a) trusts the workload's
+//!   idea of what is durable, this holds the *writer's own* watermark to
+//!   account: advance it one line before `sync_data` and this fails.
 //!
 //! Two tests sit outside that loop: `the_harness_catches_a_missing_dir_fsync`
 //! deliberately breaks the policy to prove the harness has teeth, and
@@ -27,6 +31,8 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rsl_storage::checkpoint::{self, CheckpointHeader, CheckpointWriter};
 use rsl_storage::dir::DataDir;
@@ -109,11 +115,26 @@ struct CrashCase<'a> {
 
 impl CrashCase<'_> {
     /// The last acknowledgement, parsed as a count. Workloads here acknowledge
-    /// "how many records/checkpoints are now durable".
+    /// "how many records/checkpoints are now durable"; a log workload appends
+    /// `:<durable_len>` to the label, which [`acked_durable_len`] reads back.
     fn acked_count(&self) -> u64 {
-        self.acks
-            .last()
-            .map_or(0, |a| a.parse().expect("count ack"))
+        self.acks.last().map_or(0, |a| {
+            a.split(':')
+                .next()
+                .expect("ack")
+                .parse()
+                .expect("count ack")
+        })
+    }
+
+    /// The writer's own durability watermark at the last acknowledgement, for
+    /// invariant (e). Zero when the workload does not report one.
+    fn acked_durable_len(&self) -> u64 {
+        self.acks.last().map_or(0, |a| {
+            a.split(':')
+                .nth(1)
+                .map_or(0, |len| len.parse().expect("durable_len ack"))
+        })
     }
 
     fn fail(&self, message: impl std::fmt::Display) -> String {
@@ -170,11 +191,18 @@ fn assert_clean(violations: Vec<String>, workload: &str) {
 // Shared log assertions
 // ---------------------------------------------------------------------------
 
-/// The four properties, checked against one recovered log.
+/// The properties, checked against one recovered log.
 ///
 /// `written` is every decree that was ever appended, in order; `acked` is how
-/// many of them had been acknowledged durable when the crash hit.
-fn check_log(case: &CrashCase, name: &str, written: &[u64], acked: u64) -> Result<(), String> {
+/// many of them had been acknowledged durable when the crash hit, and `durable`
+/// is the byte watermark the writer itself claimed at that moment.
+fn check_log(
+    case: &CrashCase,
+    name: &str,
+    written: &[u64],
+    acked: u64,
+    durable: u64,
+) -> Result<(), String> {
     let path = case.dir.join(name);
 
     if !path.exists() {
@@ -206,6 +234,16 @@ fn check_log(case: &CrashCase, name: &str, written: &[u64], acked: u64) -> Resul
                 record.decree, written[i]
             )));
         }
+    }
+
+    // (e) The writer's own watermark is honest: everything it counted as
+    // durable is still readable as valid records.
+    let recovered_bytes: u64 = scan.records.iter().map(|r| u64::from(r.padded_len)).sum();
+    if recovered_bytes < durable {
+        return Err(case.fail(format!(
+            "{name} recovered {recovered_bytes} bytes but durable_len claimed {durable} ({})",
+            scan.detail()
+        )));
     }
 
     // (a) Everything acknowledged is still here.
@@ -249,7 +287,7 @@ fn check_log(case: &CrashCase, name: &str, written: &[u64], acked: u64) -> Resul
         .copied()
         .unwrap_or(written[written.len() - 1] + 1);
     writer
-        .append_durable(&[&vote_record(next, 0)])
+        .append_batch(&[&vote_record(next, 0)])
         .map_err(|e| case.fail(format!("{name} could not be appended to: {e}")))?;
     drop(writer);
 
@@ -283,35 +321,38 @@ fn name_decree(name: &str) -> u64 {
 fn append_workload(sim: &SimCrash, dir: &Path) -> Vec<u64> {
     let mut writer = LogWriter::open_with(dir, 0, sim.clone()).expect("open");
     let mut written = Vec::new();
-    let ack = |sim: &SimCrash, n: usize| sim.ack(n.to_string());
 
     // A single small vote, made durable on its own.
-    writer
-        .append_durable(&[&vote_record(0, 0)])
-        .expect("append");
+    writer.append(&vote_record(0, 0)).expect("append");
     written.push(0);
-    ack(sim, written.len());
+    ack(sim, written.len(), &writer);
 
     // A batch of three, one of them spanning several pages — this is the shape
     // that gives a torn or holey tail real record bytes to damage.
     let batch: Vec<Vec<u8>> = vec![vote_record(1, 0), vote_record(2, 3000), vote_record(3, 100)];
     let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
-    writer.append_durable(&refs).expect("append batch");
+    writer.append_batch(&refs).expect("append batch");
     written.extend([1, 2, 3]);
-    ack(sim, written.len());
+    ack(sim, written.len(), &writer);
 
     // An append with no sync: not acknowledged, so it is allowed to vanish...
-    writer.append(&vote_record(4, 600)).expect("append");
+    let _ = writer
+        .append_unsynced(&[&vote_record(4, 600)])
+        .expect("append");
     written.push(4);
 
     // ...until the next durable append sweeps it to disk with it.
-    writer
-        .append_durable(&[&vote_record(5, 0)])
-        .expect("append");
+    writer.append(&vote_record(5, 0)).expect("append");
     written.push(5);
-    ack(sim, written.len());
+    ack(sim, written.len(), &writer);
 
     written
+}
+
+/// Acknowledge `n` records as durable, tagging the label with the writer's own
+/// watermark so invariant (e) can check it after the crash.
+fn ack<D: Durability>(sim: &SimCrash, n: usize, writer: &LogWriter<D>) {
+    sim.ack(format!("{n}:{}", writer.durable_len()));
 }
 
 #[test]
@@ -332,7 +373,13 @@ fn appended_votes_survive_every_crash_point() {
             "absent"
         };
         *seen.entry(outcome).or_default() += 1;
-        check_log(case, "0.log", &written, case.acked_count())
+        check_log(
+            case,
+            "0.log",
+            &written,
+            case.acked_count(),
+            case.acked_durable_len(),
+        )
     });
     assert_clean(violations, "append");
 
@@ -428,7 +475,7 @@ fn garbage_collection_never_deletes_a_file_recovery_needs() {
     for (i, decree) in [0u64, 10, 20, 30].into_iter().enumerate() {
         let mut writer = LogWriter::open_with(&data, decree, sim.clone()).expect("open");
         writer
-            .append_durable(&[&vote_record(decree + i as u64, 0)])
+            .append_batch(&[&vote_record(decree + i as u64, 0)])
             .expect("append");
     }
     for decree in [15u64, 25, 35] {
@@ -514,13 +561,15 @@ fn a_reopened_log_keeps_everything_acknowledged_before_the_first_crash() {
         let mut writer = LogWriter::open_with(&data, 7, sim.clone()).expect("open");
         for decree in 7..10 {
             writer
-                .append_durable(&[&vote_record(decree, 200)])
+                .append_batch(&[&vote_record(decree, 200)])
                 .expect("append");
             written.push(decree);
-            sim.ack(written.len().to_string());
+            ack(&sim, written.len(), &writer);
         }
         // An unsynced tail, then the process goes away without closing cleanly.
-        writer.append(&vote_record(10, 2000)).expect("append");
+        let _ = writer
+            .append_unsynced(&[&vote_record(10, 2000)])
+            .expect("append");
         written.push(10);
     }
     // Restart: reopen scans what is there, truncates whatever recovery
@@ -528,17 +577,21 @@ fn a_reopened_log_keeps_everything_acknowledged_before_the_first_crash() {
     {
         let mut writer = LogWriter::open_with(&data, 7, sim.clone()).expect("reopen");
         let next = writer.index().max_decree() + 1;
-        writer
-            .append_durable(&[&vote_record(next, 0)])
-            .expect("append");
+        writer.append(&vote_record(next, 0)).expect("append");
         // That sync swept the previously unsynced decree 10 to disk with it, so
         // the whole file is durable now.
         written.push(next);
-        sim.ack(written.len().to_string());
+        ack(&sim, written.len(), &writer);
     }
 
     let violations = enumerate(&sim, scratch.path(), |case| {
-        check_log(case, "7.log", &written, case.acked_count())
+        check_log(
+            case,
+            "7.log",
+            &written,
+            case.acked_count(),
+            case.acked_durable_len(),
+        )
     });
     assert_clean(violations, "reopen");
 }
@@ -594,13 +647,17 @@ fn the_harness_catches_a_missing_dir_fsync() {
     let broken = NoDirSync(sim.clone());
 
     let mut writer = LogWriter::open_with(&data, 0, broken).expect("open");
-    writer
-        .append_durable(&[&vote_record(0, 0)])
-        .expect("append");
+    writer.append_batch(&[&vote_record(0, 0)]).expect("append");
     sim.ack("1");
 
     let violations = enumerate(&sim, scratch.path(), |case| {
-        check_log(case, "0.log", &[0], case.acked_count())
+        check_log(
+            case,
+            "0.log",
+            &[0],
+            case.acked_count(),
+            case.acked_durable_len(),
+        )
     });
     assert!(
         violations
@@ -650,6 +707,106 @@ fn the_harness_catches_an_unsynced_publish() {
     );
 }
 
+/// A policy whose `fdatasync` fails on demand. Everything else is `SimCrash`.
+#[derive(Clone)]
+struct FailingSync {
+    inner: SimCrash,
+    fail: Arc<AtomicBool>,
+}
+
+impl Durability for FailingSync {
+    type File = SimFile;
+    type Bulk = rsl_storage::sim::SimDevice;
+
+    fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<SimFile> {
+        self.inner.open(path, mode)
+    }
+    fn bulk(&self) -> rsl_storage::sim::SimDevice {
+        self.inner.bulk()
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+    fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+        self.inner.read_dir(dir)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_data(&self, file: &SimFile) -> std::io::Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("simulated flush failure"));
+        }
+        self.inner.sync_data(file)
+    }
+    fn sync_file(&self, file: &SimFile) -> std::io::Result<()> {
+        self.inner.sync_file(file)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        self.inner.sync_dir(dir)
+    }
+}
+
+/// (e) with teeth. A failed flush is the one moment the *order* of the
+/// watermark update is visible from outside the writer: the bytes are written,
+/// the device refused to commit them, and `durable_len` must still describe the
+/// last flush that succeeded. Move `self.durable_len = target` above the
+/// `sync_data` call in `LogWriter::sync` and this test fails.
+#[test]
+fn a_failed_flush_never_advances_the_watermark() {
+    let scratch = common::TempDir::new("crash-failsync");
+    let data = PathBuf::from("/data");
+    let sim = SimCrash::new();
+    let fail = Arc::new(AtomicBool::new(false));
+    let policy = FailingSync {
+        inner: sim.clone(),
+        fail: Arc::clone(&fail),
+    };
+
+    let mut writer = LogWriter::open_with(&data, 0, policy).expect("open");
+    let mut written = Vec::new();
+
+    writer.append(&vote_record(0, 0)).expect("append");
+    written.push(0);
+    let committed = writer.durable_len();
+    ack(&sim, written.len(), &writer);
+
+    // The append whose flush fails: written, indexed, never committed.
+    fail.store(true, Ordering::SeqCst);
+    let err = writer
+        .append(&vote_record(1, 0))
+        .expect_err("flush must fail");
+    assert!(
+        matches!(err, LogError::Io(_)),
+        "a refused flush must surface as an I/O error, got {err:?}"
+    );
+    written.push(1);
+    // Acknowledge no more than before — but re-report the watermark, so every
+    // crash point after this one is checked against the writer's own claim.
+    // Invariant (e) is what has to catch an over-eager watermark here; the
+    // direct assertion below only says the same thing more legibly.
+    ack(&sim, written.len() - 1, &writer);
+
+    let violations = enumerate(&sim, scratch.path(), |case| {
+        check_log(
+            case,
+            "0.log",
+            &written,
+            case.acked_count(),
+            case.acked_durable_len(),
+        )
+    });
+    assert_clean(violations, "failed-flush");
+    assert_eq!(
+        writer.durable_len(),
+        committed,
+        "durable_len advanced over a flush that failed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A real filesystem, a real SIGKILL
 // ---------------------------------------------------------------------------
@@ -668,7 +825,7 @@ fn a_killed_writer_leaves_a_recoverable_log() {
         let mut decree = 0u64;
         loop {
             writer
-                .append_durable(&[&vote_record(decree, (decree as usize % 7) * 500)])
+                .append_batch(&[&vote_record(decree, (decree as usize % 7) * 500)])
                 .expect("child append");
             decree += 1;
         }
@@ -713,7 +870,7 @@ fn a_killed_writer_leaves_a_recoverable_log() {
     let mut writer = LogWriter::open(scratch.path(), 0).expect("reopen after the kill");
     let next = scan.records.len() as u64;
     writer
-        .append_durable(&[&vote_record(next, 0)])
+        .append_batch(&[&vote_record(next, 0)])
         .expect("append after the kill");
     drop(writer);
     let rescan = log::scan_file(&path).expect("rescan");

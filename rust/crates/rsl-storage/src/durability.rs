@@ -236,6 +236,12 @@ impl Durability for SyncAll {
 /// "acknowledged" vote can be lost. It exists so a benchmark can isolate the
 /// encode path from the disk, and so a test that only cares about bytes does not
 /// pay for an `fsync` per file.
+///
+/// In particular [`LogWriter::durable_len`](crate::log::LogWriter::durable_len)
+/// is meaningless under this policy: [`sync_data`](Durability::sync_data)
+/// returns `Ok` without flushing anything, so the watermark advances over bytes
+/// that are still only in the page cache. That is the point of `NoSync`, not a
+/// defect in the watermark.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoSync;
 

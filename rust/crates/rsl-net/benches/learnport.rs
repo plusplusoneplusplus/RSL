@@ -114,7 +114,7 @@ fn a_log(request_len: usize, count: u64) -> (PathBuf, u64) {
         .collect();
     let mut writer = LogWriter::open_with(&dir, 100, NoSync).expect("open log");
     let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
-    writer.append_batch(&refs).expect("append");
+    let _ = writer.append_unsynced(&refs).expect("append");
     let len = writer.data_len();
     (dir, len)
 }

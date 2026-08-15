@@ -74,7 +74,7 @@ fn fixture(dir: &Path) -> (PathBuf, u64) {
     let batch: Vec<Vec<u8>> = (0..RECORDS).map(vote_record).collect();
     let refs: Vec<&[u8]> = batch.iter().map(|r| r.as_slice()).collect();
     let mut writer = LogWriter::open_with(dir, 1, NoSync).unwrap();
-    writer.append_batch(&refs).unwrap();
+    let _ = writer.append_unsynced(&refs).unwrap();
     drop(writer);
     let path = dir.join("1.log");
     let len = std::fs::metadata(&path).unwrap().len();

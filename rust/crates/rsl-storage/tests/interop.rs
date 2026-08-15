@@ -521,7 +521,7 @@ fn a_linux_proxy_written_directory_survives_a_rust_takeover() {
         for step in 1..=3 {
             let decree = log_decree + step;
             writer
-                .append_durable(&[&versioned_vote(version, decree, 300)])
+                .append_batch(&[&versioned_vote(version, decree, 300)])
                 .expect("append");
         }
         let last_decree = writer.index().max_decree();
@@ -575,7 +575,7 @@ fn a_rust_written_directory_is_readable_by_the_linux_proxy() {
                 .map(|i| versioned_vote(version, start + i, 200 * i as usize))
                 .collect();
             let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
-            writer.append_durable(&refs).expect("append");
+            writer.append_batch(&refs).expect("append");
         }
 
         // Three checkpoints, the newest covering the last log.

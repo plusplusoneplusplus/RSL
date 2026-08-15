@@ -98,8 +98,10 @@ The C++ relies on Windows semantics — unbuffered write-through handles plus
 explicit, and **[`DURABILITY.md`](DURABILITY.md) states the exact guarantee at
 each API**. In short:
 
-- `LogWriter::append_durable` — the batch survives power loss when it returns.
-  This is the contract Phase 5 acknowledges decrees against.
+- `LogWriter::append` / `append_batch` — the batch survives power loss when it
+  returns. This is the contract Phase 5 acknowledges decrees against, and it is
+  the default: deferring the flush means asking for `append_unsynced` by name
+  and holding a `#[must_use]` receipt until `sync` makes it good.
 - `LogWriter::open` — fsyncs the *directory* when it creates the log, because
   `fdatasync` on ext4/xfs does not publish a new file's name. Appends then need
   only `fdatasync`.
@@ -148,7 +150,7 @@ let dir = Path::new("/var/lib/rsl");
 // Opening scans the existing file, rebuilds the index, and positions the
 // write pointer past any tail recovery discarded.
 let mut log = LogWriter::open(dir, 1000)?;        // <dir>/1000.log
-log.append_durable(&[&vote_bytes, &prepare_bytes])?;  // one writev + fsync
+log.append_batch(&[&vote_bytes, &prepare_bytes])?;    // one writev + fsync
 
 // Replaying from a decree, e.g. for the execute queue's read-behind path.
 let log = LogReader::open(dir, 1000)?;
