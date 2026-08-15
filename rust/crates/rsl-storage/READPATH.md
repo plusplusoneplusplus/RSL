@@ -103,9 +103,10 @@ nothing buffered had yet run. Same window, both cold.
 | Window 0, phase 2a | MiB/s |
 | --- | --- |
 | `APSEQREAD` 8 x 1 MiB | 4029 |
-| Log replay today — `BufReader::new`, 8 KiB | 676 |
+| Log replay as it stood — `BufReader::new`, 8 KiB | 676 |
 
-**Today's replay reader runs at 17% of `APSEQREAD` on identical LBAs.** Every
+**The replay reader this replaced ran at 17% of `APSEQREAD` on identical
+LBAs.** Every
 other cross-type pairing in earlier drafts of this document was contaminated,
 and an earlier version of this file quoted a table of eight such ratios that
 should not have been believed.
@@ -116,11 +117,11 @@ larger than the ~1.4x position spread mean anything:
 
 | Buffered reader | MiB/s |
 | --- | --- |
-| bare `File`, 4 KiB reads — log scan today (log.rs:319) | 655 |
-| `BufReader::new`, 8 KiB — log replay today (log.rs:522, :737) | 676 |
-| `tokio::fs`, 64 KiB chunks — learner streaming today (server.rs:405) | 959 |
+| bare `File`, 4 KiB reads — log scan, before | 655 |
+| `BufReader::new`, 8 KiB — log replay, before; the recovery rescan still | 676 |
+| `tokio::fs`, 64 KiB chunks — learner streaming, still (server.rs:405) | 959 |
 | `BufReader` 64 KiB | 1017 |
-| `File` + `read_exact`, 64 KiB blocks — checkpoint today (checkpoint.rs:694) | 1030 |
+| `File` + `read_exact`, 64 KiB blocks — checkpoint, before | 1030 |
 | `BufReader` 1 MiB | 2475 |
 | `BufReader` 10 MiB | 2608 |
 | `File` + `read_exact`, 10 MiB blocks | 2938 |
@@ -169,11 +170,12 @@ directory, fully cached, through the real `log::scan`:
 | Reader | Throughput |
 | --- | --- |
 | bare `File` | 0.68 GiB/s |
-| `BufReader` 8 KiB (today) | 1.06 |
+| `BufReader` 8 KiB (what the log paths ran) | 1.06 |
 | `BufReader` 64 KiB | 1.36 |
 | `BufReader` 1 MiB | 1.40 |
 | `BufReader` 10 MiB | 1.25 |
 | **`SeqReader` 4x4x1 MiB / 8x8x1 MiB** | **1.68 / 1.68** |
+| `SeqReader` 2x2x10 MiB — `log::LOG_READ_CONFIG` | 1.35 |
 
 This is the one comparison where the cache asymmetry runs *against* `SeqReader`
 — every `BufReader` row is reading out of RAM while `SeqReader` is unbuffered
@@ -191,6 +193,16 @@ Note also that `BufReader` at 10 MiB is *worse* than at 1 MiB in this table.
 Cold, bigger is better; warm, a 10 MiB buffer is L2/L3 pressure with nothing to
 show for it. 1 MiB is the size that survives both, which is why it is
 `SeqReaderConfig`'s default block and not the 10 MB the C++ uses.
+
+The log config's row is the same effect on the ring. At 1.35 GiB/s it is the
+only `SeqReader` shape here that does not beat the best `BufReader`, for two
+reasons this fixture exaggerates: a 32 MiB file is **four** 10 MiB blocks, so a
+2-deep ring never reaches steady state, and criterion charges each iteration a
+fresh 20 MiB of aligned buffers against 32 MiB of parsing. Neither applies to a
+real log — replay opens one reader and walks the whole file. Cold, where the
+decision was made, the C++'s own shape measures 4669 MiB/s against the best
+buffered reader's 2608. Read this row as the fixed cost of a deep ring on a
+small file, not as a verdict on the config.
 
 ### What was not inherited
 
@@ -257,10 +269,12 @@ multiplier and not the ring that rules one out there.
 
 | Path | Was | Is now |
 | --- | --- | --- |
-| Log replay (log.rs:522, :737) | `BufReader::new` — 8 KiB | **still open** |
-| Log scan (log.rs:319) | bare `File::open` | **still open** |
+| Log scan (`log::scan_file`, `LogScanner::open`) | bare `File::open` | `SeqReader` at `log::LOG_READ_CONFIG` — 2 threads x 2 slots x 10 MiB |
+| Log replay (`LogReader::replay_from{,_offset}`) | `File` + `seek` + `BufReader::new` — 8 KiB | `SeqReader::open_at` at the same config |
+| Log recovery rescan (`LogWriter::open_with`) | `BufReader` over the `Durability` handle | **unchanged, deliberately** — see below |
 | Checkpoint read (checkpoint.rs) | `File` + `read_exact` per block | `SeqReader`, default config |
 | Learner streaming (server.rs) | `tokio::fs` + one `stream_chunk` buffer | **unchanged, deliberately** — see below |
+| Defunct-config read (`dir::read_defunct`) | 4 bytes off a plain `File` | unchanged — a ring would be pure overhead |
 
 `CheckpointReader::open` and `checkpoint::verify_file` now read the header off
 an ordinary handle — it is a page or two, and a ring of read-ahead over that is
@@ -270,7 +284,68 @@ the position is chosen at open time rather than sought to afterwards; the
 non-seeking half of `CheckpointReader::new` is factored out as `assemble` so
 both constructors share the same validation.
 
-The log paths are still open.
+### The log reads, and why they are not at the default config
+
+Every log read in the C++ goes through `APSEQREAD` at the *same* shape —
+`DoInit(fileName, 2, s_AvgMessageLen, true)`, two reads in flight over a 10 MiB
+block (`s_AvgMessageLen`, message.h:39) — at all three sites: recovery replay
+(legislator.cpp:5544), log copy/compaction (legislator.cpp:1484) and the
+checkpoint header scan (legislator.cpp:637). All three wrap it in
+`DiskStreamReader` (legislator.cpp:59). So the port has one constant,
+`log::LOG_READ_CONFIG`, and `scan_file`, `LogScanner::open` and
+`LogReader::replay_from_offset` all use it.
+
+It is **not** `SeqReaderConfig::default()`. The default is 8 x 8 x 1 MiB, the
+shape measured at parity with `APSEQREAD` and the one the checkpoint stream
+runs; the C++'s log shape is a different and, by the table above, *worse* point
+— 20 MiB in flight for 4669 MiB/s against 8 MiB's 5797. Fidelity wins here
+because the reason for the large block is visible in the format rather than in
+the throughput: a log record is one marshaled message and can be arbitrarily
+large, where a checkpoint block is bounded. Either shape is a 6-7x improvement
+on the 676 MiB/s the 8 KiB `BufReader` was managing, so the choice between them
+is not what this migration was about. The constant is one edit away from the
+default if a profile ever asks for it.
+
+Two mechanical notes. `SeqReader` has no `Seek`, so `replay_from_offset` — which
+opened and then seeked — is now a single `open_at`; the reader starts its
+unbuffered reads at the sector boundary below the requested offset and discards
+the prefix itself, so it still hands back the byte at `offset` first and
+`LogScanner::at_offset` keeps reported offsets file-absolute exactly as before.
+And 10 MiB is a multiple of `SECTOR`, with `slots == threads == 2` satisfying
+`slots >= threads`, so the config validates as written.
+
+### The recovery rescan keeps its `BufReader`
+
+`LogWriter::open_with` scans an existing log before positioning the write
+pointer, and that is the one log read that does **not** move. It reads through
+the handle `Durability::open` just returned, which is what lets
+[`sim::SimCrash`](src/sim.rs) substitute a shadow filesystem and `tests/crash.rs`
+cut power at every prefix of a workload. `SeqReader` opens its own real handles
+by path and would read straight past the seam, so migrating it as written would
+mean the crash harness stops exercising the code that ships.
+
+[`WRITEPATH.md`](WRITEPATH.md) solved exactly this on the write side by teaching
+`Durability` a `Bulk: BlockDevice` associated type, and the read-side mirror is
+the same shape of work: a `BlockReader` handle per reader thread, a
+`SeqReader` that issues positional block reads through it instead of owning
+files, a `SimDevice` read path that serves out of the shadow filesystem, and an
+`inline` mode so a crash replay stays deterministic. It is tractable — the write
+side is the proof — but it buys nothing here.
+
+The write side had a reason the read side does not. There, the ring *is* the
+production writer for checkpoints; without the seam the crash harness would test
+a different writer from the one that ships. Here the seam already covers the
+whole of what this scan is for. The scan is `log::scan` over a `Read`, byte for
+byte the same parser and the same `ScanResult` the migrated `scan_file` runs —
+what crossing the seam would change is the number of syscalls, not a decision.
+And it is a startup cost paid once per log file the writer opens, against a
+recovery replay that walks every log in the directory. Spending a `BlockDevice`
+port on it would add a second substitutable I/O seam to `Durability` to speed up
+the one read whose latency nobody waits on.
+
+So: left on `BufReader::new`, with a comment at the site saying why. If the read
+side ever grows a `BlockDevice` for another reason, this is the first caller to
+move onto it.
 
 ### The learner's serving side keeps `tokio::fs`
 

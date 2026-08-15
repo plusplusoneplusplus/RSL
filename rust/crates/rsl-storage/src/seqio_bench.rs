@@ -1,4 +1,4 @@
-﻿//! The Rust half of the sequential-I/O comparison against `apdiskio.cpp`.
+//! The Rust half of the sequential-I/O comparison against `apdiskio.cpp`.
 //!
 //! This mirrors `src/RSL/UnitTest/SeqIoBench/main.cpp` exactly: same
 //! subcommands, same fixture file, same `--offset`/`--length` window, same
@@ -22,8 +22,8 @@
 //!
 //! | Mode | Models |
 //! | --- | --- |
-//! | `file` | `LogScanner::open` — bare `File`, one syscall per record (log.rs:319) |
-//! | `bufreader:<cap>` | log replay — `BufReader` (log.rs:522, :737); `cap` 8192 is today's default |
+//! | `file` | what `LogScanner::open` was — bare `File`, one syscall per record |
+//! | `bufreader:<cap>` | what log replay was, and what `LogWriter::open_with`'s rescan still is — `BufReader`; `cap` 8192 is `BufReader::new` |
 //! | `block:<n>` | checkpoint read — `File` + `read_exact` per block (checkpoint.rs:694) |
 //! | `ring:<threads>x<slots>x<block>` | the shipped [`SeqReader`] — unbuffered ring, the port's `APSEQREAD` |
 //!
@@ -491,7 +491,9 @@ fn run_read(a: &Args) -> io::Result<()> {
 
     let sample = match *mode {
         Mode::Bare => measure_reads(open()?, want, a.record)?,
-        Mode::Buffered(cap) => measure_reads(BufReader::with_capacity(cap, open()?), want, a.record)?,
+        Mode::Buffered(cap) => {
+            measure_reads(BufReader::with_capacity(cap, open()?), want, a.record)?
+        }
         Mode::Block(n) => measure_blocked(open()?, want, a.record, n)?,
         // The shipped reader, so the benchmark measures what actually ships.
         Mode::Ring {

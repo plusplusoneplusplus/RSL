@@ -566,7 +566,8 @@ fn drain_loop<W: BlockWriter>(handle: &W, ring: &Ring, slots: usize, block: usiz
                 if g.err.is_some() {
                     return;
                 }
-                if let Some(slot) = (0..slots).find(|&s| g.pending[s].is_some() && g.bufs[s].is_some())
+                if let Some(slot) =
+                    (0..slots).find(|&s| g.pending[s].is_some() && g.bufs[s].is_some())
                 {
                     let index = g.pending[slot].expect("checked");
                     let buf = g.bufs[slot].take().expect("checked");

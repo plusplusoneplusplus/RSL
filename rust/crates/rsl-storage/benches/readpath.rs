@@ -13,8 +13,12 @@
 //! how many bytes each one asks the OS for at a time.
 //!
 //! `bufreader/8192` is not an arbitrary point on the sweep. It is what
-//! `log::scan_file` (log.rs:522) and `LogReader::seek_to` (log.rs:737) use
-//! today, because `BufReader::new` is the 8 KiB default.
+//! `log::scan_file` and `LogReader::replay_from_offset` used before the
+//! migration, because `BufReader::new` is the 8 KiB default — and it is still
+//! what `LogWriter::open_with`'s recovery rescan uses, since that one reads
+//! back through the `Durability` seam. Both migrated paths now run a
+//! `SeqReader` at `log::LOG_READ_CONFIG` (2 x 10 MiB), which is the
+//! `seqreader` family below at a different shape.
 //!
 //! # The `seqreader` row is not like the others
 //!
@@ -87,8 +91,9 @@ fn scan_capacity(c: &mut Criterion) {
     let mut group = c.benchmark_group("readpath/scan");
     group.throughput(Throughput::Bytes(len));
 
-    // Bare `File`: what `LogScanner::open` (log.rs:319) does — no buffering at
-    // all, so the scanner's header-sized reads go straight to the OS.
+    // Bare `File`: what `LogScanner::open` did before the migration — no
+    // buffering at all, so the scanner's header-sized reads go straight to the
+    // OS. Kept as the floor of the sweep.
     group.bench_function("file/unbuffered", |b| {
         b.iter(|| {
             let scan = log::scan(File::open(&path).unwrap()).unwrap();
@@ -111,23 +116,37 @@ fn scan_capacity(c: &mut Criterion) {
     // check that a ring of unbuffered reads reassembles into exactly the byte
     // stream `log::scan` expects, over a file whose length is not a multiple of
     // the block size.
-    for (threads, slots) in [(4usize, 4usize), (8, 8)] {
-        let cfg = SeqReaderConfig {
-            threads,
-            slots,
-            block: 1 << 20,
-        };
-        group.bench_with_input(
-            BenchmarkId::new("seqreader", format!("{threads}x{slots}x1MiB")),
-            &cfg,
-            |b, &cfg| {
-                b.iter(|| {
-                    let r = SeqReader::open_with(&path, cfg).unwrap();
-                    let scan = log::scan(r).unwrap();
-                    assert_eq!(scan.records.len(), RECORDS as usize);
-                });
+    //
+    // The third shape is `log::LOG_READ_CONFIG` itself — the C++'s own 2 x
+    // 10 MiB — so the sweep shows what the shipped log readers actually run
+    // alongside the two 1 MiB shapes the parity work used.
+    let shapes = [
+        (
+            "4x4x1MiB",
+            SeqReaderConfig {
+                threads: 4,
+                slots: 4,
+                block: 1 << 20,
             },
-        );
+        ),
+        (
+            "8x8x1MiB",
+            SeqReaderConfig {
+                threads: 8,
+                slots: 8,
+                block: 1 << 20,
+            },
+        ),
+        ("2x2x10MiB (log)", log::LOG_READ_CONFIG),
+    ];
+    for (name, cfg) in shapes {
+        group.bench_with_input(BenchmarkId::new("seqreader", name), &cfg, |b, &cfg| {
+            b.iter(|| {
+                let r = SeqReader::open_with(&path, cfg).unwrap();
+                let scan = log::scan(r).unwrap();
+                assert_eq!(scan.records.len(), RECORDS as usize);
+            });
+        });
     }
 
     group.finish();

@@ -58,7 +58,6 @@
 //!   Rabin-64 verifies. The Phase-3a extraction stops at the checksum and never
 //!   emits this `detail` string.
 
-use std::fs::File;
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -68,7 +67,38 @@ use rsl_wire::messages::{
 };
 
 use crate::durability::{Durability, OpenMode, StorageFile, SyncAll};
+use crate::seqread::{SeqReader, SeqReaderConfig};
 use crate::{round_up_to_page, PAGE_SIZE};
+
+/// How every log read is sized: **2 reads in flight x 10 MiB**.
+///
+/// This is `APSEQREAD`'s shape at each of the three places the C++ reads a log,
+/// all of which call `DoInit(fileName, 2, s_AvgMessageLen, true)` —
+/// `c_maxReadsDefault` reads over a block of `s_AvgMessageLen`, 10 MiB
+/// (`message.h:39`):
+///
+/// * recovery replay, `legislator.cpp:5544`
+/// * log copy / compaction, `legislator.cpp:1484`
+/// * the checkpoint header scan, `legislator.cpp:637`
+///
+/// Deliberately *not* [`SeqReaderConfig::default()`], which is 8 x 8 x 1 MiB —
+/// the shape measured at parity with `APSEQREAD` and the one the checkpoint
+/// stream runs. The C++'s own log choice carries more bytes in flight (20 MiB
+/// against 8) for less throughput (`READPATH.md`: 4669 MiB/s against 5797), but
+/// log records can individually be large and replay is latency-insensitive, so
+/// the faithful shape is kept rather than the fast one. `slots == threads == 2`
+/// satisfies `slots >= threads`, and 10 MiB is a multiple of
+/// [`SECTOR`](crate::seqread::SECTOR), so this validates as written.
+///
+/// The fixed cost is 20 MiB of aligned buffers and two OS threads per reader,
+/// paid whether the log is a gigabyte or a page — `DoInit` sizes the same way,
+/// and log readers are opened one file at a time on paths that then read the
+/// file end to end.
+pub const LOG_READ_CONFIG: SeqReaderConfig = SeqReaderConfig {
+    threads: 2,
+    slots: 2,
+    block: 10 << 20,
+};
 
 /// `MAX_SINGLE_IO_SIZE` (`legislator.cpp:21`) — the largest single unbuffered
 /// I/O the Windows engine issues. POSIX has no such limit, but keeping append
@@ -313,10 +343,14 @@ pub struct LogScanner<R> {
     end: Option<ScanEnd>,
 }
 
-impl LogScanner<File> {
-    /// Scan `path` from the beginning.
-    pub fn open(path: &Path) -> io::Result<LogScanner<File>> {
-        Ok(LogScanner::new(File::open(path)?))
+impl LogScanner<SeqReader> {
+    /// Scan `path` from the beginning, through a [`SeqReader`] at
+    /// [`LOG_READ_CONFIG`].
+    pub fn open(path: &Path) -> io::Result<LogScanner<SeqReader>> {
+        Ok(LogScanner::new(SeqReader::open_with(
+            path,
+            LOG_READ_CONFIG,
+        )?))
     }
 }
 
@@ -517,9 +551,9 @@ pub fn scan_bytes(buf: &[u8]) -> ScanResult {
     scan(buf).expect("in-memory scan cannot fail")
 }
 
-/// Scan a log file on disk.
+/// Scan a log file on disk, through a [`SeqReader`] at [`LOG_READ_CONFIG`].
 pub fn scan_file(path: &Path) -> io::Result<ScanResult> {
-    scan(io::BufReader::new(File::open(path)?))
+    scan(SeqReader::open_with(path, LOG_READ_CONFIG)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +757,7 @@ impl LogReader {
 
     /// Replay records from `decree` onward, or `None` if this log does not hold
     /// it. Offsets reported by the scanner stay file-absolute.
-    pub fn replay_from(&self, decree: u64) -> io::Result<Option<LogScanner<io::BufReader<File>>>> {
+    pub fn replay_from(&self, decree: u64) -> io::Result<Option<LogScanner<SeqReader>>> {
         match self.index.offset(decree) {
             Some(offset) => self.replay_from_offset(offset).map(Some),
             None => Ok(None),
@@ -731,10 +765,16 @@ impl LogReader {
     }
 
     /// Replay records from a byte offset, which must be a record boundary.
-    pub fn replay_from_offset(&self, offset: u64) -> io::Result<LogScanner<io::BufReader<File>>> {
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        Ok(LogScanner::new(io::BufReader::new(file)).at_offset(offset))
+    ///
+    /// [`SeqReader`] has no `Seek` — positioning is chosen at open, so this is
+    /// one [`open_at`](SeqReader::open_at) rather than the open-then-seek it
+    /// used to be. The reader hands back the byte at `offset` first (it starts
+    /// its unbuffered reads at the sector boundary below and discards the
+    /// prefix itself), so [`at_offset`](LogScanner::at_offset) is still what
+    /// keeps the scanner's reported offsets file-absolute.
+    pub fn replay_from_offset(&self, offset: u64) -> io::Result<LogScanner<SeqReader>> {
+        let inner = SeqReader::open_at(&self.path, offset, LOG_READ_CONFIG)?;
+        Ok(LogScanner::new(inner).at_offset(offset))
     }
 }
 
@@ -1060,6 +1100,13 @@ impl<D: Durability> LogWriter<D> {
         let mut file = durability.open(&path, OpenMode::Append)?;
 
         let index = if existed {
+            // Deliberately *not* a `SeqReader`, unlike every other log read in
+            // this module. This scan reads back through `file` — the handle
+            // `durability.open` just returned — which is what lets
+            // `sim::SimCrash` substitute its shadow filesystem and `crash.rs`
+            // cut power at every prefix of a workload. A `SeqReader` opens its
+            // own real handles by path and would read straight past the seam.
+            // `READPATH.md` records the cost of the alternative.
             let scan = scan(io::BufReader::new(&mut file))?;
             if !scan.end.recoverable() {
                 return Err(LogError::Corrupt(Box::new(scan)));

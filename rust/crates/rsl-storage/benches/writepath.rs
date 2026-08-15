@@ -82,7 +82,13 @@ fn deliver_capacity(c: &mut Criterion) {
         b.iter(|| deliver(File::create(&path).expect("create")));
     });
 
-    for cap in [8 * 1024usize, 64 * 1024, 128 * 1024, 1024 * 1024, 10 * 1024 * 1024] {
+    for cap in [
+        8 * 1024usize,
+        64 * 1024,
+        128 * 1024,
+        1024 * 1024,
+        10 * 1024 * 1024,
+    ] {
         group.bench_with_input(BenchmarkId::new("bufwriter", cap), &cap, |b, &cap| {
             b.iter(|| {
                 deliver(BufWriter::with_capacity(
@@ -165,8 +171,7 @@ fn checkpoint_today(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(TOTAL));
     group.bench_function("today", |b| {
         b.iter(|| {
-            let mut w =
-                CheckpointWriter::create_with(&path, header(), NoSync).expect("create");
+            let mut w = CheckpointWriter::create_with(&path, header(), NoSync).expect("create");
             let mut buf = vec![0u8; RECORD];
             let mut written = 0u64;
             while written < TOTAL {
