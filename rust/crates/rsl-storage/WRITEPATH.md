@@ -334,17 +334,87 @@ ordinary and buffered — correct, just not fast.
 Format-invariant: nothing here changes a byte on disk, so any of it can be
 revisited from a profile. The open questions are whether the thread handoff can
 be tightened enough to close the last 4% (real async submission via IOCP or
-io_uring would, at the cost of `unsafe` or a wrapper crate), where the SLC cliff
-actually is for runs larger than 32 GiB, and whether the learner copy path wants
-a ring at all.
+io_uring would, at the cost of `unsafe` or a wrapper crate) and where the SLC
+cliff actually is for runs larger than 32 GiB. The learner copy path's question
+is closed: it has a ring, sized against the C++'s defaults rather than this
+crate's — see the migration table below.
 
 ## Follow-up: migrating the call sites
 
 | Path | Was | Is now |
 | --- | --- | --- |
 | Checkpoint write (checkpoint.rs) | `BufWriter::new` — 8 KiB | `SeqWriter`, default config, through `available`/`commit` |
-| Learner checkpoint copy (rsl-net `learnport/client.rs:351`) | `tokio::fs::File` + `write_all` | **still open** — thread-per-writer is wrong for many concurrent copies |
+| Learner checkpoint copy (rsl-net `learnport/client.rs`) | `tokio::fs::File` + `write_all` | `SeqWriter`, 2 threads x 4 slots x the streaming chunk |
 | Defunct config (`dir::write_defunct`) | small buffered write | unchanged — 4 bytes, and a ring would be pure overhead |
+
+### The learner's copy, and why the thread objection did not apply
+
+This table used to read "still open — thread-per-writer is wrong for many
+concurrent copies", which was the right worry aimed at the wrong side of the
+protocol. Inbound copies are not the many-at-once case: a replica fetches a
+checkpoint when it has fallen too far behind to catch up from the log, and it
+fetches *one*, from *one* peer. The many-at-once case is the replica serving
+those fetches, and that one is settled in [`READPATH.md`](READPATH.md) — it
+keeps `tokio::fs`.
+
+Sized against the C++ rather than against `SeqWriterConfig::default()`, the cost
+is small enough that the objection dissolves. `CopyCheckpoint` runs `APSEQWRITE`
+at `c_maxWritesDefault` — 2 writes in flight — and the table above shows the
+depth curve flat past 2 (2 x 128 KiB at 3061 MiB/s against 8 x 128 KiB's 3207).
+So the port runs `threads: 2`, and `slots: 4` rather than 2 because a thread
+handoff is coarser than an overlapped queue and the caller wants a spare buffer
+to fill while both writers are busy — the same reason parity at the checkpoint's
+shape needed 2 x 2 x 4 MiB against the C++'s 2 x 4 MiB. That is two OS threads
+and 1 MiB of buffers per copy in progress, against the default config's four
+threads and 16 MiB.
+
+The block is `LearnConfig::stream_chunk` rounded up to `SECTOR`, so one socket
+read fills exactly one ring block. That tie is the C++'s own arrangement, not a
+convenience: `CopyCheckpoint` stages into a buffer sized to
+`c_writeBufSizeDefault` for precisely this reason (`learn_protocol.cpp:234`).
+
+**The measured win is not the one this document's tables predict.** Those
+compare a ring against a `BufWriter` with the device as the ceiling. Here the
+socket is the ceiling and the page cache had room, so the 2.7x above is not
+available. What *is* available is that the copied file is re-read immediately,
+unbuffered, by `checkpoint::verify_file` — so writing it through the page cache
+buys nothing and costs twice, once in evicting everything else on the machine
+and once in writeback contending with the verify pass. That is confound 3 from
+[`READPATH.md`](READPATH.md) arriving on the write side. `cargo bench -p rsl-net
+--bench learnport`, loopback, full fetch-verify-publish:
+
+| Checkpoint state | `tokio::fs` | `SeqWriter` |
+| --- | --- | --- |
+| 1 MiB | 62.3 MiB/s | **92.2** (+50%) |
+| 8 MiB | 200.5 | **302.8** (+57%) |
+| 32 MiB | 424.7 | 528.7 (+15%, inside the noise) |
+
+Criterion calls the first two improvements and the third no change. The effect
+shrinking as the file grows is the shape to expect if it is cache contention
+rather than throughput: the fixed cost of the verify pass is what the larger
+runs amortize.
+
+### Driving a blocking ring from async
+
+`SeqWriter` is blocking `std::io` and `copy_checkpoint` is an `async fn`
+interleaving socket reads with file writes, so the two do not compose directly —
+blocking a Tokio worker inside the copy loop would stall the executor.
+
+`RingSink` bridges them by handing the writer *through* `spawn_blocking` and
+taking it back with the result, once per block. Three candidates were weighed
+and this is the cheapest:
+
+* **A dedicated thread per copy owning the ring, with a channel to the async
+  side.** Removes the per-block task handoff and adds a third OS thread to do
+  it, on a path already running two. The handoff it removes is not the expensive
+  part.
+* **Restructuring so the writer threads read the socket directly.** The socket
+  is async and the response is ordered; this is a rewrite of the protocol loop
+  to save a memcpy the table above prices at 3.8% at this block size.
+* **`spawn_blocking` per block.** One task handoff per block rather than per
+  byte, wrapping a call that is normally just a `memcpy` into a free slot — the
+  ring's own threads are what wait on the device. At the default chunk that is a
+  few thousand handoffs a second on a path bounded by a network.
 
 ### How the ring got behind the durability seam
 

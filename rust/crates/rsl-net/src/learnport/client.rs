@@ -7,7 +7,7 @@
 //! no reply envelope and no error code — a peer that will not serve the request
 //! just closes, so a short stream *is* the failure signal.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use rsl_storage::checkpoint::{self, CheckpointHeader};
 use rsl_storage::durability::{Durability, SyncAll};
+use rsl_storage::seqread::SECTOR;
+use rsl_storage::seqwrite::{SeqWriter, SeqWriterConfig};
 use rsl_storage::{round_up_to_page, PAGE_SIZE};
 use rsl_wire::messages::{
     unmarshal_base, verify_checksum, Header, Msg, MsgKind, StatusResponse, MSG_PREPARE,
@@ -341,6 +343,12 @@ impl LearnClient {
     /// bytes until `expected_size` have been read *in total*
     /// (`legislator.cpp:5551` counts `reader.BytesRead()`, the header
     /// included).
+    ///
+    /// The bytes land through a [`SeqWriter`] ring, which is what the C++ does
+    /// — `CopyCheckpoint` writes through `APSEQWRITE` (`learn_protocol.cpp:234`)
+    /// and sizes its socket staging buffer to the ring's block so that each
+    /// socket read fills exactly one block. [`RingSink`] keeps that shape and
+    /// explains the sizing and the blocking/async bridge.
     async fn copy_checkpoint<S: AsyncRead + Unpin>(
         &self,
         stream: &mut S,
@@ -348,7 +356,7 @@ impl LearnClient {
         temp: &Path,
         raise_max_ballot: Option<BallotNumber>,
     ) -> Result<(), TransferError> {
-        let mut file = tokio::fs::File::create(temp).await?;
+        let mut sink = RingSink::create(temp, self.config.ring_block()).await?;
         let mut read_so_far = 0u64;
 
         if let Some(floor) = raise_max_ballot {
@@ -361,13 +369,14 @@ impl LearnClient {
             let bytes = header
                 .marshal()
                 .map_err(|e| TransferError::Checkpoint(CheckpointFailure::Header(e.to_string())))?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+            sink.write_all(bytes).await?;
         }
 
-        let mut chunk = vec![0u8; self.config.chunk_size()];
         while read_so_far < expected_size {
-            let want = (expected_size - read_so_far).min(chunk.len() as u64) as usize;
-            if !read_exact_or_eof(stream, &mut chunk[..want], self.config.recv_timeout).await? {
+            let want = (expected_size - read_so_far).min(sink.block() as u64) as usize;
+            if !read_exact_or_eof(stream, &mut sink.stage()[..want], self.config.recv_timeout)
+                .await?
+            {
                 return Err(if read_so_far == 0 {
                     TransferError::Closed
                 } else {
@@ -377,11 +386,13 @@ impl LearnClient {
                     }
                 });
             }
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk[..want]).await?;
+            sink.push(want).await?;
             read_so_far += want as u64;
         }
 
-        file.flush().await?;
+        // `seqWrite->Flush()` then `DoDispose()` (`learn_protocol.cpp:307`),
+        // before the verify pass `publish` runs.
+        sink.finish().await?;
         Ok(())
     }
 
@@ -433,6 +444,135 @@ impl LearnConfig {
     /// checkpoint copy issue absurdly many syscalls without changing a byte).
     fn chunk_size(&self) -> usize {
         self.stream_chunk.max(PAGE_SIZE as usize)
+    }
+
+    /// [`chunk_size`](Self::chunk_size) rounded up to a [`SECTOR`] multiple,
+    /// which is what an unbuffered write requires of its length and therefore
+    /// what [`SeqWriterConfig::block`] demands.
+    ///
+    /// Deriving the ring block from the socket chunk rather than fixing it is
+    /// the C++'s own arrangement — `CopyCheckpoint` stages into a buffer sized
+    /// to `c_writeBufSizeDefault` precisely so one socket read fills one ring
+    /// block (`learn_protocol.cpp:234`). Keeping the two tied means
+    /// [`LearnConfig::stream_chunk`] stays the single knob its documentation
+    /// claims it is.
+    fn ring_block(&self) -> usize {
+        self.chunk_size().next_multiple_of(SECTOR)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The staging writer
+// ---------------------------------------------------------------------------
+
+/// A [`SeqWriter`] driven from async code, plus the socket staging buffer that
+/// feeds it.
+///
+/// # Why a ring here and not on the serving side
+///
+/// An inbound checkpoint copy is normally the only one in flight on a replica,
+/// and the file it produces is re-read *unbuffered* moments later by
+/// [`checkpoint::verify_file`]. Writing it through the page cache therefore
+/// buys nothing and costs twice: a checkpoint-sized eviction of everything else
+/// on the machine, and writeback contending with the verify pass that follows
+/// it. The ring writes straight past the cache, which is also what
+/// `APSEQWRITE` does.
+///
+/// # Sizing
+///
+/// `threads: 2` is `c_maxWritesDefault` — the C++ keeps two writes in flight
+/// (`apdiskio.h:98`) and `WRITEPATH.md` measures the depth curve as flat past
+/// two. `slots: 4` gives the caller two spare buffers so a socket read never
+/// waits for a slot; that slack is the price of a thread handoff, which
+/// `WRITEPATH.md` records as the reason the port's ring must be wider than the
+/// C++'s overlapped queue. At the default chunk that is 1 MiB of buffers and
+/// two OS threads per copy in progress — affordable at one copy at a time,
+/// which is the case the serving side does *not* have.
+///
+/// # The blocking/async bridge
+///
+/// [`SeqWriter`] is blocking `std::io`, so every call to it goes through
+/// [`spawn_blocking`](tokio::task::spawn_blocking), the writer travelling with
+/// the closure and coming back with the result. The overhead is one task
+/// handoff per block rather than per byte, and the call it wraps is normally
+/// just a `memcpy` into a free slot — the ring's own threads are what wait on
+/// the device. A dedicated thread per copy would remove the handoff and add a
+/// third thread to do it, which is a worse trade at this depth.
+struct RingSink {
+    /// `None` only while a blocking call is in flight.
+    inner: Option<(SeqWriter, Vec<u8>)>,
+    block: usize,
+}
+
+impl RingSink {
+    /// Create `path`, truncating any existing file, with a ring of `block`-sized
+    /// buffers.
+    async fn create(path: &Path, block: usize) -> io::Result<RingSink> {
+        let config = SeqWriterConfig {
+            threads: 2,
+            slots: 4,
+            block,
+        };
+        let path = path.to_path_buf();
+        let writer = tokio::task::spawn_blocking(move || SeqWriter::create_with(&path, config))
+            .await
+            .map_err(io::Error::other)??;
+        Ok(RingSink {
+            inner: Some((writer, vec![0u8; block])),
+            block,
+        })
+    }
+
+    /// The staging buffer's size, which is also the ring's block.
+    fn block(&self) -> usize {
+        self.block
+    }
+
+    /// The staging buffer, to read a socket chunk into.
+    fn stage(&mut self) -> &mut [u8] {
+        &mut self
+            .inner
+            .as_mut()
+            .expect("the sink is live between calls")
+            .1
+    }
+
+    /// Hand the first `n` staged bytes to the ring.
+    async fn push(&mut self, n: usize) -> io::Result<()> {
+        self.with(move |writer, stage| writer.write_all(&stage[..n]))
+            .await
+    }
+
+    /// Write `bytes` — the rewritten header, which does not come through the
+    /// staging buffer and may be any length.
+    async fn write_all(&mut self, bytes: Vec<u8>) -> io::Result<()> {
+        self.with(move |writer, _| writer.write_all(&bytes)).await
+    }
+
+    /// Drain the ring, establish the file's length and sync it.
+    async fn finish(mut self) -> io::Result<u64> {
+        let (writer, _) = self.inner.take().expect("the sink is live until finished");
+        tokio::task::spawn_blocking(move || writer.finish())
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Run one blocking call against the writer, handing ownership across and
+    /// taking it back.
+    async fn with<T, F>(&mut self, f: F) -> io::Result<T>
+    where
+        F: FnOnce(&mut SeqWriter, &mut Vec<u8>) -> io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (mut writer, mut stage) = self.inner.take().expect("the sink is live between calls");
+        let (result, writer, stage) = tokio::task::spawn_blocking(move || {
+            let result = f(&mut writer, &mut stage);
+            (result, writer, stage)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        self.inner = Some((writer, stage));
+        result
     }
 }
 

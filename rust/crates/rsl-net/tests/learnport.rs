@@ -441,6 +441,92 @@ async fn the_header_rewrite_raises_the_max_ballot() {
         .accepted());
 }
 
+/// Every other checkpoint in this file fits inside one ring block, so the
+/// `SeqWriter` behind `copy_checkpoint` never rotates: one partial block,
+/// padded and cut back by `finish`. This is the case that does rotate — enough
+/// blocks to recycle every slot many times over, so slot reuse, a caller
+/// running ahead of the writers, and a tail that is not a block multiple are
+/// all on the path.
+///
+/// The ring block is [`LearnConfig::stream_chunk`] rounded up to a sector, so
+/// shrinking the chunk buys the rotation for a couple of hundred kilobytes
+/// instead of a couple of hundred megabytes. The server keeps the default, so
+/// the bytes still arrive in chunks far larger than the block.
+#[tokio::test]
+async fn a_checkpoint_spanning_many_ring_blocks_copies_byte_for_byte() {
+    let source_dir = TempDir::new("learn-cp-blocks-src");
+    let dest_dir = TempDir::new("learn-cp-blocks-dst");
+    // Deliberately not a multiple of anything: the file's length is whatever
+    // `finish`'s `set_len` says, not what the sector-multiple writes could
+    // express.
+    let state: Vec<u8> = (0..200_003u32).map(|i| (i * 7) as u8).collect();
+    let size = write_checkpoint(source_dir.path(), 500, &state);
+
+    let server = serve(&source_dir, StubStatus::new().with_checkpoint(500, size)).await;
+    let client = LearnClient::with_config(LearnConfig {
+        stream_chunk: 4096,
+        ..LearnConfig::default()
+    });
+    let fetched = client
+        .fetch_checkpoint(
+            server.local_addr(),
+            &requester().fetch_checkpoint(500),
+            size,
+            dest_dir.path(),
+        )
+        .await
+        .expect("fetch checkpoint");
+
+    let original = std::fs::read(source_dir.join("500.codex")).expect("read source");
+    let copy = std::fs::read(&fetched.path).expect("read copy");
+    assert_eq!(copy.len() as u64, size, "the ring padded the file");
+    assert_eq!(copy, original);
+    assert!(rsl_storage::checkpoint::verify_file(&fetched.path)
+        .expect("verify")
+        .accepted());
+}
+
+/// The rewritten header goes through the ring ahead of the body, which leaves
+/// every later socket chunk straddling a block boundary. Same assertion as the
+/// single-block rewrite above, over a file long enough for that to matter.
+#[tokio::test]
+async fn the_header_rewrite_survives_a_multi_block_copy() {
+    let source_dir = TempDir::new("learn-cp-rewrite-src");
+    let dest_dir = TempDir::new("learn-cp-rewrite-dst");
+    let state: Vec<u8> = (0..200_003u32).map(|i| (i * 11) as u8).collect();
+    let size = write_checkpoint(source_dir.path(), 500, &state);
+
+    let server = serve(&source_dir, StubStatus::new().with_checkpoint(500, size)).await;
+    let higher = BallotNumber::new(99, MemberId::from_str("909"));
+    let client = LearnClient::with_config(LearnConfig {
+        stream_chunk: 4096,
+        ..LearnConfig::default()
+    });
+    let fetched = client
+        .fetch_checkpoint_with(
+            server.local_addr(),
+            &requester().fetch_checkpoint(500),
+            size,
+            dest_dir.path(),
+            Some(higher.clone()),
+        )
+        .await
+        .expect("fetch checkpoint");
+
+    let reader = rsl_storage::checkpoint::CheckpointReader::open(&fetched.path).expect("open");
+    assert_eq!(reader.header().max_ballot, higher);
+    assert_eq!(std::fs::metadata(&fetched.path).unwrap().len(), size);
+    assert!(rsl_storage::checkpoint::verify_file(&fetched.path)
+        .expect("verify")
+        .accepted());
+
+    // The body is untouched by the rewrite: only the header page differs.
+    let original = std::fs::read(source_dir.join("500.codex")).expect("read source");
+    let copy = std::fs::read(&fetched.path).expect("read copy");
+    let tail = rsl_storage::PAGE_SIZE as usize;
+    assert_eq!(copy[tail..], original[tail..]);
+}
+
 // ---------------------------------------------------------------------------
 // Torn streams
 // ---------------------------------------------------------------------------

@@ -247,10 +247,11 @@ Correctness is unaffected; only cache behaviour and throughput are.
 ### Reopening
 
 Format-invariant, so any of this can be revisited from a profile without
-touching anything on disk. The open questions are the worst-case latency gap
+touching anything on disk. The open question is the worst-case latency gap
 (thread scheduling, which real async submission via IOCP or io_uring would
-remove, at the cost of `unsafe` or a wrapper crate) and whether the learn port
-wants a shared reader pool.
+remove, at the cost of `unsafe` or a wrapper crate). Real async submission is
+also what would reopen the learn port's serving side, since it is the thread
+multiplier and not the ring that rules one out there.
 
 ## Follow-up: migrating the call sites
 
@@ -259,7 +260,7 @@ wants a shared reader pool.
 | Log replay (log.rs:522, :737) | `BufReader::new` — 8 KiB | **still open** |
 | Log scan (log.rs:319) | bare `File::open` | **still open** |
 | Checkpoint read (checkpoint.rs) | `File` + `read_exact` per block | `SeqReader`, default config |
-| Learner streaming (server.rs:405-421) | `tokio::fs` + one `stream_chunk` buffer | **still open** — thread-per-reader is the wrong shape for many concurrent peers |
+| Learner streaming (server.rs) | `tokio::fs` + one `stream_chunk` buffer | **unchanged, deliberately** — see below |
 
 `CheckpointReader::open` and `checkpoint::verify_file` now read the header off
 an ordinary handle — it is a page or two, and a ring of read-ahead over that is
@@ -269,5 +270,50 @@ the position is chosen at open time rather than sought to afterwards; the
 non-seeking half of `CheckpointReader::new` is factored out as `assemble` so
 both constructors share the same validation.
 
-The log paths are still open, and the learner one needs a decision about
-threads before it needs any code.
+The log paths are still open.
+
+### The learner's serving side keeps `tokio::fs`
+
+This row used to say "still open — thread-per-reader is the wrong shape for many
+concurrent peers", pending a decision about threads. The decision is **no ring**,
+and it does not rest on the thread count alone.
+
+`Legislator::HandleFetchRequest` is spawned per accepted socket
+(`legislator.cpp:4940`) and blocks all the way down, so `APSEQREAD`'s overlap
+costs the C++ nothing on top of a thread it was already paying for — its four
+reads in flight are four overlapped `ReadFile`s and zero workers. The port is a
+Tokio task per connection with no admission control (`accept_loop` in
+`learnport/server.rs` spawns unconditionally), so the same four reads in flight
+are four OS threads that did not previously exist, multiplied by every peer
+catching up at once. That is the objection as originally stated, and unlike the
+receive side — see [`WRITEPATH.md`](WRITEPATH.md), where sizing against the C++
+defaults dissolved it — there is no small configuration that rescues it, because
+the multiplier is the problem rather than the constant.
+
+Two things settle it beyond the thread count.
+
+**The wire is the ceiling, not the disk.** The table above measures today's
+`tokio::fs` streaming reader at 959 MiB/s — 8 Gb/s — on the machine's own NVMe.
+A ring would take that to 2465 at the C++'s own 4 x 64 KiB shape, or 5797 at
+8 x 1 MiB. Every one of those numbers is at or past a 10 GbE link and an order
+of magnitude past a 1 GbE one, so the threads would buy latency the socket
+immediately gives back. The one real inefficiency in `send_file` is that it does
+not overlap the disk read with the socket write at all — read, write, read,
+write — and closing *that* needs one buffer of read-ahead, not a pool.
+
+**Unbuffered reading is actively wrong for this path.** A ring bypasses the page
+cache, which is what makes it fast when the device is the bottleneck and what
+makes it a regression here: the common case is several replicas fetching the
+*same* checkpoint after a restart, and today the second and third peers are
+served out of RAM. `APSEQREAD` has the same property, so this is not a
+divergence from the C++ so much as a place where the C++'s choice does not
+survive the port's different threading.
+
+There is a smaller correctness note in the same direction. `send_file` also
+serves live vote-log spans, and `LogWriter` writes those buffered and syncs
+(`log.rs`) — mixing buffered writes with unbuffered reads on one file is
+coherent only because the sync happens before a span can be served. That
+invariant holds today and nothing should be built on it needing to.
+
+The open question this leaves is not "ring or not" but whether `send_file`
+should double-buffer, which is a change inside `rsl-net` with no reader in it.
